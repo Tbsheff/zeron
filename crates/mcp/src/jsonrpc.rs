@@ -16,85 +16,16 @@ use tokio::sync::mpsc;
 
 use crate::tools::Tools;
 
-/// Protocol revisions this server knows. The client's requested revision
-/// is echoed when it is one of these; otherwise the newest is offered and
-/// the client decides whether to continue (per the MCP handshake rules).
-const PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
-const LATEST_PROTOCOL: &str = "2025-06-18";
+const PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+const LATEST_PROTOCOL: &str = "2025-11-25";
 
-const INSTRUCTIONS: &str = "\
-Zeron runs coding agents in chats, each hosted on a device, optionally in a project \
-(a folder on that specific device). These tools operate the local Zeron engine: \
-discover devices/projects/chats, create chats with a chosen harness and \
-model, read transcripts, and send messages between chats.\n\
-\n\
-Chats are referenced by full id, a unique id prefix, or an exact title. Use \
-`whoami` to learn which chat you are speaking from; messages you send are \
-attributed to it and a chat cannot message itself. For request/response \
-with a single chat, `send_message` with `wait: true` returns its reply. \
-For parallel delegation, use `create_chats` with a prompt for each chat or \
-`send_messages` for existing chats. These batch tools launch requests concurrently \
-even if your harness executes tool calls sequentially. Alternatively, launch ALL \
-chats/messages with `wait: false` first, then use `wait_for_turn` to collect replies. \
-Do not wait for one worker before launching the next independent worker. \
-A chat you create from your chat is your subagent by default (`kind: subagent`): \
-it lists under your chat's Subagents and in its transcript's subagent block. Use \
-`kind: side` only for a side conversation the person should treat as their own, \
-and `kind: chat` for a standalone session visible in Sessions (no parent). Omitted \
-kind: subagent with an origin/parent, standalone otherwise. \
-Discover hosts with `list_devices`, then `list_projects {device}`, \
-`list_harnesses {device}` and `list_models {device, harness}`. A project fixes \
-its host; with both project and device it must belong to that device. Use listed \
-ids when names/paths repeat. Without project or device, creation uses the local engine. \
-If a chat is `awaitingInput`, answer it with `respond_to_input`.\n\
-\n\
-Delegation is provider-agnostic: `list_harnesses` shows every provider, and \
-those marked `connected` can take work from you whichever provider you run \
-on (a claude-code agent may hand a task to codex, and the reverse). Pass \
-`harness` (and a model from `list_models`) to `create_chat` to choose one. \
-Delegation is one level deep: a chat that has a parent cannot create chats. \
-Pass `cloud: true` to run a child on a Cloud machine of its own (Codex or Claude Code); \
-from a Cloud chat it clones the same repository, and without `cloud` it shares your machine.\n\
-\n\
-When a chart, table, diagram, dashboard, or 3D view would say more than prose and \
-`show_visual` is available, write a Luau visual script and show it with `show_visual` before \
-your final reply. Zeron renders it with its own native interface and enforces its style: \
-content sits directly on the chat with no cards or boxed panels, text uses the interface font \
-and type scale, and colors are theme tokens that work on frosted glass or opaque, light or dark. \
-The reader sees the visual above that reply, so don't announce or restate it. To show the \
-reader an image file (a screenshot, a rendered PNG), call `show_image` with its path; don't \
-draw images through `show_visual`.";
-
-/// Appended to [`INSTRUCTIONS`] where the agent is offered
-/// `wait_on_background` ([`zeron_proto::McpServer::WAITS_ON_BACKGROUND_ENV`]).
-const WAITS_ON_BACKGROUND: &str = "\n\n\
-Before ending a turn while a background command you started is still running and you'll carry on \
-once it ends (tests, a build), call `wait_on_background` with its task id, so the person sees the \
-chat waiting rather than finished. Not for anything you leave running (a dev server, a watcher).";
-
-/// Appended to [`INSTRUCTIONS`] when the host launched the agent without its
-/// own subagent tools ([`zeron_proto::McpServer::SIDE_CHATS_ONLY_ENV`]).
-const SIDE_CHATS_ONLY: &str = "\n\n\
-Your own subagent tools are turned off in Zeron's settings: where you would start a \
-subagent, delegate through Zeron chats instead, with `create_chats` (or `create_chat`).";
-
-/// What `initialize` tells the agent: with when to say it waits where it's
-/// offered `wait_on_background`, and the side-chat rule when its host turned
-/// the agent's own subagents off.
-fn instructions(
-    waits: bool,
-    side_chats_only: bool,
-    plugins: Option<&str>,
-) -> std::borrow::Cow<'static, str> {
-    if !waits && !side_chats_only && plugins.is_none() {
-        return INSTRUCTIONS.into();
+fn instructions(tools: &Tools) -> String {
+    use zeron_proto::agent_guidance::{MCP_INSTRUCTIONS, with_plugins};
+    if tools.guidance_in_prompt() {
+        return MCP_INSTRUCTIONS.to_owned();
     }
-    let waits = if waits { WAITS_ON_BACKGROUND } else { "" };
-    let side_chats = if side_chats_only { SIDE_CHATS_ONLY } else { "" };
-    let plugins = plugins
-        .map(|text| format!("\n\n{text}"))
-        .unwrap_or_default();
-    format!("{INSTRUCTIONS}{waits}{side_chats}{plugins}").into()
+    let guidance = with_plugins(tools.guidance_features(), tools.plugin_instructions().as_deref());
+    format!("{MCP_INSTRUCTIONS}\n\n{guidance}")
 }
 
 const PARSE_ERROR: i64 = -32700;
@@ -241,11 +172,7 @@ pub async fn handle_request(tools: &Tools, id: Value, method: &str, params: Valu
                         "name": "zeron",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
-                    "instructions": instructions(
-                        tools.waits_on_background(),
-                        tools.side_chats_only(),
-                        tools.plugin_instructions().as_deref(),
-                    ),
+                    "instructions": instructions(tools),
                 }),
             )
         }
@@ -256,7 +183,14 @@ pub async fn handle_request(tools: &Tools, id: Value, method: &str, params: Valu
                 return error_response(id, INVALID_PARAMS, "tools/call needs a tool name");
             };
             if !tools.has(name) && !crate::tools::is_plugin_tool_name(name) {
-                return error_response(id, INVALID_PARAMS, &format!("unknown tool: {name}"));
+                let hint = crate::tools::renamed(name)
+                    .map(|new| format!(" It is now `{new}`."))
+                    .unwrap_or_default();
+                return error_response(
+                    id,
+                    INVALID_PARAMS,
+                    &format!("unknown tool: {name}.{hint} tools/list names every tool."),
+                );
             }
             let arguments = params
                 .get("arguments")
@@ -266,18 +200,22 @@ pub async fn handle_request(tools: &Tools, id: Value, method: &str, params: Valu
                 Ok(value) => ok_response(
                     id,
                     json!({
-                        "content": [{ "type": "text", "text": pretty(&value) }],
+                        "content": [{ "type": "text", "text": text_of(&value) }],
                         "structuredContent": wrap_structured(value),
                         "isError": false,
                     }),
                 ),
-                Err(message) => ok_response(
-                    id,
-                    json!({
-                        "content": [{ "type": "text", "text": message }],
-                        "isError": true,
-                    }),
-                ),
+                Err(error) => {
+                    let body = error.to_json();
+                    ok_response(
+                        id,
+                        json!({
+                            "content": [{ "type": "text", "text": body.to_string() }],
+                            "structuredContent": body,
+                            "isError": true,
+                        }),
+                    )
+                }
             }
         }
         // Optional capabilities we do not advertise; answer empty rather
@@ -297,10 +235,10 @@ fn wrap_structured(value: Value) -> Value {
     }
 }
 
-fn pretty(value: &Value) -> String {
+fn text_of(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
-        other => serde_json::to_string_pretty(other).unwrap_or_default(),
+        other => other.to_string(),
     }
 }
 
@@ -392,29 +330,71 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert!(names.contains(&"whoami"));
+        assert!(names.contains(&"catalog"));
         assert!(names.contains(&"p__one"));
         for tool in listed["result"]["tools"].as_array().unwrap() {
             assert_eq!(tool["inputSchema"]["type"], "object", "{tool}");
         }
     }
 
-    #[test]
-    fn side_chats_only_instructions_add_the_delegation_rule() {
-        assert_eq!(instructions(false, false, None), INSTRUCTIONS);
-        let side_chats = instructions(false, true, None);
-        assert!(side_chats.starts_with(INSTRUCTIONS));
-        assert!(side_chats.ends_with("with `create_chats` (or `create_chat`)."));
+    fn tools_with(origin: Origin) -> Tools {
+        Tools::new(Arc::new(Zeron::with_client(memory_client(Arc::new(Watching)), origin)))
     }
 
-    #[test]
-    fn only_an_agent_offered_wait_on_background_is_told_when_to_use_it() {
-        assert!(!INSTRUCTIONS.contains("wait_on_background"));
-        let waits = instructions(true, false, None);
-        assert!(waits.starts_with(INSTRUCTIONS));
-        assert!(waits.contains("call `wait_on_background`"));
-        let both = instructions(true, true, None);
-        assert!(both.contains("call `wait_on_background`"));
-        assert!(both.ends_with("with `create_chats` (or `create_chat`)."));
+    #[tokio::test]
+    async fn instructions_shrink_to_one_line_when_the_harness_delivers_the_guidance() {
+        use zeron_proto::agent_guidance::MCP_INSTRUCTIONS;
+        let in_chat = Origin {
+            chat_id: Some("chat-1".into()),
+            waits_on_background: true,
+            side_chats_only: true,
+            ..Default::default()
+        };
+        let delivered = instructions(&tools_with(Origin {
+            guidance_in_prompt: true,
+            ..in_chat.clone()
+        }));
+        assert_eq!(delivered, MCP_INSTRUCTIONS);
+        let fallback = instructions(&tools_with(in_chat));
+        assert!(fallback.starts_with(MCP_INSTRUCTIONS));
+        for said in [
+            "Ordinary coding tasks need no Zeron tools.",
+            "call the Zeron tool `wait_on_background`",
+            "delegate with Zeron's `create_chats` instead",
+            "`show_visual`",
+        ] {
+            assert!(fallback.contains(said), "{said}");
+        }
+        let bare = instructions(&tools_with(Origin::default()));
+        assert!(!bare.contains("wait_on_background") && !bare.contains("show_visual"));
+        assert!(bare.len() < 2_048 + MCP_INSTRUCTIONS.len());
+    }
+
+    #[tokio::test]
+    async fn server_discover_and_unknown_methods_answer_method_not_found() {
+        let tools = tools_with(Origin::default());
+        for method in ["server/discover", "tasks/get", "nope"] {
+            let reply = handle_request(&tools, json!(1), method, json!({})).await;
+            assert_eq!(reply["error"]["code"], METHOD_NOT_FOUND, "{method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_echoes_the_two_current_protocol_revisions() {
+        let tools = tools_with(Origin::default());
+        for version in ["2025-11-25", "2025-06-18"] {
+            let init = handle_request(&tools, json!(1), "initialize", json!({ "protocolVersion": version })).await;
+            assert_eq!(init["result"]["protocolVersion"], version);
+        }
+        let future = handle_request(&tools, json!(2), "initialize", json!({ "protocolVersion": "2026-07-28" })).await;
+        assert_eq!(future["result"]["protocolVersion"], LATEST_PROTOCOL);
+    }
+
+    #[tokio::test]
+    async fn an_old_tool_name_says_what_replaced_it() {
+        let tools = tools_with(Origin::default());
+        let reply = handle_request(&tools, json!(1), "tools/call", json!({ "name": "create_chat" })).await;
+        assert_eq!(reply["error"]["code"], INVALID_PARAMS);
+        assert!(reply["error"]["message"].as_str().unwrap().contains("It is now `create_chats`"));
     }
 }

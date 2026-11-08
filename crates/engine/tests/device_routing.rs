@@ -2154,16 +2154,16 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
-        let devices = tools.call("list_devices", json!({})).await.unwrap();
+        let devices = tools.call("catalog", json!({"kind":"devices"})).await.unwrap();
         let projects = tools
-            .call("list_projects", json!({"device":"device-b"}))
+            .call("catalog", json!({"kind":"projects", "device":"device-b"}))
             .await;
-        if devices["devices"].as_array().unwrap().len() == 2
+        if devices["items"].as_array().unwrap().len() == 2
             && projects
                 .as_ref()
-                .is_ok_and(|p| p["projects"].as_array().unwrap().len() == 1)
+                .is_ok_and(|p| p["items"].as_array().unwrap().len() == 1)
             && tools
-                .call("list_harnesses", json!({"device":"device-b"}))
+                .call("catalog", json!({"kind":"harnesses", "device":"device-b"}))
                 .await
                 .is_ok()
         {
@@ -2176,28 +2176,30 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let projects = tools
-        .call("list_projects", json!({"device":"device-b"}))
+        .call("catalog", json!({"kind":"projects", "device":"device-b"}))
         .await
         .unwrap();
-    let project = projects["projects"][0]["id"].as_str().unwrap();
+    let project = projects["items"][0]["id"].as_str().unwrap();
     tools
         .call(
-            "list_models",
-            json!({"device":"device-b", "harness":"codex"}),
+            "catalog",
+            json!({"kind":"models", "device":"device-b", "harness":"codex"}),
         )
         .await
         .unwrap();
     let created = tools
         .call(
-            "create_chat",
-            json!({
+            "create_chats",
+            json!({"requests": [{
                 "kind":"chat", "device":"device-b", "project":project,
                 "harness":"codex", "title":"Remote MCP session", "prompt":"execute on B",
                 "wait":true, "timeout_secs":30
-            }),
+            }]}),
         )
         .await
         .unwrap();
+    let created = created["results"][0].clone();
+    assert_eq!(created["ok"], true, "{created}");
     let chat_id = created["chatId"].as_str().unwrap();
     assert_eq!(created["kind"], "chat");
     assert!(created["parentChatId"].is_null());
@@ -2234,13 +2236,15 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
     );
     let sent = tools
         .call(
-            "send_message",
-            json!({
+            "send_messages",
+            json!({"requests": [{
                 "chat":chat_id, "text":"a second remote turn", "wait":true, "timeout_secs":30
-            }),
+            }]}),
         )
         .await
         .unwrap();
+    let sent = sent["results"][0].clone();
+    assert_eq!(sent["ok"], true, "{sent}");
     assert_eq!(sent["turn"]["outcome"], "completed", "{sent}");
     assert_eq!(
         sent["turn"]["replies"].as_array().unwrap().len(),

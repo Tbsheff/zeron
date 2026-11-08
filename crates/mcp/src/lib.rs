@@ -16,13 +16,16 @@
 //! environment. Every send from such an agent is then attributed to its
 //! originating chat, and a chat can never message itself.
 
+mod error;
 mod jsonrpc;
+mod schema;
 mod tools;
 mod transcript;
 mod zeron;
 
 pub use jsonrpc::serve_stdio;
-pub use tools::{ListedTool, ToolDef, Tools};
+pub use error::ToolError;
+pub use tools::{Hints, ListedTool, ToolDef, Tools};
 pub use transcript::{RenderOptions, RenderedMessage, render_entries};
 pub use zeron::{Origin, Zeron};
 

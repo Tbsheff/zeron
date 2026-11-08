@@ -32,21 +32,19 @@ pub const CORE: Section = Section {
     text: "\
 ## Zeron
 
-Ordinary coding tasks need no Zeron tools. Zeron runs agent chats on the person's devices. Its tools (server `zeron`) load on demand: search for them by name.
+Ordinary coding tasks need no Zeron tools. Zeron runs agent chats on the person's devices; its tools (server `zeron`) load on demand, so search for them by name.
 
-Task -> tool:
-- Delegate parallel work: `create_chats` (1-32 chats, a prompt each, all start at once).
-- Message chats that exist: `send_messages`.
-- Collect a reply: `wait_for_turn`. Read status or transcript: `read_chat`. Find chats: `list_chats`.
-- Pick a device, project, harness, or model: `catalog`.
-- Unblock a chat that asks a question: `respond_to_input`. Stop a turn: `interrupt_chat`. Tidy up: `archive_chat`.
-- Build Zeron plugins, templates, themes: `plugins`, `templates`, `themes` read; `manage_plugin`, `manage_template`, `manage_theme` write.
+- Parallel work: `create_chats` (1-32 chats, a prompt each, all start at once).
+- Message chats that exist: `send_messages`. Collect a reply: `wait_for_turn`.
+- Status or transcript: `read_chat`. Find chats: `list_chats`. Devices, projects, harnesses, models: `catalog`.
+- Chat asks a question: `respond_to_input`. Stop it: `interrupt_chat`. Tidy up: `archive_chat`.
+- Zeron plugins, templates, themes: `plugins`, `templates`, `themes`.
 
 Rules:
-1. Start all independent chats in one `create_chats` call, then wait. Never wait on one worker before you start the next.
-2. A chat you create is your subagent. Delegation is one level deep: a subagent cannot create chats.
-3. Any harness marked `connected` in `catalog` can take work, whatever provider you are.
-4. Name a chat by id, unique id prefix, or exact title. A chat cannot message itself.
+1. Start all independent chats in one `create_chats` call, then wait. Never wait on one before you start the next.
+2. A chat you create is your subagent. A subagent cannot create chats.
+3. Any `connected` harness in `catalog` takes work, whatever provider you are.
+4. Name a chat by id, id prefix, or exact title. A chat cannot message itself.
 5. Results are JSON with stable ids. When a result has `next`, do what it says.",
 };
 
@@ -71,7 +69,7 @@ pub const VISUALS: Section = Section {
     text: "\
 ## Visuals
 
-When a chart, table, diagram, dashboard, or 3D view says more than prose, show it with `show_visual` (a Luau script) before your final reply. Show an image file with `show_image`. The reader sees it above your reply: do not announce or restate it. Full visual API: `visual_reference`, or the `zeron:visuals` skill where you have it.",
+When a chart, table, diagram, or 3D view says more than prose, show it with `show_visual` before your final reply; show an image file with `show_image`. Do not restate what it shows. Full API: `visual_reference` or the `zeron:visuals` skill.",
 };
 
 pub fn sections(features: Features) -> Vec<Section> {

@@ -55,6 +55,7 @@ summary = {
     "inputSchema": sum(r["inputSchema"] for r in rows),
     "outputSchema": sum(r["outputSchema"] for r in rows),
     "toolsListBytes": size(tools),
+    "upfrontNameDescInput": sum(size(t["name"]) + r["description"] + r["inputSchema"] for t, r in zip(tools, rows)),
     "alwaysLoad": [t["name"] for t in tools if (t.get("_meta") or {}).get("anthropic/alwaysLoad")],
 }
 if "--json" in sys.argv:

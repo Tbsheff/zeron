@@ -42,6 +42,7 @@ pub struct Origin {
     /// ([`zeron_proto::McpServer::WAITS_ON_BACKGROUND_ENV`]).
     pub waits_on_background: bool,
     pub plugin_instructions: Option<std::path::PathBuf>,
+    pub guidance_in_prompt: bool,
 }
 
 impl Origin {
@@ -62,6 +63,8 @@ impl Origin {
                 == Some("1"),
             plugin_instructions: read(zeron_proto::McpServer::PLUGIN_INSTRUCTIONS_ENV)
                 .map(std::path::PathBuf::from),
+            guidance_in_prompt: read(zeron_proto::McpServer::GUIDANCE_ENV).as_deref()
+                == Some("prompt"),
         }
     }
 }
@@ -191,9 +194,10 @@ impl Zeron {
         let client = connect_ipc_as_agent(port, self.data_dir.as_deref())
             .await
             .map_err(|e| {
-                anyhow!(
-                    "no Zeron engine reachable at ws://127.0.0.1:{port} ({e}) — is Zeron running?"
-                )
+                anyhow::Error::new(crate::error::ToolError::new(
+                    crate::error::ENGINE_UNAVAILABLE,
+                    format!("no Zeron engine reachable at ws://127.0.0.1:{port} ({e}) — is Zeron running?"),
+                ))
             })?;
         let client = Arc::new(client);
         *slot = Some(client.clone());
@@ -215,9 +219,9 @@ impl Zeron {
                 client
                     .call(method, params)
                     .await
-                    .map_err(|e| anyhow!("{method}: {e}"))
+                    .map_err(|e| anyhow::Error::new(e).context(method.to_owned()))
             }
-            other => other.map_err(|e| anyhow!("{method}: {e}")),
+            other => other.map_err(|e| anyhow::Error::new(e).context(method.to_owned())),
         }
     }
 
@@ -544,22 +548,22 @@ impl Zeron {
             .collect();
         match by_name.as_slice() {
             [one] => Ok(one.id.clone()),
-            [] => bail!(
+            [] => Err(not_found(format!(
                 "no device matches {key:?}; known: {}",
                 devices
                     .iter()
                     .map(|d| format!("{} ({})", d.name, d.id))
                     .collect::<Vec<_>>()
                     .join(", ")
-            ),
-            many => bail!(
+            ))),
+            many => Err(ambiguous(format!(
                 "{} devices are named {key:?}; use an id: {}",
                 many.len(),
                 many.iter()
                     .map(|d| d.id.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
-            ),
+            ))),
         }
     }
 
@@ -686,6 +690,14 @@ impl Zeron {
 
 /// The session row that speaks for `chat`: the host device's, else the
 /// freshest one (a chat re-homed mid-flight can briefly have two).
+fn not_found(message: String) -> anyhow::Error {
+    anyhow::Error::new(crate::error::ToolError::not_found(message))
+}
+
+fn ambiguous(message: String) -> anyhow::Error {
+    anyhow::Error::new(crate::error::ToolError::ambiguous(message))
+}
+
 pub fn session_for(sessions: &[Session], chat: &Chat) -> Option<Session> {
     let mine: Vec<&Session> = sessions.iter().filter(|s| s.chat_id == chat.id).collect();
     mine.iter()
@@ -714,7 +726,7 @@ pub fn resolve_chat_in(chats: &[Chat], key: &str) -> anyhow::Result<Chat> {
         return Ok((*one).clone());
     }
     if by_prefix.len() > 1 {
-        bail!(
+        return Err(ambiguous(format!(
             "{} chats start with {key:?}; be more specific: {}",
             by_prefix.len(),
             by_prefix
@@ -722,10 +734,10 @@ pub fn resolve_chat_in(chats: &[Chat], key: &str) -> anyhow::Result<Chat> {
                 .map(|c| short(&c.id))
                 .collect::<Vec<_>>()
                 .join(", ")
-        );
+        )));
     }
     if by_title.len() > 1 {
-        bail!(
+        return Err(ambiguous(format!(
             "{} chats are titled {key:?}; use an id: {}",
             by_title.len(),
             by_title
@@ -733,9 +745,28 @@ pub fn resolve_chat_in(chats: &[Chat], key: &str) -> anyhow::Result<Chat> {
                 .map(|c| short(&c.id))
                 .collect::<Vec<_>>()
                 .join(", ")
-        );
+        )));
     }
-    bail!("no chat matches {key:?} (id, id prefix, or exact title); try list_chats")
+    let close = crate::error::suggestions(
+        key,
+        chats
+            .iter()
+            .filter_map(|c| Some((c.title.as_deref()?, c.id.as_str()))),
+    );
+    let hint = match close.as_slice() {
+        [] => String::new(),
+        ids => format!(
+            " Did you mean {}?",
+            ids.iter()
+                .filter_map(|id| chats.iter().find(|c| c.id == *id))
+                .map(|c| format!("{:?} ({})", c.title.as_deref().unwrap_or_default(), short(&c.id)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    Err(not_found(format!(
+        "no chat matches {key:?} (id, id prefix, or exact title).{hint} list_chats shows every chat."
+    )))
 }
 
 pub fn resolve_space_in(spaces: &[Space], key: &str) -> anyhow::Result<Space> {
@@ -772,7 +803,7 @@ pub fn resolve_space_in(spaces: &[Space], key: &str) -> anyhow::Result<Space> {
         return Ok((*one).clone());
     }
     if candidates.len() > 1 {
-        bail!(
+        return Err(ambiguous(format!(
             "{} projects match {key:?}; use an id: {}",
             candidates.len(),
             candidates
@@ -780,9 +811,11 @@ pub fn resolve_space_in(spaces: &[Space], key: &str) -> anyhow::Result<Space> {
                 .map(|s| format!("{} (id {}, device {})", s.path, s.id, s.device_id))
                 .collect::<Vec<_>>()
                 .join(", ")
-        );
+        )));
     }
-    bail!("no project matches {key:?} (id, path, or name); try list_projects")
+    Err(not_found(format!(
+        "no project matches {key:?} (id, path, or name); catalog {{kind: \"projects\"}} lists them"
+    )))
 }
 
 /// Eight-char id prefix, the sidebar's convention.

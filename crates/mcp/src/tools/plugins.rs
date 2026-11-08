@@ -15,22 +15,16 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use zeron_rpc::{RpcError, methods};
 
-use super::{ToolDef, Tools, parse};
+use super::{Hints, ToolDef, Tools, parse};
+use crate::error::ToolError;
 
-pub(super) const CREATE_PLUGIN: &str = "create_plugin";
-pub(super) const LIST_PLUGINS: &str = "list_plugins";
-pub(super) const LIST_TEMPLATES: &str = "list_templates";
-pub(super) const CREATE_TEMPLATE: &str = "create_template";
-pub(super) const USE_TEMPLATE: &str = "use_template";
-pub(super) const TEMPLATE_STATUS: &str = "template_status";
-pub(super) const DELETE_TEMPLATE: &str = "delete_template";
-pub(super) const DESCRIBE_APP: &str = "describe_app";
-pub(super) const EXPORT_TEMPLATE: &str = "export_template";
-pub(super) const IMPORT_TEMPLATE: &str = "import_template";
-pub(super) const DESCRIBE_ELEMENTS: &str = "describe_elements";
-pub(super) const PLUGIN_STATUS: &str = "plugin_status";
-pub(super) const INSTALL_PLUGIN: &str = "install_plugin";
-pub(super) const UPDATE_PLUGIN: &str = "update_plugin";
+const LIST_TEMPLATES: &str = "list";
+const DESCRIBE_APP: &str = "app";
+const TEMPLATE_STATUS: &str = "status";
+const CREATE_TEMPLATE: &str = "create";
+const USE_TEMPLATE: &str = "use";
+const DELETE_TEMPLATE: &str = "delete";
+const EXPORT_TEMPLATE: &str = "export";
 
 /// How long a listing waits for the engine's plugin tools before it goes
 /// out with the static tools only.
@@ -46,16 +40,30 @@ const MAX_RETRY: Duration = Duration::from_secs(30);
 #[serde(rename_all = "camelCase")]
 pub struct ListedTool {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub description: String,
     pub input_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 impl From<ToolDef> for ListedTool {
     fn from(def: ToolDef) -> Self {
         Self {
             name: def.name.to_owned(),
+            title: Some(def.title.to_owned()),
             description: def.description.to_owned(),
-            input_schema: def.input_schema,
+            input_schema: crate::schema::compact(&def.input_schema),
+            output_schema: def.output_schema,
+            annotations: Some(def.hints.to_json(def.title)),
+            meta: def
+                .always_load
+                .then(|| json!({ "anthropic/alwaysLoad": true })),
         }
     }
 }
@@ -112,8 +120,12 @@ impl PluginTools {
                 };
                 ListedTool {
                     name: tool.mcp_name.clone(),
+                    title: None,
                     description,
-                    input_schema: input_schema(&tool.input),
+                    input_schema: crate::schema::compact(&input_schema(&tool.input)),
+                    output_schema: None,
+                    annotations: None,
+                    meta: None,
                 }
             })
             .collect()
@@ -149,157 +161,104 @@ pub(crate) fn is_plugin_tool_name(name: &str) -> bool {
 }
 
 /// The engine's error in words an agent can act on.
-fn plain(error: RpcError) -> String {
-    match error {
-        RpcError::Failed(message) => message,
-        RpcError::UnknownMethod(_) => {
-            "This Zeron doesn't run plugins yet; update Zeron to use them.".into()
-        }
-        other => other.to_string(),
+fn plain(error: RpcError) -> ToolError {
+    ToolError::from_rpc(&error, "This Zeron doesn't run plugins yet; update Zeron to use them.")
+}
+
+pub(super) const PLUGINS: &str = "plugins";
+pub(super) const TEMPLATES: &str = "templates";
+pub(super) const NAMES: [&str; 2] = [PLUGINS, TEMPLATES];
+const PLUGIN_ACTIONS: [&str; 6] = ["list", "status", "elements", "updates", "create", "install"];
+const TEMPLATE_ACTIONS: [&str; 8] = ["list", "status", "app", "create", "use", "delete", "export", "import"];
+
+const PLUGINS_DESCRIPTION: &str = "\
+Zeron plugins on this device. action list. status {id, snapshot?}: where its UI landed (places, \
+matched elements, Settings row, errors); snapshot adds a PNG to read. elements: selectors for \
+zeron.place and what each provides. updates {id?}: newer versions (only the person installs them). \
+create {id, name, permissions?}: a signed folder that reloads as you save; read the reply's `guide` \
+first. install {path | url, ref?, folder?}: the person must allow it in Zeron, not you.";
+
+const TEMPLATES_DESCRIPTION: &str = "\
+Zeron templates: whole copies of Zeron's Luau interface to rewrite. action list: ids, status, in use. \
+status {id}: errors and out-of-date files. app: screens and the #ids and .classes plugins place by. \
+create {id, name, from?}: copy to a folder; read the reply's `guide` first. use {id}: switch the window \
+live (zeron: Zeron's own); a preview until the person keeps it. delete {id}. export {id}: a signed \
+.zeron-template file. import {path | url}: someone else's waits for the person to allow it.";
+
+pub(super) fn catalog() -> Vec<ToolDef> {
+    let text = || json!({ "type": "string" });
+    vec![
+        ToolDef {
+            name: PLUGINS,
+            title: "Zeron plugins",
+            description: PLUGINS_DESCRIPTION,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": PLUGIN_ACTIONS },
+                    "id": text(),
+                    "name": text(),
+                    "description": text(),
+                    "permissions": { "type": "array", "items": { "type": "string" }, "description": "e.g. ui.add, ui.change, sessions.read, network, commands; the guide lists all." },
+                    "snapshot": { "type": "boolean" },
+                    "path": text(),
+                    "url": text(),
+                    "ref": text(),
+                    "folder": text()
+                },
+                "required": ["action"]
+            }),
+            output_schema: None,
+            hints: Hints::WRITE.open_world(),
+            always_load: false,
+            example: r#"{"action":"status","id":"focus","snapshot":true}"#,
+        },
+        ToolDef {
+            name: TEMPLATES,
+            title: "Zeron templates",
+            description: TEMPLATES_DESCRIPTION,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": TEMPLATE_ACTIONS },
+                    "id": text(),
+                    "name": text(),
+                    "from": text(),
+                    "path": text(),
+                    "url": text()
+                },
+                "required": ["action"]
+            }),
+            output_schema: None,
+            hints: Hints::WRITE.destructive().open_world(),
+            always_load: false,
+            example: r#"{"action":"create","id":"midnight","name":"Midnight"}"#,
+        },
+    ]
+}
+
+#[derive(Deserialize)]
+struct ActionArgs {
+    action: String,
+}
+
+fn action_of(args: &Value, allowed: &[&str]) -> Result<String, ToolError> {
+    let action = parse::<ActionArgs>(args.clone())?.action;
+    if allowed.contains(&action.as_str()) {
+        Ok(action)
+    } else {
+        Err(ToolError::invalid(format!(
+            "unknown action {action:?}; one of: {}",
+            allowed.join(", ")
+        )))
     }
 }
 
-pub(super) fn catalog() -> Vec<ToolDef> {
-    vec![
-        ToolDef {
-            name: CREATE_PLUGIN,
-            description: "Create a Zeron plugin on this device: a folder with a manifest (zeron-plugin.json), init.luau to edit, and zeron.luau, the SDK. Zeron signs it as yours and loads it, and re-signs and reloads it as you save; the person allows once, in Zeron, any permissions it asks for. `id` is lowercase letters, digits and dashes (2-40). `permissions` are what the plugin may do (ui.add, ui.change, ui.replace, profile.read, sessions.read, messages.read, account.email, files.read, panel.tabs, pages.add, github, github.write, navigate, compose, network, clipboard, files, web, windows, tools, devices, native, commands: with a manifest `commands` list of programs it runs, as you). The reply links the authoring guide (`guide`): read it before writing.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,39}$", "description": "Folder and manifest id, e.g. focus." },
-                    "name": { "type": "string", "description": "Display name, e.g. Focus." },
-                    "description": { "type": "string" },
-                    "permissions": { "type": "array", "items": { "type": "string" } }
-                },
-                "required": ["id", "name"]
-            }),
-        },
-        ToolDef {
-            name: LIST_PLUGINS,
-            description: "Zeron plugins on this device: id, name, status (on, off, pending review, tampered, broken), who made it, and its folder.",
-            input_schema: json!({ "type": "object", "properties": {} }),
-        },
-        ToolDef {
-            name: PLUGIN_STATUS,
-            description: "Where a Zeron plugin's UI landed, to check your work without a person: its status (on, off, pending review, tampered, broken, and why), what it was allowed, and, from Zeron's window on this device, each zeron.place it made (its selector, how, how many elements it matched and their boxes in the window), what its row in Settings says (a node that needs what its place doesn't give, places this template doesn't have, an error that stopped it) and its pages. With snapshot: true, also a PNG of the window cut to around its nodes (the whole window when none shows): read the file at `snapshot` to look. Edit the plugin, save, and ask again.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "The plugin's id, from list_plugins." },
-                    "snapshot": { "type": "boolean", "description": "Also save a picture of where it shows." }
-                },
-                "required": ["id"]
-            }),
-        },
-        ToolDef {
-            name: INSTALL_PLUGIN,
-            description: "Install someone's Zeron plugin from a .zeron-plugin file (`path`) or a link (`url`): a link to a .zeron-plugin file, a GitHub release (…/releases/latest or …/releases/tag/<tag>, its .zeron-plugin asset), or a git repository (owner/repo, its GitHub page, …/tree/<branch>/<folder>, or any https git URL; `ref` a branch or tag, `folder` where the plugin is in it). Zeron checks the signature over every file first: an unsigned or changed plugin is refused. Whatever you install waits for the person to allow it in Zeron's window, which shows who signed it and what it asks: you can't allow it for them (`waiting` says so). Installing over a plugin already installed is an update, and only when the same key signed both.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "A .zeron-plugin file's full path." },
-                    "url": { "type": "string", "description": "A package link, a GitHub release, or a git repository (https)." },
-                    "ref": { "type": "string", "description": "With a git repository: the branch or tag (default its default branch)." },
-                    "folder": { "type": "string", "description": "With a git repository: the plugin's folder in it (default the top)." }
-                }
-            }),
-        },
-        ToolDef {
-            name: UPDATE_PLUGIN,
-            description: "Check whether a plugin installed from someone else has a newer version at the source it came from (its file, link, release or repository): its version and what it changes in what the plugin asks (`added`, `removed`); without an id, check every installed plugin. Installing an update is the person's, in Zeron (Settings → Plugins): you can't update it for them, so tell them what you found.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "The plugin's id, from list_plugins; without one, every installed plugin." },
-                    "check": { "type": "boolean", "description": "Kept for older callers: this tool only ever checks." }
-                }
-            }),
-        },
-        ToolDef {
-            name: DESCRIBE_ELEMENTS,
-            description: "Where a Zeron plugin can place its nodes: Zeron's named elements, each with its selector (#id or .class), where it is in words, what it is, what it provides to what's placed in it (session, message, file, project, panel; everything has profile, appearance and route), whether the window running now has it (a template may rename or leave out elements), and whether it's stable (kept across Zeron's updates and by every template: place by those where you can). Place with zeron.place { at = \"<selector>\", before | after | replace = function() return <node> end }; selectors also take `#a >> .b` (inside) and role:button \"Name\". In the built node read what's provided with zeron.context(name) (nil where absent) or zeron.need(name) (it draws nothing there, and Settings says why). Records hold only what the plugin was allowed: sessions.read, messages.read, profile.read, account.email, files.read (without it a file is an id of the plugin's own, never its path). The reply links the plugin authoring guide (`guide`).",
-            input_schema: json!({ "type": "object", "properties": {} }),
-        },
-        ToolDef {
-            name: LIST_TEMPLATES,
-            description: "Zeron's templates on this device. A template is a whole copy of Zeron's interface (its Luau app: app.luau, screens/, ds/, assets/) that you can rewrite; it inherits Zeron's own for any file it lacks. Each one's id, name, folder, whether it's the one in use, and its status: ok, errors (some files fall back to Zeron's own; template_status says why), out_of_date (made for another version of Zeron: Zeron has updated since; template_status names the files whose Zeron original changed) or broken. Zeron's own comes first. One installed from someone's package (import_template) has `imported` (who signed it); packages waiting for the person to allow them are under `pending`.",
-            input_schema: json!({ "type": "object", "properties": {} }),
-        },
-        ToolDef {
-            name: CREATE_TEMPLATE,
-            description: "Make a new template on this device: a whole copy of Zeron's interface (or of another template, with `from`) in its own folder, to rewrite. Returns its folder, its files and a short map of the app. Delete any file to inherit Zeron's own. While Zeron is open and the template is in use (use_template), each edit shows live as you save it. A file with an error falls back to Zeron's own for that file, and template_status says why. `id` is lowercase letters, digits and dashes (2-40). The reply links the authoring guide (`guide`): read it before writing.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,39}$", "description": "The template's id and folder name, e.g. midnight." },
-                    "name": { "type": "string", "description": "Its display name, e.g. Midnight." },
-                    "from": { "type": "string", "description": "A template to start from, from list_templates (default zeron, Zeron's own)." }
-                },
-                "required": ["id", "name"]
-            }),
-        },
-        ToolDef {
-            name: USE_TEMPLATE,
-            description: "Run Zeron's window with a template: it switches live while Zeron is open. `zeron` is Zeron's own interface. Only templates installed on this device can be used. Unless the person has kept this template in Zeron, it runs as a preview (`preview`): Zeron shows them a bar to Keep or Revert it, and holds back what only a kept template may do until they keep it. You can't keep it for them; ask them to look.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "A template's id, from list_templates, or zeron." }
-                },
-                "required": ["id"]
-            }),
-        },
-        ToolDef {
-            name: TEMPLATE_STATUS,
-            description: "How a template is doing: whether it's in use, the error that broke it (root_error), the files with errors (each falls back to Zeron's own, with the error), the files out of date (Zeron's own has changed since they were copied), how many files it has, and how many it inherits from Zeron.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "A template's id, from list_templates." }
-                },
-                "required": ["id"]
-            }),
-        },
-        ToolDef {
-            name: DELETE_TEMPLATE,
-            description: "Delete a template: its folder is set aside in the templates folder's .removed. Deleting the one in use switches the window back to Zeron's own. Zeron's own can't be deleted.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "A template's id, from list_templates." }
-                },
-                "required": ["id"]
-            }),
-        },
-        ToolDef {
-            name: DESCRIBE_APP,
-            description: "What Zeron's interface is made of, to find your way in a template: its screens (each one's module, file, what it draws, and the elements it names: #ids and .classes, which plugins place by; keep them to keep plugins working) and a short map of the app's folders. For where plugins can place in the window running now, use describe_elements. The reply links the template authoring guide (`guide`).",
-            input_schema: json!({ "type": "object", "properties": {} }),
-        },
-        ToolDef {
-            name: EXPORT_TEMPLATE,
-            description: "Share a template: save it as one signed .zeron-template file, signed with this device's key (the person's Zeron account vouches for it, as for their plugins). It holds the template's own files and its preview; the files no template may replace (screens/plugins, screens/templates, account/, .luaurc) are left out. Zeron's own can't be exported. It's saved in Zeron's exports folder (an earlier export of it there is replaced). Returns the file's path, how many files it holds and the key that signed it.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "A template's id, from list_templates." }
-                },
-                "required": ["id"]
-            }),
-        },
-        ToolDef {
-            name: IMPORT_TEMPLATE,
-            description: "Install a template from a .zeron-template file (`path`) or a link (`url`: to a .zeron-template file, or a GitHub repository or release with one; a template from a link is checked there for updates). Zeron checks its signature over every file first: an unsigned or changed package is refused. One signed on this device installs at once (using it still runs as a preview until the person keeps it). Anyone else's waits for the person: a template runs as Zeron's own code with all its powers, so they must allow it in Zeron's window (Templates shows it waiting, with who signed it); you can't allow it for them. The reply says which: `installed` (its id), or `pending` with `needs_consent`. Files no template may replace are never installed (`ignored` names them). list_templates shows it once installed.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "The .zeron-template file's full path." },
-                    "url": { "type": "string", "description": "Or a link: a .zeron-template file's, or a GitHub repository or release (e.g. owner/repo) with one." }
-                }
-            }),
-        },
-    ]
+fn without_action(mut args: Value) -> Value {
+    if let Some(fields) = args.as_object_mut() {
+        fields.remove("action");
+    }
+    args
 }
 
 #[derive(Deserialize)]
@@ -414,7 +373,7 @@ impl Tools {
     }
 
     /// A plugin tool call, attributed to the chat this server speaks for.
-    pub(super) async fn call_plugin_tool(&self, name: &str, args: Value) -> Result<Value, String> {
+    pub(super) async fn call_plugin_tool(&self, name: &str, args: Value) -> Result<Value, ToolError> {
         let mut params = json!({ "mcp_name": name, "args": args });
         if let Some(chat) = &self.zeron.origin().chat_id {
             params["chatId"] = json!(chat);
@@ -425,16 +384,17 @@ impl Tools {
             .await
             .map_err(plain)?;
         if reply.get("ok").and_then(Value::as_bool) == Some(false) {
-            return Err(reply
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("The plugin tool failed")
-                .to_owned());
+            return Err(ToolError::rejected(
+                reply
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("The plugin tool failed"),
+            ));
         }
         Ok(reply.get("value").cloned().unwrap_or(Value::Null))
     }
 
-    pub(super) async fn create_plugin(&self, args: Value) -> Result<Value, String> {
+    pub(super) async fn create_plugin(&self, args: Value) -> Result<Value, ToolError> {
         let args: CreatePluginArgs = parse(args)?;
         let mut params = json!({ "id": args.id, "name": args.name });
         if let Some(description) = args.description {
@@ -464,16 +424,34 @@ impl Tools {
             reply["guide"] = json!(guide);
             reply["guide_summary"] = item.get("guide_summary").cloned().unwrap_or(Value::Null);
             reply["hint"] = json!(format!(
-                "Read {guide} first (how to write a plugin, with examples). Then edit {dir}/init.luau; Zeron re-signs and reloads it as you save. Check it with plugin_status (snapshot: true)."
+                "Read {guide} first (how to write a plugin, with examples). Then edit {dir}/init.luau; Zeron re-signs and reloads it as you save. Check it with plugins {{action: status, snapshot: true}}."
             ));
         }
         Ok(reply)
     }
 
+    pub(super) async fn plugins(&self, tool: &str, args: Value) -> Result<Value, ToolError> {
+        if tool == PLUGINS {
+            return match action_of(&args, &PLUGIN_ACTIONS)?.as_str() {
+                "list" => self.list_plugins().await,
+                "status" => self.plugin_status(without_action(args)).await,
+                "elements" => self.describe_elements().await,
+                "updates" => self.update_plugin(without_action(args)).await,
+                "create" => self.create_plugin(without_action(args)).await,
+                _ => self.install_plugin(without_action(args)).await,
+            };
+        }
+        let action = action_of(&args, &TEMPLATE_ACTIONS)?;
+        match action.as_str() {
+            EXPORT_TEMPLATE | "import" => self.template_packages(&action, without_action(args)).await,
+            _ => self.templates(&action, without_action(args)).await,
+        }
+    }
+
     /// The template tools: the engine's `ListTemplates`, `CreateTemplate`,
     /// `UseTemplate`, `TemplateStatus`, `DeleteTemplate` and `DescribeApp`,
     /// as they answer.
-    pub(super) async fn templates(&self, tool: &str, args: Value) -> Result<Value, String> {
+    pub(super) async fn templates(&self, tool: &str, args: Value) -> Result<Value, ToolError> {
         let args: TemplateArgs = parse(args)?;
         let (method, needs_id) = match tool {
             LIST_TEMPLATES => (methods::LIST_TEMPLATES, false),
@@ -486,13 +464,13 @@ impl Tools {
         let mut params = json!({});
         if needs_id {
             let Some(id) = args.id.filter(|id| !id.trim().is_empty()) else {
-                return Err("Say which template: `id`, from list_templates.".into());
+                return Err(ToolError::invalid("Say which template: `id`, from templates {action: list}."));
             };
             params["id"] = json!(id);
         }
         if method == methods::CREATE_TEMPLATE {
             let Some(name) = args.name.filter(|name| !name.trim().is_empty()) else {
-                return Err("Give the template a `name`.".into());
+                return Err(ToolError::invalid("Give the template a `name`."));
             };
             params["name"] = json!(name);
             if let Some(from) = args.from.filter(|from| !from.trim().is_empty()) {
@@ -511,11 +489,11 @@ impl Tools {
     /// `export_template` and `import_template`: the engine's
     /// `ExportTemplate` and `ImportTemplate`. Allowing someone else's is the
     /// person's, in Zeron's own window: no tool answers for them.
-    pub(super) async fn template_packages(&self, tool: &str, args: Value) -> Result<Value, String> {
+    pub(super) async fn template_packages(&self, tool: &str, args: Value) -> Result<Value, ToolError> {
         let args: PackageArgs = parse(args)?;
         let (method, params) = if tool == EXPORT_TEMPLATE {
             let Some(id) = args.id.filter(|id| !id.trim().is_empty()) else {
-                return Err("Say which template: `id`, from list_templates.".into());
+                return Err(ToolError::invalid("Say which template: `id`, from templates {action: list}."));
             };
             // Always to Zeron's exports folder (the reply says where): a
             // path of an agent's choosing is the person's, and refused.
@@ -525,7 +503,7 @@ impl Tools {
             match (path, args.url.filter(|u| !u.trim().is_empty())) {
                 (Some(path), None) => (methods::IMPORT_TEMPLATE, json!({ "path": path })),
                 (None, Some(url)) => (methods::IMPORT_TEMPLATE, json!({ "url": url })),
-                _ => return Err("Say what to import: `path`, a .zeron-template file, or `url`, a link to one.".into()),
+                _ => return Err(ToolError::invalid("Say what to import: `path`, a .zeron-template file, or `url`, a link to one.")),
             }
         };
         let mut reply = self.zeron.call_rpc(method, params).await.map_err(plain)?;
@@ -537,7 +515,7 @@ impl Tools {
         Ok(reply)
     }
 
-    pub(super) async fn list_plugins(&self) -> Result<Value, String> {
+    pub(super) async fn list_plugins(&self) -> Result<Value, ToolError> {
         let reply = self
             .zeron
             .call_rpc(methods::LIST_PLUGINS, json!({}))
@@ -570,7 +548,7 @@ impl Tools {
     }
 
     /// The engine's `PluginStatus`.
-    pub(super) async fn plugin_status(&self, args: Value) -> Result<Value, String> {
+    pub(super) async fn plugin_status(&self, args: Value) -> Result<Value, ToolError> {
         #[derive(Deserialize)]
         struct Args {
             id: String,
@@ -586,7 +564,7 @@ impl Tools {
 
     /// `install_plugin`: the engine's `InstallPlugin`. Allowing someone
     /// else's is the person's, in Zeron's window.
-    pub(super) async fn install_plugin(&self, args: Value) -> Result<Value, String> {
+    pub(super) async fn install_plugin(&self, args: Value) -> Result<Value, ToolError> {
         #[derive(Deserialize)]
         struct Args {
             path: Option<String>,
@@ -600,7 +578,7 @@ impl Tools {
         let params = match (given(args.path), given(args.url)) {
             (Some(path), None) => json!({ "path": path }),
             (None, Some(url)) => json!({ "url": url, "ref": given(args.git_ref), "folder": given(args.folder) }),
-            _ => return Err("Give one of `path` (a .zeron-plugin file) or `url` (a link or repository).".into()),
+            _ => return Err(ToolError::invalid("Give one of `path` (a .zeron-plugin file) or `url` (a link or repository).")),
         };
         let reply = self.zeron.call_rpc(methods::INSTALL_PLUGIN, params).await.map_err(plain)?;
         Ok(installed(reply))
@@ -608,7 +586,7 @@ impl Tools {
 
     /// `update_plugin`: `CheckPluginUpdates` only. Installing an update is
     /// the person's (`UpdatePlugin` is closed to agents).
-    pub(super) async fn update_plugin(&self, args: Value) -> Result<Value, String> {
+    pub(super) async fn update_plugin(&self, args: Value) -> Result<Value, ToolError> {
         #[derive(Deserialize)]
         struct Args {
             id: Option<String>,
@@ -634,7 +612,7 @@ impl Tools {
     }
 
     /// The engine's `DescribeElements`, as the window wrote it.
-    pub(super) async fn describe_elements(&self) -> Result<Value, String> {
+    pub(super) async fn describe_elements(&self) -> Result<Value, ToolError> {
         self.zeron
             .call_rpc(methods::DESCRIBE_ELEMENTS, json!({}))
             .await
@@ -841,7 +819,7 @@ mod tests {
         let engine = Arc::new(Engine::default());
         let tools = tools_for(engine.clone(), None);
 
-        let listed = tools.call(LIST_TEMPLATES, json!({})).await.unwrap();
+        let listed = tools.call("templates", json!({ "action": "list" })).await.unwrap();
         assert_eq!(listed["templates"][1]["error"], "ds/tokens.luau: boom");
         assert_eq!(
             last_call(&engine),
@@ -850,8 +828,8 @@ mod tests {
 
         let made = tools
             .call(
-                CREATE_TEMPLATE,
-                json!({ "id": "midnight", "name": "Midnight", "from": "dusk" }),
+                "templates",
+                json!({ "action": "create", "id": "midnight", "name": "Midnight", "from": "dusk" }),
             )
             .await
             .unwrap();
@@ -865,8 +843,8 @@ mod tests {
         );
         tools
             .call(
-                CREATE_TEMPLATE,
-                json!({ "id": "midnight", "name": "Midnight" }),
+                "templates",
+                json!({ "action": "create", "id": "midnight", "name": "Midnight" }),
             )
             .await
             .unwrap();
@@ -877,7 +855,7 @@ mod tests {
 
         // R7: an agent's switch is a preview until the person keeps it.
         let used = tools
-            .call(USE_TEMPLATE, json!({ "id": "midnight" }))
+            .call("templates", json!({ "action": "use", "id": "midnight" }))
             .await
             .unwrap();
         assert_eq!((used["active"].as_str(), used["preview"].as_bool()), (Some("midnight"), Some(true)));
@@ -892,21 +870,22 @@ mod tests {
         // The engine's words come back as they are.
         assert_eq!(
             tools
-                .call(USE_TEMPLATE, json!({ "id": "nope" }))
+                .call("templates", json!({ "action": "use", "id": "nope" }))
                 .await
-                .unwrap_err(),
+                .unwrap_err()
+                .message,
             "There's no template nope. list_templates names them."
         );
 
         let status = tools
-            .call(TEMPLATE_STATUS, json!({ "id": "midnight" }))
+            .call("templates", json!({ "action": "status", "id": "midnight" }))
             .await
             .unwrap();
         assert_eq!(status["file_errors"]["ds/tokens.luau"], "boom");
         assert_eq!(last_call(&engine).0, methods::TEMPLATE_STATUS);
 
         let deleted = tools
-            .call(DELETE_TEMPLATE, json!({ "id": "midnight" }))
+            .call("templates", json!({ "action": "delete", "id": "midnight" }))
             .await
             .unwrap();
         assert_eq!(deleted, json!({ "deleted": "midnight", "active": "zeron" }));
@@ -918,7 +897,7 @@ mod tests {
             )
         );
 
-        let described = tools.call(DESCRIBE_APP, json!({})).await.unwrap();
+        let described = tools.call("templates", json!({ "action": "app" })).await.unwrap();
         assert_eq!(described["screens"][0]["elements"], json!(["#sidebar"]));
         assert_eq!(
             last_call(&engine),
@@ -932,7 +911,7 @@ mod tests {
         let tools = tools_for(engine.clone(), None);
 
         let exported = tools
-            .call(EXPORT_TEMPLATE, json!({ "id": "midnight", "path": "/Users/x/.ssh/x.zeron-template" }))
+            .call("templates", json!({ "action": "export", "id": "midnight", "path": "/Users/x/.ssh/x.zeron-template" }))
             .await
             .unwrap();
         assert_eq!(exported["files"], 12);
@@ -941,7 +920,7 @@ mod tests {
 
         // Yours: installed.
         let mine = tools
-            .call(IMPORT_TEMPLATE, json!({ "path": "/x/mine.zeron-template" }))
+            .call("templates", json!({ "action": "import", "path": "/x/mine.zeron-template" }))
             .await
             .unwrap();
         assert_eq!(mine["installed"], "midnight");
@@ -952,7 +931,7 @@ mod tests {
         );
         // Someone else's: waiting for the person, and the reply says so.
         let theirs = tools
-            .call(IMPORT_TEMPLATE, json!({ "path": "/x/theirs.zeron-template" }))
+            .call("templates", json!({ "action": "import", "path": "/x/theirs.zeron-template" }))
             .await
             .unwrap();
         assert_eq!(theirs["needs_consent"], true);
@@ -960,7 +939,7 @@ mod tests {
         // Refused, in the engine's words.
         assert!(
             tools
-                .call(IMPORT_TEMPLATE, json!({ "path": "/x/bad.zeron-template" }))
+                .call("templates", json!({ "action": "import", "path": "/x/bad.zeron-template" }))
                 .await
                 .unwrap_err()
                 .contains("changed after it was signed")
@@ -968,23 +947,20 @@ mod tests {
 
         // What's missing never reaches the engine.
         let before = engine.calls.lock().unwrap().len();
-        assert!(tools.call(EXPORT_TEMPLATE, json!({ "path": "/x/a.zeron-template" })).await.unwrap_err().contains("`id`"));
-        assert!(tools.call(IMPORT_TEMPLATE, json!({ "path": " " })).await.unwrap_err().contains("`path`"));
+        assert!(tools.call("templates", json!({ "action": "export", "path": "/x/a.zeron-template" })).await.unwrap_err().message.contains("`id`"));
+        assert!(tools.call("templates", json!({ "action": "import", "path": " " })).await.unwrap_err().message.contains("`path`"));
         assert_eq!(engine.calls.lock().unwrap().len(), before);
 
         // No tool decides for the person.
         let catalog = super::super::catalog();
         assert!(catalog.iter().all(|d| !d.name.contains("decide") && !d.name.contains("allow")));
-        let export = catalog.iter().find(|d| d.name == EXPORT_TEMPLATE).unwrap();
-        assert!(export.input_schema["properties"].get("path").is_none());
-        // Importing takes a file or a link.
-        let import = catalog.iter().find(|d| d.name == IMPORT_TEMPLATE).unwrap();
+        let templates = catalog.iter().find(|d| d.name == TEMPLATES).unwrap();
         for field in ["path", "url"] {
-            assert!(import.input_schema["properties"].get(field).is_some(), "{field}");
+            assert!(templates.input_schema["properties"].get(field).is_some(), "{field}");
         }
-        assert!(tools.call(IMPORT_TEMPLATE, json!({ "path": "/x/a.zeron-template", "url": "ada/midnight" })).await.is_err());
+        assert!(tools.call("templates", json!({ "action": "import", "path": "/x/a.zeron-template", "url": "ada/midnight" })).await.is_err());
         let before = engine.calls.lock().unwrap().len();
-        let _ = tools.call(IMPORT_TEMPLATE, json!({ "url": "ada/midnight" })).await;
+        let _ = tools.call("templates", json!({ "action": "import", "url": "ada/midnight" })).await;
         let calls = engine.calls.lock().unwrap();
         assert_eq!(calls.len(), before + 1);
         assert!(format!("{:?}", calls.last().unwrap()).contains("ada/midnight"));
@@ -994,53 +970,43 @@ mod tests {
     async fn template_tools_need_an_id() {
         let engine = Arc::new(Engine::default());
         let tools = tools_for(engine.clone(), None);
-        for tool in [
+        for action in [
             CREATE_TEMPLATE,
             USE_TEMPLATE,
             TEMPLATE_STATUS,
             DELETE_TEMPLATE,
         ] {
             let error = tools
-                .call(tool, json!({ "name": "Midnight" }))
+                .call("templates", json!({ "action": action, "name": "Midnight" }))
                 .await
                 .unwrap_err();
-            assert!(error.contains("`id`"), "{tool}: {error}");
+            assert!(error.message.contains("`id`"), "{action}: {error}");
+            assert_eq!(error.code, crate::error::INVALID_ARGUMENTS);
             assert!(
                 tools
-                    .call(tool, json!({ "id": " ", "name": "Midnight" }))
+                    .call("templates", json!({ "action": action, "id": " ", "name": "Midnight" }))
                     .await
                     .is_err(),
-                "{tool}"
+                "{action}"
             );
         }
+        let unknown = tools.call("templates", json!({ "action": "rename" })).await.unwrap_err();
+        assert!(unknown.message.contains("one of: list, status"), "{unknown}");
         assert!(
             tools
-                .call(CREATE_TEMPLATE, json!({ "id": "midnight" }))
+                .call("templates", json!({ "action": "create", "id": "midnight" }))
                 .await
                 .unwrap_err()
+                .message
                 .contains("`name`")
         );
         // None of them reached the engine.
         assert!(engine.calls.lock().unwrap().is_empty());
-        // Every one is in the catalog with `id` required where it's needed.
         let catalog = super::super::catalog();
-        for tool in [
-            CREATE_TEMPLATE,
-            USE_TEMPLATE,
-            TEMPLATE_STATUS,
-            DELETE_TEMPLATE,
-        ] {
-            let def = catalog.iter().find(|d| d.name == tool).unwrap();
-            assert!(
-                def.input_schema["required"]
-                    .as_array()
-                    .unwrap()
-                    .contains(&json!("id")),
-                "{tool}"
-            );
-        }
-        for tool in [LIST_TEMPLATES, DESCRIBE_APP] {
-            assert!(catalog.iter().any(|d| d.name == tool), "{tool}");
+        let templates = catalog.iter().find(|d| d.name == TEMPLATES).unwrap();
+        let actions = templates.input_schema["properties"]["action"]["enum"].as_array().unwrap();
+        for action in [LIST_TEMPLATES, DESCRIBE_APP, CREATE_TEMPLATE, USE_TEMPLATE, TEMPLATE_STATUS, DELETE_TEMPLATE] {
+            assert!(actions.contains(&json!(action)), "{action}");
         }
     }
 
@@ -1055,7 +1021,7 @@ mod tests {
     #[test]
     fn plugin_tool_names_are_told_apart_from_static_ones() {
         assert!(is_plugin_tool_name("word_count__count_words"));
-        assert!(!is_plugin_tool_name("list_plugins"));
+        assert!(!is_plugin_tool_name("plugins"));
         assert!(!is_plugin_tool_name("__count"));
         assert!(!is_plugin_tool_name("Word__count"));
         for def in super::super::catalog() {
@@ -1067,9 +1033,9 @@ mod tests {
     async fn tools_list_includes_plugin_tools() {
         let tools = tools_for(Arc::new(Engine::default()), Some("chat-1"));
         let listed = tools.list_all().await;
-        assert!(listed.iter().any(|t| t.name == "whoami"));
-        assert!(listed.iter().any(|t| t.name == CREATE_PLUGIN));
-        assert!(listed.iter().any(|t| t.name == LIST_PLUGINS));
+        assert!(listed.iter().any(|t| t.name == "catalog"));
+        assert!(listed.iter().any(|t| t.name == PLUGINS));
+        assert!(listed.iter().any(|t| t.name == TEMPLATES));
         let plugin = listed
             .iter()
             .find(|t| t.name == "word_count__count_words")
@@ -1127,7 +1093,8 @@ mod tests {
             tools
                 .call("word_count__count_words", json!({}))
                 .await
-                .unwrap_err(),
+                .unwrap_err()
+                .message,
             "Open Zeron on Studio to use count_words"
         );
         let reply = crate::jsonrpc::handle_request(
@@ -1139,7 +1106,7 @@ mod tests {
         .await;
         assert_eq!(reply["result"]["isError"], true);
         assert_eq!(
-            reply["result"]["content"][0]["text"],
+            reply["result"]["structuredContent"]["message"],
             "Open Zeron on Studio to use count_words"
         );
     }
@@ -1150,8 +1117,8 @@ mod tests {
         let tools = tools_for(engine.clone(), None);
         let created = tools
             .call(
-                CREATE_PLUGIN,
-                json!({ "id": "focus", "name": "Focus", "permissions": ["ui.add"] }),
+                "plugins",
+                json!({ "action": "create", "id": "focus", "name": "Focus", "permissions": ["ui.add"] }),
             )
             .await
             .unwrap();
@@ -1163,7 +1130,7 @@ mod tests {
         );
         assert_eq!(
             created["hint"],
-            "Read /nowhere/docs/plugins.md first (how to write a plugin, with examples). Then edit /nowhere/plugins/focus/init.luau; Zeron re-signs and reloads it as you save. Check it with plugin_status (snapshot: true)."
+            "Read /nowhere/docs/plugins.md first (how to write a plugin, with examples). Then edit /nowhere/plugins/focus/init.luau; Zeron re-signs and reloads it as you save. Check it with plugins {action: status, snapshot: true}."
         );
         assert_eq!(created["guide"], "/nowhere/docs/plugins.md");
         {
@@ -1175,7 +1142,7 @@ mod tests {
                 &json!({ "id": "focus", "name": "Focus", "permissions": ["ui.add"] })
             );
         }
-        let listed = tools.call(LIST_PLUGINS, json!({})).await.unwrap();
+        let listed = tools.call("plugins", json!({ "action": "list" })).await.unwrap();
         assert_eq!(
             listed,
             json!({ "plugins": [{
@@ -1187,13 +1154,13 @@ mod tests {
             engine.calls.lock().unwrap().last().unwrap().0,
             methods::LIST_PLUGINS
         );
-        let status = tools.call(PLUGIN_STATUS, json!({ "id": "focus", "snapshot": true })).await.unwrap();
+        let status = tools.call("plugins", json!({ "action": "status", "id": "focus", "snapshot": true })).await.unwrap();
         assert_eq!(status["placements"][0]["count"], 3);
         assert_eq!(
             last_call(&engine),
             (methods::PLUGIN_STATUS.to_owned(), json!({ "id": "focus", "snapshot": true }))
         );
-        let map = tools.call(DESCRIBE_ELEMENTS, json!({})).await.unwrap();
+        let map = tools.call("plugins", json!({ "action": "elements" })).await.unwrap();
         assert_eq!(map["elements"][0]["selector"], ".session-row");
         assert_eq!(
             engine.calls.lock().unwrap().last().unwrap().0,
@@ -1206,7 +1173,7 @@ mod tests {
         let engine = Arc::new(Engine::default());
         let tools = tools_for(engine.clone(), None);
         let installed = tools
-            .call(INSTALL_PLUGIN, json!({ "url": "ada/focus", "ref": "v1", "folder": " " }))
+            .call("plugins", json!({ "action": "install", "url": "ada/focus", "ref": "v1", "folder": " " }))
             .await
             .unwrap();
         assert_eq!(
@@ -1215,20 +1182,20 @@ mod tests {
         );
         assert_eq!((installed["status"].as_str(), installed["waiting"].as_bool()), (Some("pending"), Some(true)));
         assert!(installed["next"].as_str().unwrap().contains("can't allow it for them"));
-        tools.call(INSTALL_PLUGIN, json!({ "path": "/x/focus.zeron-plugin" })).await.unwrap();
+        tools.call("plugins", json!({ "action": "install", "path": "/x/focus.zeron-plugin" })).await.unwrap();
         assert_eq!(last_call(&engine), (methods::INSTALL_PLUGIN.to_owned(), json!({ "path": "/x/focus.zeron-plugin" })));
-        assert!(tools.call(INSTALL_PLUGIN, json!({})).await.unwrap_err().contains("`path`"));
-        assert!(tools.call(INSTALL_PLUGIN, json!({ "path": "/a", "url": "b/c" })).await.unwrap_err().contains("one of"));
+        assert!(tools.call("plugins", json!({ "action": "install" })).await.unwrap_err().message.contains("`path`"));
+        assert!(tools.call("plugins", json!({ "action": "install", "path": "/a", "url": "b/c" })).await.unwrap_err().message.contains("one of"));
 
-        let checked = tools.call(UPDATE_PLUGIN, json!({ "check": true })).await.unwrap();
+        let checked = tools.call("plugins", json!({ "action": "updates", "check": true })).await.unwrap();
         assert_eq!(checked["updates"][0]["added"], json!(["github"]));
         assert_eq!(last_call(&engine), (methods::CHECK_PLUGIN_UPDATES.to_owned(), json!({ "id": null })));
         // R6: updating is the person's. The tool only checks, and says so.
-        let updated = tools.call(UPDATE_PLUGIN, json!({ "id": "focus" })).await.unwrap();
+        let updated = tools.call("plugins", json!({ "action": "updates", "id": "focus" })).await.unwrap();
         assert_eq!(updated["updates"][0]["version"], "2.0.0");
         assert!(updated["next"].as_str().unwrap().contains("can't update it for them"));
         assert_eq!(last_call(&engine), (methods::CHECK_PLUGIN_UPDATES.to_owned(), json!({ "id": "focus" })));
-        tools.call(UPDATE_PLUGIN, json!({})).await.unwrap();
+        tools.call("plugins", json!({ "action": "updates" })).await.unwrap();
         assert!(
             engine.calls.lock().unwrap().iter().all(|(method, _)| method != methods::UPDATE_PLUGIN),
             "the tool never installs an update"

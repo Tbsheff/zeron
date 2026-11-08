@@ -85,9 +85,9 @@ async fn pty_states_match_sidebar_mcp_and_synced_registry_without_a_viewport() {
     assert!(working.last_completed_turn.is_none());
     assert_eq!(
         tools
-            .call("get_chat", serde_json::json!({"chat":"chat"}))
+            .call("read_chat", serde_json::json!({"chat":"chat","limit":0}))
             .await
-            .unwrap()["status"],
+            .unwrap()["chat"]["status"],
         "working"
     );
 
@@ -134,17 +134,17 @@ async fn pty_states_match_sidebar_mcp_and_synced_registry_without_a_viewport() {
     );
     assert_eq!(
         tools
-            .call("get_chat", serde_json::json!({"chat":"chat"}))
+            .call("read_chat", serde_json::json!({"chat":"chat","limit":0}))
             .await
-            .unwrap()["status"],
+            .unwrap()["chat"]["status"],
         "completed"
     );
     core.workspace.mark_chat_seen("chat", Utc::now()).unwrap();
     assert_eq!(
         tools
-            .call("get_chat", serde_json::json!({"chat":"chat"}))
+            .call("read_chat", serde_json::json!({"chat":"chat","limit":0}))
             .await
-            .unwrap()["status"],
+            .unwrap()["chat"]["status"],
         "idle"
     );
 
@@ -173,9 +173,9 @@ async fn pty_states_match_sidebar_mcp_and_synced_registry_without_a_viewport() {
     // A finished root does not hide its still-blocked worker.
     assert_eq!(
         tools
-            .call("get_chat", serde_json::json!({"chat":"chat"}))
+            .call("read_chat", serde_json::json!({"chat":"chat","limit":0}))
             .await
-            .unwrap()["status"],
+            .unwrap()["chat"]["status"],
         "awaitingInput"
     );
     core.terminals.close(&terminal.id).unwrap();
@@ -195,9 +195,9 @@ async fn pty_states_match_sidebar_mcp_and_synced_registry_without_a_viewport() {
     .unwrap();
     assert_eq!(
         tools
-            .call("get_chat", serde_json::json!({"chat":"chat"}))
+            .call("read_chat", serde_json::json!({"chat":"chat","limit":0}))
             .await
-            .unwrap()["status"],
+            .unwrap()["chat"]["status"],
         "idle"
     );
     // A lost terminal owner must not turn a blocked report into success.
@@ -219,10 +219,12 @@ async fn pty_states_match_sidebar_mcp_and_synced_registry_without_a_viewport() {
     })
     .await
     .unwrap();
-    let summary = tools
-        .call("get_chat", serde_json::json!({"chat":"chat"}))
+    let read = tools
+        .call("read_chat", serde_json::json!({"chat":"chat","limit":0}))
         .await
         .unwrap();
+    assert!(read["pendingInput"].is_null(), "stale reports no question");
+    let summary = &read["chat"];
     assert_eq!(summary["status"], "idle");
     assert_eq!(summary["statusStale"], true);
     let waited = tools

@@ -19,555 +19,129 @@ use zeron_proto::{
     Space, UserInputAnswer,
 };
 
+use crate::error::ToolError;
 use crate::transcript::{RenderOptions, RenderedMessage, render_entries};
 use crate::zeron::{HarnessInfo, TurnOutcome, Zeron, session_for, short};
 
+mod defs;
 mod plugins;
 mod themes;
+mod visual;
 pub use plugins::ListedTool;
 pub(crate) use plugins::is_plugin_tool_name;
+use visual::{SHOW_IMAGE, SHOW_VISUAL, VISUAL_REFERENCE, WAIT_ON_BACKGROUND};
 
-/// Default and ceiling for the blocking waits.
 const MAX_BATCH: usize = 32;
-/// Cloud runs these agents (Codex and Claude Code): a Cloud chat's harness.
 const CLOUD_HARNESSES: &[HarnessId] = &[HarnessId::ClaudeCode, HarnessId::Codex];
 const DEFAULT_WAIT: Duration = Duration::from_secs(600);
 const MAX_WAIT: Duration = Duration::from_secs(3600);
+const COLLECT_NEXT: &str = "The chats work in parallel now. Collect each reply with wait_for_turn {chat: chatId} (do other work first if you have it). Do not poll read_chat.";
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hints {
+    pub read_only: bool,
+    pub destructive: bool,
+    pub idempotent: bool,
+    pub open_world: bool,
+}
+
+impl Hints {
+    pub const READ: Self = Self {
+        read_only: true,
+        destructive: false,
+        idempotent: true,
+        open_world: false,
+    };
+    pub const WRITE: Self = Self {
+        read_only: false,
+        destructive: false,
+        idempotent: false,
+        open_world: false,
+    };
+
+    pub const fn destructive(self) -> Self {
+        Self {
+            destructive: true,
+            ..self
+        }
+    }
+
+    pub const fn idempotent(self) -> Self {
+        Self {
+            idempotent: true,
+            ..self
+        }
+    }
+
+    pub const fn open_world(self) -> Self {
+        Self {
+            open_world: true,
+            ..self
+        }
+    }
+
+    pub fn to_json(self, title: &str) -> Value {
+        json!({
+            "title": title,
+            "readOnlyHint": self.read_only,
+            "destructiveHint": self.destructive,
+            "idempotentHint": self.idempotent,
+            "openWorldHint": self.open_world,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ToolDef {
     pub name: &'static str,
+    pub title: &'static str,
     pub description: &'static str,
     pub input_schema: Value,
+    pub output_schema: Option<Value>,
+    pub hints: Hints,
+    pub always_load: bool,
+    pub example: &'static str,
 }
+
+type Replay = Arc<tokio::sync::OnceCell<Value>>;
 
 pub struct Tools {
     zeron: Arc<Zeron>,
     // Remember successful sends on this MCP connection so wait_for_turn after
     // wait:false also waits for a newly created chat with no session row yet.
     pending_turns: tokio::sync::Mutex<HashMap<String, Arc<PendingTurn>>>,
+    replays: tokio::sync::Mutex<HashMap<String, Replay>>,
     /// Which plugin tools the client was last shown ([`Self::list_all`],
     /// [`Self::watch_plugin_tools`]).
     plugins: plugins::PluginState,
 }
 
-fn chat_key_schema(extra: Value) -> Value {
-    let mut properties = json!({
-        "chat": {
-            "type": "string",
-            "description": "Chat id, unique id prefix, or exact title."
+pub fn renamed(old: &str) -> Option<&'static str> {
+    Some(match old {
+        "create_chat" => defs::CREATE_CHATS,
+        "send_message" => defs::SEND_MESSAGES,
+        "get_chat" => defs::READ_CHAT,
+        "whoami" | "list_devices" | "list_projects" | "list_harnesses" | "list_models" => defs::CATALOG,
+        "list_plugins" | "plugin_status" | "describe_elements" | "update_plugin" | "create_plugin"
+        | "install_plugin" => plugins::PLUGINS,
+        "list_templates" | "template_status" | "describe_app" | "create_template" | "use_template"
+        | "delete_template" | "export_template" | "import_template" => plugins::TEMPLATES,
+        "list_themes" | "get_theme" | "create_theme" | "update_theme" | "delete_theme" | "use_theme" => {
+            themes::THEMES
         }
-    });
-    if let (Some(base), Some(more)) = (properties.as_object_mut(), extra.as_object()) {
-        for (k, v) in more {
-            base.insert(k.clone(), v.clone());
-        }
-    }
-    json!({ "type": "object", "properties": properties, "required": ["chat"] })
-}
-
-fn device_schema() -> Value {
-    json!({ "type": "string", "description": "Host device id or exact name. Omit for the local engine." })
+        _ => return None,
+    })
 }
 
 fn catalog() -> Vec<ToolDef> {
-    let mut tools = vec![
-        ToolDef {
-            name: "whoami",
-            description: "Which chat and device this server speaks for, plus the engine's workspace mode. Call this first when you need to know your own chat id.",
-            input_schema: json!({ "type": "object", "properties": {} }),
-        },
-        ToolDef {
-            name: "list_devices",
-            description: "Devices in this workspace (the local engine's device is flagged). Chats and projects are hosted on a device.",
-            input_schema: json!({ "type": "object", "properties": {} }),
-        },
-        ToolDef {
-            name: "list_projects",
-            description: "Projects: folders on specific devices. Filter by device (id or name); omit for all projects. Use ids when names or paths repeat.",
-            input_schema: json!({ "type": "object", "properties": { "device": device_schema() } }),
-        },
-        ToolDef {
-            name: "list_harnesses",
-            description: "Agent harnesses (claude-code, codex, cursor, …) on the chosen device (local when omitted). `connected` = installed, enabled and not known to be signed out: those are the providers you can delegate to, whichever provider you are. `signedIn` is null when the login state is unknown.",
-            input_schema: json!({ "type": "object", "properties": { "device": device_schema() } }),
-        },
-        ToolDef {
-            name: "list_models",
-            description: "Models a harness offers on the chosen device (local engine when omitted). Model ids are harness-specific strings; pass one to create_chat.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "harness": { "type": "string", "description": "Harness id, e.g. claude-code or codex." },
-                    "device": device_schema()
-                },
-                "required": ["harness"]
-            }),
-        },
-        ToolDef {
-            name: "list_chats",
-            description: "Chats with project, device, harness/model, sidebar status, and last activity. Status is working, awaitingInput (needs input), completed (unseen result), errored, or idle. statusStale marks expired live reports; terminalActivity explains OSC 7501 reports. sessionStatus is native execution state. Newest activity first.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "project": { "type": "string", "description": "Only chats in this project (id, path, or name)." },
-                    "device": { "type": "string", "description": "Only chats hosted on this device (id or name)." },
-                    "include_archived": { "type": "boolean", "default": false },
-                    "parent": { "type": "string", "description": "Only chats created by this chat (id, prefix, or title) — e.g. your own id to list the chats you spawned." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 }
-                }
-            }),
-        },
-        ToolDef {
-            name: "get_chat",
-            description: "One chat's metadata, live status, and any question its agent is currently blocked on.",
-            input_schema: chat_key_schema(json!({})),
-        },
-        ToolDef {
-            name: "create_chat",
-            description: "Create a child of your chat to delegate work to (kind subagent, the default when you speak from a chat or pass parent: listed under that chat's Subagents and in its transcript's subagent block), a side chat (kind side: only when the person should treat it as a side conversation of their own), or a standalone session (kind chat, no parent). Any connected provider works (see list_harnesses), whichever provider you run on. Delegation is one level deep: a chat that has a parent cannot create chats. With cloud, the chat runs on a Cloud machine of its own (Codex or Claude Code), from a Cloud chat or a project with a GitHub repository. Select a project and/or device; catalogs are validated on that host. Optionally send a first prompt and wait for the reply. For parallel delegation use create_chats, or launch with wait=false and wait only after all chats have started.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "kind": { "type": "string", "enum": ["subagent", "side", "chat"], "description": "subagent (default with a parent or origin chat): delegated work, listed under the parent's Subagents. side: a side conversation for the person, needs a parent or origin. chat: standalone, no parent allowed. Omitted: subagent with a parent/origin, chat otherwise." },
-                    "project": { "type": "string", "description": "Project id, path, or name. Belongs to a specific device; when device is supplied, search only there. Optional." },
-                    "device": { "type": "string", "description": "Host device (id or name). With project, it must own that project. Without either, use the local engine." },
-                    "parent": { "type": "string", "description": "Parent chat to record (id, prefix, or title). Defaults to the chat you are speaking from." },
-                    "harness": { "type": "string", "description": "Harness id (see list_harnesses with the chosen device). Prefers a connected provider, claude-code first." },
-                    "model": { "type": "string", "description": "Model id from list_models on the chosen device. Omit for the harness default." },
-                    "reasoning": { "type": "string", "description": "Reasoning level the model supports (e.g. low, medium, high, max)." },
-                    "sandbox": { "type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"], "default": "workspace-write", "description": "Never wider than the sandbox of the chat you are speaking from: more is lowered to it (accessCapped)." },
-                    "access": { "type": "string", "enum": ["supervised", "auto-accept-edits", "full-access"], "description": "What the agent may do without asking: supervised asks before commands and file changes, auto-accept-edits applies edits and asks before the rest, full-access asks nothing. Questions go to the person in the chat. Must be one of the harness's accessModes (list_harnesses). Defaults to the access of the chat you are speaking from, and never exceeds it: more is lowered to it (the reply's accessCapped says so)." },
-                    "plan": { "type": "boolean", "default": false, "description": "Plan mode: explore and propose a plan before changing anything. Only for harnesses with supportsPlan." },
-                    "title": { "type": "string", "description": "Sidebar title. Otherwise the engine titles it from the first exchange." },
-                    "branch": { "type": "string", "description": "Branch label to record on the chat." },
-                    "cwd": { "type": "string", "description": "Working directory override (an existing worktree path). Defaults to the project folder." },
-                    "cloud": { "type": "boolean", "default": false, "description": "Run on a Cloud machine of its own (cloning the project's GitHub repository) instead of the project's device. From a Cloud chat, the child clones the same repository; without cloud it shares this machine." },
-                    "prompt": { "type": "string", "description": "First message to send right away." },
-                    "wait": { "type": "boolean", "default": false, "description": "With prompt: block until the first turn finishes and return the reply." },
-                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 600 }
-                }
-            }),
-        },
-        ToolDef {
-            name: "read_chat",
-            description: "Read a chat's transcript as plain messages (newest window by default). Tool calls are summarized one per line.",
-            input_schema: chat_key_schema(json!({
-                "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 40, "description": "How many messages, counted from the newest." },
-                "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Skip this many newest messages (paging backwards)." },
-                "include_reasoning": { "type": "boolean", "default": false },
-                "include_tools": { "type": "boolean", "default": true }
-            })),
-        },
-        ToolDef {
-            name: "send_message",
-            description: "Send a message to a chat. Messages are attributed to your chat. mode 'auto' starts a turn when the chat is idle, steers a running turn through its live mailbox (at the next supported input boundary without interrupting the agent). Use mode 'queue' only to explicitly hold a message for later. With wait=true, blocks until the turn finishes and returns the assistant's reply. For parallel work use send_messages, or send to all chats with wait=false before waiting.",
-            input_schema: chat_key_schema(json!({
-                "text": { "type": "string" },
-                "mode": { "type": "string", "enum": ["auto", "run", "steer", "queue"], "default": "auto" },
-                "wait": { "type": "boolean", "default": false },
-                "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 600 }
-            })),
-        },
-        ToolDef {
-            name: "wait_for_turn",
-            description: "Wait for completed, awaitingInput, interrupted, errored, or timedOut. Native pendingInput can be answered with respond_to_input; terminalActivity input must be handled in its terminal. Stale/offline activity is not completion. Returns assistant replies when available.",
-            input_schema: chat_key_schema(json!({
-                "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 600 }
-            })),
-        },
-        ToolDef {
-            name: "interrupt_chat",
-            description: "Stop the chat's running turn.",
-            input_schema: chat_key_schema(json!({})),
-        },
-        ToolDef {
-            name: "respond_to_input",
-            description: "Answer a question the chat's agent is blocked on (see get_chat / wait_for_turn pendingInput). Labels are the option strings, or free text for open questions.",
-            input_schema: chat_key_schema(json!({
-                "request_id": { "type": "string", "description": "The pending request id. Defaults to the chat's current pending question." },
-                "answers": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "question_id": { "type": "string" },
-                            "labels": { "type": "array", "items": { "type": "string" } }
-                        },
-                        "required": ["question_id", "labels"]
-                    }
-                }
-            })),
-        },
-        ToolDef {
-            name: "archive_chat",
-            description: "Archive a chat (hide it from the active sidebar list); pass archived=false to restore. Use it to tidy up chats you created.",
-            input_schema: chat_key_schema(json!({
-                "archived": { "type": "boolean", "default": true }
-            })),
-        },
-    ];
-    for (name, single, description) in [
-        (
-            "create_chats",
-            "create_chat",
-            "Create multiple chats concurrently: subagents of your chat by default, or side/standalone chats (kind per request, as create_chat). Put each chat's prompt in its request to start all work together. Prefer this for parallel delegation, including harnesses that execute tool calls sequentially. Each request has create_chat arguments; wait defaults to false. Results preserve request order and include per-request errors; successful requests are not rolled back.",
-        ),
-        (
-            "send_messages",
-            "send_message",
-            "Send messages to multiple independent chats concurrently. Prefer this to delegate parallel work to existing chats. Each request has send_message arguments; wait defaults to false. If wait=true, requests still run concurrently. Results preserve request order and include per-request errors; successful sends are not rolled back. Do not include dependent messages to the same chat.",
-        ),
-    ] {
-        let item_schema = tools
-            .iter()
-            .find(|tool| tool.name == single)
-            .unwrap()
-            .input_schema
-            .clone();
-        tools.push(ToolDef {
-            name, description,
-            input_schema: json!({
-                "type": "object",
-                "properties": {"requests": {"type": "array", "minItems": 1, "maxItems": MAX_BATCH, "items": item_schema}},
-                "required": ["requests"],
-            }),
-        });
-    }
-    tools.push(ToolDef {
-        name: SHOW_VISUAL,
-        description: SHOW_VISUAL_DESCRIPTION,
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "script": {
-                    "type": "string",
-                    "description": "The Luau visual script: setup at the top level, ending with `return function() return ui.column { ... } end`."
-                },
-                "title": { "type": "string", "description": "Short name for the visual." },
-                "assets": {
-                    "type": "object",
-                    "additionalProperties": { "type": "string" },
-                    "description": "Files the script uses, by the name it uses them: { \"prism.glb\": \"models/prism.glb\", \"sky.hdr\": \"/tmp/sky.hdr\" }. Paths are on this machine, relative to your working directory. glTF models (.glb, or .gltf with everything embedded), PNG, JPEG, WebP, and Radiance .hdr images; at most 16 files, 8 MB each, 10 MB together."
-                }
-            },
-            "required": ["script", "title"]
-        }),
-    });
-    tools.push(ToolDef {
-        name: SHOW_IMAGE,
-        description: SHOW_IMAGE_DESCRIPTION,
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "The image file on this machine, absolute or relative to your working directory."
-                }
-            },
-            "required": ["path"]
-        }),
-    });
-    tools.push(ToolDef {
-        name: WAIT_ON_BACKGROUND,
-        description: WAIT_ON_BACKGROUND_DESCRIPTION,
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "task_ids": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "minItems": 1,
-                    "maxItems": 20,
-                    "description": "The background tasks' ids, as your tools reported them."
-                },
-                "waiting": {
-                    "type": "boolean",
-                    "description": "false takes the marks back. Default true."
-                }
-            },
-            "required": ["task_ids"]
-        }),
-    });
+    let mut tools = defs::catalog();
+    tools.extend(visual::catalog());
     tools.extend(plugins::catalog());
     tools.extend(themes::catalog());
     tools
 }
 
-/// Shows a page in the CALLING chat, so it is offered only to an agent that
-/// Zeron launched (`ZERON_CHAT_ID` set).
-const SHOW_VISUAL: &str = "show_visual";
-
-/// Shows an image file in the CALLING chat; offered like `show_visual`.
-const SHOW_IMAGE: &str = "show_image";
-
-/// Says what the CALLING chat's agent waits on after its turn; offered like
-/// `show_visual`.
-const WAIT_ON_BACKGROUND: &str = "wait_on_background";
-
-const WAIT_ON_BACKGROUND_DESCRIPTION: &str = "\
-Say that you'll wait on background work you started, so this chat reads as waiting (not finished) \
-after your turn ends, until that work ends and you're woken to carry on. Pass the ids your tools \
-gave the background tasks (a background command says the id it runs under). Use it for work you'll \
-come back to: a test run, a build, a long check. Never for something you leave running on purpose \
-(a dev server, a file watcher): nothing is coming, and the chat would look busy. Background agents \
-you started are waited on already. `waiting: false` takes a mark back. It doesn't stop or change \
-the work. Refused where your runtime doesn't wake you when background work ends: wait for the work \
-inside your turn instead.";
-
-const SHOW_IMAGE_DESCRIPTION: &str = "\
-Show an image file (a screenshot, a rendered chart or diagram, a photo) inline in this chat, above \
-your final text reply; call it before writing that reply, once per image, in the order they should \
-appear. PNG, JPEG, WebP, or GIF, at most 10 MB and 4096 pixels on a side. Zeron copies the file \
-into the chat, so it stays visible after the file changes or is deleted. The reader \
-already sees the image, so the reply should not announce or describe it: add only what the image \
-doesn't show.";
-
-const SHOW_VISUAL_DESCRIPTION: &str = "\
-Show an interactive visual (chart, table, dashboard, diagram, simulation, 3D view) inline in this \
-chat, above your final text reply; call it before writing that reply. Use it when a visual says more \
-than prose. The reader already sees it, so the reply should not announce, locate, or restate it: add \
-only what the visual doesn't say. To show an image file as it is (a screenshot, a photo), use \
-show_image instead.\n\
-\n\
-A visual is a Luau script (Lua 5.1 plus `+=`, `continue`, and `if` expressions). Zeron runs it in a \
-sandbox (no I/O or network; math.random is seeded, so data is the same on every render) and renders \
-what it returns with Zeron's own native interface. Build data and state at the top level, then return \
-a view function. Zeron calls the view again after every handler, so handlers just assign to state:\n\
-\n\
-local s = ui.state { metric = \"p95\" }\n\
-local data = { { region = \"us-east\", p95 = 182, p99 = 240 }, { region = \"eu-west\", p95 = 140, p99 = 210 } }\n\
-return function()\n\
-  return ui.column { gap = 16,\n\
-    ui.text { \"Latency by region\", size = \"lg\", weight = 600 },\n\
-    ui.tabs { options = { \"p95\", \"p99\" }, value = s.metric, on_change = function(v) s.metric = v end },\n\
-    ui.chart { type = \"bar\", height = 220, unit = \"ms\",\n\
-      x = ui.map(data, function(d) return d.region end),\n\
-      series = { { name = s.metric, values = ui.map(data, function(d) return d[s.metric] end) } } },\n\
-  }\n\
-end\n\
-\n\
-Zeron runs the script before showing it (setup, render, every draw, and each tab, toggle, slider, and \
-button once) and returns the first error with its line; fix it and call again.\n\
-\n\
-Nodes are props tables: children are the array part, strings are plain text, nil and false children \
-are skipped, and lists of nodes flatten (so ui.map results can be children). Unknown props are errors.\n\
-- ui.column { gap = 8, align = \"start|center|end\", ... }, ui.row { gap = 12, align, justify = \
-\"start|center|end|between\", wrap = true, ... }, ui.grid { columns = 3, gap = 16, ... }. Any node \
-takes width = px or grow = true inside a row (sliders, charts, tables, canvases, and scenes fill a \
-row's spare width by default), and key = \"name\" to keep its hover or camera when the tree changes \
-shape. A row or column with on_click = function() end is clickable; hover = true gives \
-it the hover wash.\n\
-- ui.text { \"plain \", ui.span { \"bold\", weight = 600, color = \"accent\", mono = true }, size = \
-\"xs|sm|body|lg|xl|2xl\", weight = 400-700, color, mono, italic, align, truncate }, or ui.text \"string\".\n\
-- ui.stat { value = \"182 ms\", label = \"p95 latency\", delta = \"-12%\", tone = \"success\" }: a headline \
-figure over a muted label; tone colors the delta.\n\
-- ui.table { columns = { \"Region\", { label = \"p95\", align = \"end\" } }, rows = { { \"us-east\", 182 }, \
-... } }: laid out like a markdown table (bold header, hairline row rules), numbers right-aligned; cells \
-are strings, numbers, or nodes.\n\
-- ui.chart { type = \"bar|line|area|scatter\", height = 220, x = { labels }, series = { { name, values = \
-{ ... }, color } }, stacked, horizontal (bar), min, max, unit = \"ms\", prefix = \"$\", decimals, legend }. \
-Scatter series take points = { { x, y }, ... } (x_unit, x_decimals). Axes, gridlines, the legend, and a \
-hover readout are built in.\n\
-- ui.rule {} is a hairline divider; ui.space { size = 16 }; ui.link { label, url = \"https://...\" } \
-opens like a chat link.\n\
-- Controls: ui.tabs { options = { ... }, value, on_change = function(option) end }, ui.toggle { label, \
-value = bool, on_change = function(on) end }, ui.slider { label, value, min, max, step, unit, on_change \
-= function(n) end }, ui.button { label, on_click = function() end, primary = bool }.\n\
-- ui.canvas { height = 240, draw = function(g, w, h, t) ... end, animate = bool, on_click = \
-function(x, y) end }: 2D drawing in pixels, origin top-left, w = the reply column's width. \
-g:line(x1, y1, x2, y2, { color, width, dash }), g:polyline(pts, { color, width }), g:polygon(pts, \
-{ fill, stroke, width }), g:rect(x, y, w, h, { fill, stroke, radius }), g:circle(x, y, r, { fill, \
-stroke }), g:arc(x, y, r, a0, a1, { color } or { fill, inner = radius } for pie and donut sectors; \
-radians clockwise from 3 o'clock), g:text(x, y, str, { size, color, weight, align = \
-\"start|center|end\", baseline = \"top|middle|bottom\", mono }). pts are { x1, y1, x2, y2, ... } or \
-{ { x, y }, ... }. g.pointer is { x, y, down } while the pointer is over the canvas (draw hover \
-effects with it); t is seconds, and animate = true redraws every frame while visible.\n\
-- ui.scene { height = 320, draw = function(s, t) ... end, orbit = true, spin = 0.3 (turntable \
-radians per second), camera = { yaw = 0.6, pitch = 0.45, zoom = 1 }, animate = bool }: real 3D, y up, \
-rendered on the GPU with depth, soft shadows from a key light, and bloom. Zeron frames the camera on \
-your geometry and the reader drags to orbit. Solids (box, sphere, cylinder, surface, mesh) take \
-material props: roughness (0 mirror to 1 matte), metal (0-1), glow (emits its color and blooms; \
-use for lamps, beams, highlights), glass = true (refracts what's behind it; ior = 1.5, dispersion \
-= 0-1 splits it into a rainbow, as a prism does). Build real forms from several primitives (legs, \
-tops, rims), not single boxes, and give materials so surfaces read as wood, metal, or glass. s:box { at = { x, y, z }, size = { w, h, d } or n, color }, s:sphere { at, radius, color }, \
-s:cylinder { at (base center), radius, height, color }, s:surface { x = { min, max }, z = { min, max }, \
-f = function(x, z) return y end or values = { { ... } }, detail = 32, colors = { \"chart1\", \"chart3\" } \
-(a ramp by height), wire = bool }, s:mesh { vertices = { { x, y, z }, ... }, faces = { { 1, 2, 3 }, ... }, \
-color }, s:line(a, b, { color, width }), s:path(points, { color, width }), s:point(at, { radius, \
-color, hint = \"shown on hover\" }), s:label(at, text, { color, size }), s:grid { size = 10, step = 1 }, \
-s:axes { size = 1, labels = { \"x\", \"y\", \"z\" } }. Physical colors may be \"#rrggbb\" in scenes \
-(a material's own color: gold, glass, wood), and only there.\n\
-- Assets: pass real files in show_visual's assets (name -> path) and scripts use them by name. \
-s:model { asset = \"prism.glb\", at, rotate = { x, y, z } degrees, scale, fit = 2 (center it and size \
-its longest side), color and material props override the model's own } draws a glTF model with its \
-materials and textures. Solids take texture = \"wood.jpg\" (multiplied by color; mesh takes uvs = { { u, v \
-}, ... } per vertex). s:environment { asset = \"studio.hdr\", intensity = 1, background = false } lights \
-the scene from an equirectangular image (an HDR is best) that metal and glass reflect and glass bends; \
-background = true also draws it behind the scene. s:sprite { at, size = 48 (pixels), color, glow = 1, \
-asset = \"flare.png\" } adds a camera-facing light (a flare or glint; a soft round glow without an \
-asset) that blooms. ui.shader takes textures = { \"rock.jpg\", ... } as iTexture0-iTexture3 \
-(repeating, mipmapped). Find or make assets with your own tools (download, convert KTX2 or EXR to PNG \
-or HDR) before calling.\n\
-- ui.shader { height = 360, code = [[ GLSL ]], buffers = { [[ GLSL ]], ... }, inputs = { speed = \
-s.speed }, blend = \"alpha|light|opaque\", bloom = 0-3, orbit = bool, spin, camera = { yaw, pitch, \
-zoom }, animate = true }: GPU shaders for what geometry can't express: raymarched SDFs and \
-fractals, light and optics (beams, refraction, dispersion), volumes, fluids, particles, generative \
-art. Write each pass as on Shadertoy: void mainImage(out vec4 fragColor, in vec2 fragCoord), with \
-iResolution (vec3: width and height in pixels, then the display's pixel density), iTime, \
-iTimeDelta, iFrame, iMouse (pixels from the bottom-left; xy where the pointer is, zw where it went \
-down while it's held, negative otherwise), iCamera (vec4 yaw, pitch, zoom, 0; orbit = true lets the reader drag \
-it), every inputs name as a float (bind them to state so sliders and toggles drive the shader), \
-iNoise (a tiling 256x256 random RGBA texture), and iChannel0-iChannel3 with iChannelResolution: \
-buffers run first, in order, each into a float texture that every pass reads as iChannel<i> (an \
-earlier buffer's current frame; a buffer's own previous frame), for multi-pass work like blur, \
-trails, accumulation, and simulation. The shader sits on the chat, never in a box: don't paint a \
-background, vignette, or floor color. By default (blend = \"light\") the output is emitted light: \
-brightness is opacity and black is clear, right for beams, glows, sparks, and light through glass. \
-For solid shaded objects (fractals, SDF bodies) set blend = \"alpha\" and write alpha 0 where the ray \
-misses. bloom = 0.6-1.5 adds a soft glow around bright light. \
-The width varies with the reader (a phone is about 350px wide, often narrower than the shader is \
-tall): scale the scene by min(iResolution.x, iResolution.y), not one axis, and keep the subject \
-centered with room on both sides, so it fits and stays centered at any aspect. \
-GLSL errors come back with the pass and line number.\n\
-- Helpers: ui.scale(d0, d1, r0, r1) returns a mapping function; ui.ticks(lo, hi, n); ui.fmt(n, { unit, \
-prefix, decimals }) groups digits; ui.map(list, function(v, i) end); ui.range(a, b, step); ui.clamp; \
-ui.lerp; ui.series(i) is \"chart<i>\"; ui.color(token, alpha); ui.mix(a, b, t). print(...) output comes \
-back to you.\n\
-\n\
-Colors are theme tokens, never hex or color names (except scene materials): text; muted (labels, axes, captions); faint \
-(tertiary notes); accent (the one thing to notice); on-accent (text on an accent mark); success, \
-warning, danger (status only); border (hairlines, gridlines); chart1, chart2, chart3, chart4, \
-chart5, chart6 (series, in order; \
-chart1 is the accent). They follow the reader's theme, light or dark, on frosted glass or an opaque \
-surface, so never assume a background color.\n\
-\n\
-Style, enforced: layout nodes have no fill, border, shadow, padding, or font props. A visual is part \
-of the reply, not a widget, so lay content directly on the chat with type, spacing, and alignment: no \
-cards, tiles, boxed panels, banners, or canvas backgrounds. Stats are a row of plain ui.stat figures; \
-a chart is a plain heading, then the chart; separate sections with gap or one ui.rule. Text renders \
-in Zeron's interface font at the reader's text size: body for most text, sm and xs for labels and \
-notes, lg and xl for headings, 2xl for a headline figure. The width is the reply column (about 720px, \
-as narrow as 360px), so lay out fluidly with grow, wrap, and grid, and give charts, canvases, and \
-scenes heights of 160-420px.";
-
-/// Read `show_visual`'s asset files (paths relative to the agent's working
-/// directory), base64-encoded by name for the engine.
-async fn read_visual_assets(
-    assets: &std::collections::BTreeMap<String, String>,
-) -> anyhow::Result<serde_json::Map<String, Value>> {
-    use base64::Engine as _;
-    use zeron_proto::{
-        VISUAL_MAX_ASSET_BYTES as MAX_ASSET_BYTES, VISUAL_MAX_ASSETS as MAX_ASSETS,
-        VISUAL_MAX_TOTAL_ASSET_BYTES as MAX_TOTAL_ASSET_BYTES,
-        valid_visual_asset_name as valid_name,
-    };
-    anyhow::ensure!(
-        assets.len() <= MAX_ASSETS,
-        "a visual takes at most {MAX_ASSETS} assets"
-    );
-    let mut out = serde_json::Map::new();
-    let mut total = 0;
-    let mut seen = std::collections::HashSet::new();
-    for (name, path) in assets {
-        anyhow::ensure!(
-            valid_name(name),
-            "asset name '{name}' must be a plain file name (letters, digits, '.', '-', '_')"
-        );
-        // Stored as files, and file systems often ignore case.
-        anyhow::ensure!(
-            seen.insert(name.to_ascii_lowercase()),
-            "asset names must differ by more than case ('{name}')"
-        );
-        let metadata = tokio::fs::metadata(path)
-            .await
-            .with_context(|| format!("asset '{name}': can't read {path}"))?;
-        anyhow::ensure!(metadata.is_file(), "asset '{name}': {path} is not a file");
-        anyhow::ensure!(
-            metadata.len() <= MAX_ASSET_BYTES as u64,
-            "asset '{name}' is over {} MB",
-            MAX_ASSET_BYTES / (1024 * 1024)
-        );
-        // Bounded however the file changes (or lies about its size).
-        let mut bytes = Vec::new();
-        {
-            use tokio::io::AsyncReadExt as _;
-            tokio::fs::File::open(path)
-                .await
-                .with_context(|| format!("asset '{name}': can't read {path}"))?
-                .take(MAX_ASSET_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)
-                .await
-                .with_context(|| format!("asset '{name}': can't read {path}"))?;
-        }
-        anyhow::ensure!(
-            bytes.len() <= MAX_ASSET_BYTES,
-            "asset '{name}' is over {} MB",
-            MAX_ASSET_BYTES / (1024 * 1024)
-        );
-        total += bytes.len();
-        anyhow::ensure!(
-            total <= MAX_TOTAL_ASSET_BYTES,
-            "a visual's assets total at most {} MB",
-            MAX_TOTAL_ASSET_BYTES / (1024 * 1024)
-        );
-        out.insert(
-            name.clone(),
-            Value::String(base64::engine::general_purpose::STANDARD.encode(bytes)),
-        );
-    }
-    Ok(out)
-}
-
-/// Read `show_image`'s file (a path relative to the agent's working
-/// directory), bounded however the file changes (or lies about its size).
-async fn read_image(path: &str) -> anyhow::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt as _;
-    use zeron_proto::IMAGE_MAX_BYTES;
-    let too_large = || anyhow::anyhow!("{path} is over {} MB", IMAGE_MAX_BYTES / (1024 * 1024));
-    let metadata = tokio::fs::metadata(path)
-        .await
-        .with_context(|| format!("can't read {path}"))?;
-    anyhow::ensure!(metadata.is_file(), "{path} is not a file");
-    if metadata.len() > IMAGE_MAX_BYTES as u64 {
-        return Err(too_large());
-    }
-    let mut bytes = Vec::new();
-    tokio::fs::File::open(path)
-        .await
-        .with_context(|| format!("can't read {path}"))?
-        .take(IMAGE_MAX_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .await
-        .with_context(|| format!("can't read {path}"))?;
-    if bytes.len() > IMAGE_MAX_BYTES {
-        return Err(too_large());
-    }
-    Ok(bytes)
-}
-
 // ---- argument shapes ---------------------------------------------------------
-
-#[derive(Deserialize)]
-struct ShowImageArgs {
-    path: String,
-}
-
-#[derive(Deserialize)]
-struct WaitOnBackgroundArgs {
-    task_ids: Vec<String>,
-    #[serde(default)]
-    waiting: Option<bool>,
-}
-
-#[derive(Deserialize)]
-struct ShowVisualArgs {
-    script: String,
-    title: String,
-    #[serde(default)]
-    assets: std::collections::BTreeMap<String, String>,
-}
 
 #[derive(Deserialize)]
 struct BatchArgs {
@@ -575,17 +149,32 @@ struct BatchArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ChatArgs {
     chat: String,
 }
 
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum CatalogKind {
+    #[serde(rename = "self")]
+    Me,
+    Devices,
+    Projects,
+    Harnesses,
+    Models,
+}
+
 #[derive(Deserialize)]
-struct ListModelsArgs {
-    harness: String,
+#[serde(deny_unknown_fields)]
+struct CatalogArgs {
+    kind: CatalogKind,
     device: Option<String>,
+    harness: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct ListChatsArgs {
     project: Option<String>,
     device: Option<String>,
@@ -603,11 +192,6 @@ enum ChatKind {
     Subagent,
 }
 
-#[derive(Deserialize, Default)]
-struct DeviceArgs {
-    device: Option<String>,
-}
-
 /// Messages already in the transcript before a send. Replies are matched by
 /// id, not by time: `createdAt` is stamped on the host's clock, which can run
 /// behind the caller's when the chat lives on another device.
@@ -623,6 +207,7 @@ struct PendingTurn {
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct CreateChatArgs {
     kind: Option<ChatKind>,
     project: Option<String>,
@@ -644,9 +229,12 @@ struct CreateChatArgs {
     #[serde(default)]
     wait: bool,
     timeout_secs: Option<u64>,
+    #[serde(rename = "clientRequestId")]
+    client_request_id: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadChatArgs {
     chat: String,
     limit: Option<usize>,
@@ -658,6 +246,7 @@ struct ReadChatArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SendArgs {
     chat: String,
     text: String,
@@ -665,21 +254,26 @@ struct SendArgs {
     #[serde(default)]
     wait: bool,
     timeout_secs: Option<u64>,
+    #[serde(rename = "clientRequestId")]
+    client_request_id: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WaitArgs {
     chat: String,
     timeout_secs: Option<u64>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ArchiveArgs {
     chat: String,
     archived: Option<bool>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RespondArgs {
     chat: String,
     request_id: Option<String>,
@@ -693,8 +287,21 @@ struct AnswerArg {
     labels: Vec<String>,
 }
 
-fn parse<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, String> {
-    serde_json::from_value(args).map_err(|e| format!("invalid arguments: {e}"))
+fn parse<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, ToolError> {
+    serde_json::from_value(args).map_err(|e| ToolError::invalid(format!("invalid arguments: {e}")))
+}
+
+fn strip_nulls(value: Value) -> Value {
+    match value {
+        Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k, strip_nulls(v)))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 fn wait_duration(secs: Option<u64>) -> Duration {
@@ -711,9 +318,9 @@ fn now_millis() -> i64 {
         .unwrap_or_default()
 }
 
-fn parse_enum<T: serde::de::DeserializeOwned>(what: &str, raw: &str) -> Result<T, String> {
+fn parse_enum<T: serde::de::DeserializeOwned>(what: &str, raw: &str) -> Result<T, ToolError> {
     serde_json::from_value(Value::String(raw.trim().to_owned()))
-        .map_err(|_| format!("unknown {what}: {raw:?}"))
+        .map_err(|_| ToolError::invalid(format!("unknown {what}: {raw:?}")))
 }
 
 // ---- summaries ---------------------------------------------------------------
@@ -734,6 +341,10 @@ fn status_of(session: Option<&Session>) -> (String, Option<i64>) {
 }
 
 fn summarize_chat(chat: &Chat, spaces: &[Space], sessions: &[Session]) -> Value {
+    strip_nulls(chat_summary(chat, spaces, sessions))
+}
+
+fn chat_summary(chat: &Chat, spaces: &[Space], sessions: &[Session]) -> Value {
     let space = chat
         .space_id
         .as_deref()
@@ -782,21 +393,30 @@ impl Tools {
         Self {
             zeron,
             pending_turns: Default::default(),
+            replays: Default::default(),
             plugins: Default::default(),
         }
     }
 
-    /// Whether the host launched this server's agent without its own
-    /// subagent tools, so `initialize` says to delegate through chats.
     pub fn side_chats_only(&self) -> bool {
         self.zeron.origin().side_chats_only
     }
 
-    /// Whether this server's agent is offered `wait_on_background`: a
-    /// chat's, on a runtime that wakes it as background work ends.
     pub fn waits_on_background(&self) -> bool {
         let origin = self.zeron.origin();
         origin.chat_id.is_some() && origin.waits_on_background
+    }
+
+    pub fn guidance_in_prompt(&self) -> bool {
+        self.zeron.origin().guidance_in_prompt
+    }
+
+    pub fn guidance_features(&self) -> zeron_proto::agent_guidance::Features {
+        zeron_proto::agent_guidance::Features {
+            visuals: self.zeron.origin().chat_id.is_some(),
+            waits: self.waits_on_background(),
+            side_chats_only: self.side_chats_only(),
+        }
     }
 
     pub fn plugin_instructions(&self) -> Option<String> {
@@ -813,7 +433,7 @@ impl Tools {
         catalog()
             .into_iter()
             .filter(|tool| match tool.name {
-                SHOW_VISUAL | SHOW_IMAGE => in_chat,
+                SHOW_VISUAL | SHOW_IMAGE | VISUAL_REFERENCE => in_chat,
                 WAIT_ON_BACKGROUND => waits,
                 _ => true,
             })
@@ -824,90 +444,157 @@ impl Tools {
         self.list().iter().any(|t| t.name == name)
     }
 
-    /// `Ok` is the tool's structured result; `Err` is a message the model
-    /// should read (surfaced as `isError`, never as a protocol error).
-    pub async fn call(&self, name: &str, args: Value) -> Result<Value, String> {
+    fn example(&self, name: &str) -> &'static str {
+        catalog()
+            .into_iter()
+            .find(|t| t.name == name)
+            .map_or("", |t| t.example)
+    }
+
+    pub async fn call(&self, name: &str, args: Value) -> Result<Value, ToolError> {
+        let args = if args.is_null() { json!({}) } else { args };
+        let result = self.dispatch(name, args).await;
+        result.map_err(|error| {
+            if error.code == crate::error::INVALID_ARGUMENTS {
+                error.with_example(name, self.example(name))
+            } else {
+                error
+            }
+        })
+    }
+
+    async fn dispatch(&self, name: &str, args: Value) -> Result<Value, ToolError> {
         let result = match name {
-            "whoami" => self.whoami().await,
-            "list_devices" => self.list_devices().await,
-            "list_projects" => self.list_projects(parse(args)?).await,
-            "list_harnesses" => self.list_harnesses(parse(args)?).await,
-            "list_models" => self.list_models(parse(args)?).await,
-            "list_chats" => self.list_chats(parse(args)?).await,
-            "get_chat" => self.get_chat(parse(args)?).await,
-            "create_chat" => self.create_chat(parse(args)?).await,
-            "create_chats" => self.batch(parse(args)?, true).await,
-            "send_messages" => self.batch(parse(args)?, false).await,
-            "read_chat" => self.read_chat(parse(args)?).await,
-            "send_message" => self.send_message(parse(args)?).await,
-            "wait_for_turn" => self.wait_for_turn(parse(args)?).await,
-            "interrupt_chat" => self.interrupt_chat(parse(args)?).await,
-            "respond_to_input" => self.respond_to_input(parse(args)?).await,
-            "archive_chat" => self.archive_chat(parse(args)?).await,
-            SHOW_VISUAL => self.show_visual(parse(args)?).await,
+            defs::CATALOG => self.catalog(parse(args)?).await,
+            defs::LIST_CHATS => self.list_chats(parse(args)?).await,
+            defs::READ_CHAT => self.read_chat(parse(args)?).await,
+            defs::CREATE_CHATS => self.batch(parse(args)?, true).await,
+            defs::SEND_MESSAGES => self.batch(parse(args)?, false).await,
+            defs::WAIT_FOR_TURN => self.wait_for_turn(parse(args)?).await,
+            defs::INTERRUPT_CHAT => self.interrupt_chat(parse(args)?).await,
+            defs::RESPOND_TO_INPUT => self.respond_to_input(parse(args)?).await,
+            defs::ARCHIVE_CHAT => self.archive_chat(parse(args)?).await,
+            SHOW_VISUAL => return self.show_visual(parse(args)?).await,
             SHOW_IMAGE => self.show_image(parse(args)?).await,
+            VISUAL_REFERENCE => return visual::reference(parse(args)?),
             WAIT_ON_BACKGROUND => self.wait_on_background(parse(args)?).await,
-            plugins::CREATE_PLUGIN => return self.create_plugin(args).await,
-            plugins::LIST_PLUGINS => return self.list_plugins().await,
-            plugins::DESCRIBE_ELEMENTS => return self.describe_elements().await,
-            plugins::PLUGIN_STATUS => return self.plugin_status(args).await,
-            plugins::INSTALL_PLUGIN => return self.install_plugin(args).await,
-            plugins::UPDATE_PLUGIN => return self.update_plugin(args).await,
-            plugins::LIST_TEMPLATES
-            | plugins::CREATE_TEMPLATE
-            | plugins::USE_TEMPLATE
-            | plugins::TEMPLATE_STATUS
-            | plugins::DELETE_TEMPLATE
-            | plugins::DESCRIBE_APP => {
-                return self.templates(name, args).await;
+            plugin if plugins::NAMES.contains(&plugin) => return self.plugins(plugin, args).await,
+            theme if themes::NAMES.contains(&theme) => return self.themes(theme, args).await,
+            plugin if is_plugin_tool_name(plugin) => return self.call_plugin_tool(plugin, args).await,
+            other => {
+                return Err(ToolError::new(
+                    crate::error::UNKNOWN_TOOL,
+                    format!("unknown tool: {other}"),
+                ));
             }
-            plugins::EXPORT_TEMPLATE | plugins::IMPORT_TEMPLATE => {
-                return self.template_packages(name, args).await;
-            }
-            theme if themes::NAMES.contains(&theme) => {
-                return self.themes(theme, args).await;
-            }
-            plugin if is_plugin_tool_name(plugin) => {
-                return self.call_plugin_tool(plugin, args).await;
-            }
-            other => return Err(format!("unknown tool: {other}")),
         };
-        result.map_err(|e| format!("{e:#}"))
+        result.map_err(|e| ToolError::from_anyhow(&e))
     }
 
-    /// Poll every request together, including its optional wait. A waiting
-    /// first chat must not prevent subsequent chats from receiving their work.
     async fn batch(&self, args: BatchArgs, create: bool) -> anyhow::Result<Value> {
-        anyhow::ensure!(
-            (1..=MAX_BATCH).contains(&args.requests.len()),
-            "requests must contain between 1 and {MAX_BATCH} items"
-        );
-        let results = futures::future::join_all(args.requests.into_iter().enumerate().map(
-            |(index, args)| async move {
-                let result = if create {
-                    match serde_json::from_value(args) {
-                        Ok(args) => self.create_chat(args).await,
-                        Err(error) => Err(error.into()),
-                    }
-                } else {
-                    match serde_json::from_value(args) {
-                        Ok(args) => self.send_message(args).await,
-                        Err(error) => Err(error.into()),
-                    }
-                };
-                match result {
-                    Ok(result) => json!({"index": index, "isError": false, "result": result}),
-                    Err(error) => {
-                        json!({"index": index, "isError": true, "error": error.to_string()})
-                    }
-                }
-            },
-        ))
+        if !(1..=MAX_BATCH).contains(&args.requests.len()) {
+            return Err(ToolError::invalid(format!(
+                "requests must hold 1 to {MAX_BATCH} items"
+            ))
+            .into());
+        }
+        let started = args.requests.iter().any(|r| {
+            let field = if create { "prompt" } else { "text" };
+            r.get(field).and_then(Value::as_str).is_some_and(|t| !t.trim().is_empty())
+                && r.get("wait") != Some(&json!(true))
+        });
+        let results = futures::future::join_all(
+            args.requests
+                .into_iter()
+                .enumerate()
+                .map(|(index, args)| self.batch_item(index, args, create)),
+        )
         .await;
-        Ok(json!({"results": results}))
+        let mut out = json!({ "results": results });
+        if started {
+            out["next"] = json!(COLLECT_NEXT);
+        } else if create && out["results"].as_array().is_some_and(|r| r.iter().any(|i| i["ok"] == true && i.get("turn").is_none())) {
+            out["next"] = json!("Give the new chats work with send_messages.");
+        }
+        Ok(out)
     }
 
-    async fn whoami(&self) -> anyhow::Result<Value> {
+    async fn batch_item(&self, index: usize, args: Value, create: bool) -> Value {
+        let item = async {
+            if create {
+                let args: CreateChatArgs = parse(args)?;
+                let key = args.client_request_id.clone().map(|id| format!("create:{id}"));
+                self.once(key, || self.create_chat(args)).await
+            } else {
+                let args: SendArgs = parse(args)?;
+                let key = args.client_request_id.clone().map(|id| format!("send:{id}"));
+                self.once(key, || self.send_message(args)).await
+            }
+        };
+        match item.await {
+            Ok(result) => {
+                let mut row = json!({ "index": index, "ok": true });
+                if let (Some(row), Value::Object(fields)) = (row.as_object_mut(), result) {
+                    row.extend(fields);
+                }
+                row
+            }
+            Err(error) => json!({ "index": index, "ok": false, "error": error.to_json() }),
+        }
+    }
+
+    async fn once<F, Fut>(&self, key: Option<String>, run: F) -> Result<Value, ToolError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<Value>>,
+    {
+        let Some(key) = key else {
+            return run().await.map_err(|e| ToolError::from_anyhow(&e));
+        };
+        let cell = self.replays.lock().await.entry(key).or_default().clone();
+        let mut fresh = false;
+        let value = cell
+            .get_or_try_init(|| async {
+                fresh = true;
+                run().await
+            })
+            .await
+            .map_err(|e| ToolError::from_anyhow(&e))?;
+        let mut value = value.clone();
+        if !fresh {
+            value["replayed"] = json!(true);
+        }
+        Ok(value)
+    }
+
+    async fn resolve_chat(&self, key: &str) -> anyhow::Result<Chat> {
+        if key.trim().eq_ignore_ascii_case("me") {
+            let id = self.zeron.origin().chat_id.clone().ok_or_else(|| {
+                ToolError::invalid("\"me\" works only from an agent Zeron launched in a chat")
+            })?;
+            return self.zeron.resolve_chat(&id).await;
+        }
+        self.zeron.resolve_chat(key).await
+    }
+
+    async fn catalog(&self, args: CatalogArgs) -> anyhow::Result<Value> {
+        let items = match args.kind {
+            CatalogKind::Me => vec![self.catalog_self().await?],
+            CatalogKind::Devices => self.catalog_devices().await?,
+            CatalogKind::Projects => self.catalog_projects(args.device.as_deref()).await?,
+            CatalogKind::Harnesses => self.catalog_harnesses(args.device.as_deref()).await?,
+            CatalogKind::Models => {
+                let harness = args.harness.as_deref().ok_or_else(|| {
+                    ToolError::invalid("kind models needs harness (an id from kind harnesses)")
+                })?;
+                self.catalog_models(harness, args.device.as_deref()).await?
+            }
+        };
+        let kind = serde_json::to_value(args.kind).unwrap_or_default();
+        Ok(json!({ "kind": kind, "items": items }))
+    }
+
+    async fn catalog_self(&self) -> anyhow::Result<Value> {
         let origin = self.zeron.origin().clone();
         let local_device = self.zeron.local_device_id().await?;
         let engine = self.zeron.engine_info().await.unwrap_or(Value::Null);
@@ -922,7 +609,7 @@ impl Tools {
             },
             None => Value::Null,
         };
-        Ok(json!({
+        Ok(strip_nulls(json!({
             "chat": chat,
             "originDeviceId": origin.device_id,
             "localDeviceId": local_device,
@@ -932,82 +619,93 @@ impl Tools {
             } else {
                 "Not running inside a chat: messages are sent without attribution."
             },
-        }))
+        })))
     }
 
-    async fn list_devices(&self) -> anyhow::Result<Value> {
+    async fn catalog_devices(&self) -> anyhow::Result<Vec<Value>> {
         let (devices, local) =
             tokio::try_join!(self.zeron.devices(), self.zeron.local_device_id())?;
-        Ok(json!({
-            "devices": devices.iter().map(|d| json!({
-                "id": d.id,
-                "name": d.name,
-                "platform": d.platform,
-                "local": d.id == local,
-                "lastSeenAt": d.last_seen_at,
-                "version": d.version,
-            })).collect::<Vec<_>>()
-        }))
+        Ok(devices
+            .iter()
+            .map(|d| {
+                strip_nulls(json!({
+                    "id": d.id,
+                    "name": d.name,
+                    "platform": d.platform,
+                    "local": d.id == local,
+                    "lastSeenAt": d.last_seen_at,
+                    "version": d.version,
+                }))
+            })
+            .collect())
     }
 
-    async fn list_projects(&self, args: DeviceArgs) -> anyhow::Result<Value> {
+    async fn catalog_projects(&self, device: Option<&str>) -> anyhow::Result<Vec<Value>> {
         let (mut spaces, devices) = tokio::try_join!(self.zeron.spaces(), self.zeron.devices())?;
-        if let Some(device) = args.device.as_deref() {
+        if let Some(device) = device {
             let device = self.zeron.resolve_device_id(Some(device)).await?;
             spaces.retain(|s| s.device_id == device);
         }
         let device_name = |id: &str| devices.iter().find(|d| d.id == id).map(|d| d.name.clone());
-        Ok(json!({
-            "projects": spaces.iter().map(|s| json!({
-                "id": s.id,
-                "name": s.display_name(),
-                "path": s.path,
-                "deviceId": s.device_id,
-                "deviceName": device_name(&s.device_id),
-                "git": s.git_detected,
-            })).collect::<Vec<_>>()
-        }))
+        Ok(spaces
+            .iter()
+            .map(|s| {
+                strip_nulls(json!({
+                    "id": s.id,
+                    "name": s.display_name(),
+                    "path": s.path,
+                    "deviceId": s.device_id,
+                    "deviceName": device_name(&s.device_id),
+                    "git": s.git_detected,
+                }))
+            })
+            .collect())
     }
 
-    async fn list_harnesses(&self, args: DeviceArgs) -> anyhow::Result<Value> {
-        let device = match args.device.as_deref() {
+    async fn catalog_harnesses(&self, device: Option<&str>) -> anyhow::Result<Vec<Value>> {
+        let device = match device {
             Some(key) => Some(self.zeron.resolve_device_id(Some(key)).await?),
             None => None,
         };
         let harnesses = self.zeron.harnesses_on(device.as_deref()).await?;
-        Ok(json!({
-            "harnesses": harnesses.iter().map(|h| json!({
-                "id": h.id,
-                "name": h.name,
-                "available": h.available(),
-                "connected": h.connected(),
-                "signedIn": h.signed_in,
-                "installed": h.installed,
-                "steersMidTurn": h.steers_mid_turn(),
-                "reasoningLevels": h.reasoning_levels,
-                "accessModes": h.access_modes,
-                "supportsPlan": h.supports_plan,
-            })).collect::<Vec<_>>()
-        }))
+        Ok(harnesses
+            .iter()
+            .map(|h| {
+                strip_nulls(json!({
+                    "id": h.id,
+                    "name": h.name,
+                    "available": h.available(),
+                    "connected": h.connected(),
+                    "signedIn": h.signed_in,
+                    "installed": h.installed,
+                    "steersMidTurn": h.steers_mid_turn(),
+                    "reasoningLevels": h.reasoning_levels,
+                    "accessModes": h.access_modes,
+                    "supportsPlan": h.supports_plan,
+                }))
+            })
+            .collect())
     }
 
-    async fn list_models(&self, args: ListModelsArgs) -> anyhow::Result<Value> {
-        let harness: HarnessId =
-            parse_enum("harness", &args.harness).map_err(anyhow::Error::msg)?;
-        let device = match args.device.as_deref() {
+    async fn catalog_models(&self, harness: &str, device: Option<&str>) -> anyhow::Result<Vec<Value>> {
+        let harness: HarnessId = parse_enum("harness", harness)?;
+        let device = match device {
             Some(key) => Some(self.zeron.resolve_device_id(Some(key)).await?),
             None => None,
         };
         let models = self.zeron.models_on(harness, device.as_deref()).await?;
-        Ok(json!({
-            "harness": harness,
-            "models": models.iter().map(|m| json!({
-                "id": m.id,
-                "label": m.label,
-                "description": m.description,
-                "reasoningLevels": m.reasoning_levels,
-            })).collect::<Vec<_>>()
-        }))
+        Ok(models
+            .iter()
+            .map(|m| {
+                strip_nulls(json!({
+                    "id": m.id,
+                    "harness": harness,
+                    "label": m.label,
+                    "description": m.description,
+                    "reasoningLevels": m.reasoning_levels,
+                }))
+            })
+            .collect())
     }
 
     async fn list_chats(&self, args: ListChatsArgs) -> anyhow::Result<Value> {
@@ -1032,7 +730,7 @@ impl Tools {
             chats.retain(|c| !c.archived);
         }
         if let Some(parent) = args.parent.as_deref() {
-            let parent = self.zeron.resolve_chat(parent).await?;
+            let parent = self.resolve_chat(parent).await?;
             chats.retain(|c| c.parent_chat_id.as_deref() == Some(parent.id.as_str()));
         }
         chats.sort_by(|a, b| {
@@ -1041,32 +739,13 @@ impl Tools {
             b_at.cmp(&a_at)
         });
         let total = chats.len();
-        let limit = args.limit.unwrap_or(50).clamp(1, 500);
+        let limit = args.limit.unwrap_or(30).clamp(1, 500);
         Ok(json!({
             "total": total,
             "chats": chats.iter().take(limit)
                 .map(|c| summarize_chat(c, &spaces, &sessions))
                 .collect::<Vec<_>>()
         }))
-    }
-
-    async fn get_chat(&self, args: ChatArgs) -> anyhow::Result<Value> {
-        let chat = self.zeron.resolve_chat(&args.chat).await?;
-        let (spaces, sessions, entries) = tokio::try_join!(
-            self.zeron.spaces(),
-            self.zeron.sessions(),
-            self.zeron.transcript_on(&chat.id, Some(&chat.device_id))
-        )?;
-        let rendered = render_entries(&entries, RenderOptions::default());
-        let mut summary = summarize_chat(&chat, &spaces, &sessions);
-        summary["messageCount"] = json!(rendered.len());
-        summary["pendingInput"] = if summary["statusStale"] == true {
-            Value::Null
-        } else {
-            last_pending_input(&rendered).unwrap_or(Value::Null)
-        };
-        summary["lastMessage"] = rendered.last().map(|m| json!(m)).unwrap_or(Value::Null);
-        Ok(summary)
     }
 
     async fn create_chat(&self, args: CreateChatArgs) -> anyhow::Result<Value> {
@@ -1085,7 +764,7 @@ impl Tools {
             None
         } else {
             match explicit_parent {
-                Some(key) => Some(self.zeron.resolve_chat(key).await?.id),
+                Some(key) => Some(self.resolve_chat(key).await?.id),
                 None => self.zeron.origin().chat_id.clone(),
             }
             // A hidden voice orchestrator creates top-level sessions.
@@ -1140,7 +819,7 @@ impl Tools {
         let harness = match args.harness.as_deref() {
             // Cloud runs its own agents, with your Cloud accounts.
             Some(raw) if args.cloud => {
-                let id: HarnessId = parse_enum("harness", raw).map_err(anyhow::Error::msg)?;
+                let id: HarnessId = parse_enum("harness", raw)?;
                 anyhow::ensure!(
                     CLOUD_HARNESSES.contains(&id),
                     "Cloud runs Codex and Claude Code only"
@@ -1149,10 +828,10 @@ impl Tools {
             }
             None if args.cloud => CLOUD_HARNESSES[0],
             Some(raw) => {
-                let id: HarnessId = parse_enum("harness", raw).map_err(anyhow::Error::msg)?;
+                let id: HarnessId = parse_enum("harness", raw)?;
                 anyhow::ensure!(
                     harnesses.iter().any(|h| h.id == id && h.available()),
-                    "harness {raw} is not available on device {device_id} (see list_harnesses with device)"
+                    "harness {raw} is not available on device {device_id} (catalog {{kind: \"harnesses\", device}})"
                 );
                 id
             }
@@ -1172,15 +851,15 @@ impl Tools {
             );
         }
         let reasoning: Option<ReasoningLevel> = match args.reasoning.as_deref() {
-            Some(raw) => Some(parse_enum("reasoning level", raw).map_err(anyhow::Error::msg)?),
+            Some(raw) => Some(parse_enum("reasoning level", raw)?),
             None => None,
         };
         let asked_sandbox: SandboxLevel = match args.sandbox.as_deref() {
-            Some(raw) => parse_enum("sandbox", raw).map_err(anyhow::Error::msg)?,
+            Some(raw) => parse_enum("sandbox", raw)?,
             None => SandboxLevel::WorkspaceWrite,
         };
         let asked_access: AccessMode = match args.access.as_deref() {
-            Some(raw) => parse_enum("access", raw).map_err(anyhow::Error::msg)?,
+            Some(raw) => parse_enum("access", raw)?,
             None => ceiling,
         };
         // Never more than this chat's own: lowered, and the reply says so.
@@ -1321,7 +1000,7 @@ impl Tools {
         }
         if signed_out {
             result["warning"] = json!(format!(
-                "{harness:?} does not look signed in on this device, so its first turn may fail. Pick a connected harness (list_harnesses) if it does."
+                "{harness:?} does not look signed in on this device, so its first turn may fail. Pick a connected harness (catalog {{kind: \"harnesses\"}}) if it does."
             ));
         }
         if let Some(prompt) = args.prompt.filter(|p| !p.trim().is_empty()) {
@@ -1377,11 +1056,12 @@ impl Tools {
     }
 
     async fn read_chat(&self, args: ReadChatArgs) -> anyhow::Result<Value> {
-        let chat = self.zeron.resolve_chat(&args.chat).await?;
-        let entries = self
-            .zeron
-            .transcript_on(&chat.id, Some(&chat.device_id))
-            .await?;
+        let chat = self.resolve_chat(&args.chat).await?;
+        let (spaces, sessions, entries) = tokio::try_join!(
+            self.zeron.spaces(),
+            self.zeron.sessions(),
+            self.zeron.transcript_on(&chat.id, Some(&chat.device_id))
+        )?;
         let rendered = render_entries(
             &entries,
             RenderOptions {
@@ -1389,21 +1069,27 @@ impl Tools {
                 include_tools: args.include_tools.unwrap_or(true),
             },
         );
+        let summary = summarize_chat(&chat, &spaces, &sessions);
+        let stale = summary["statusStale"] == true;
+        let pending = if stale { None } else { last_pending_input(&rendered) };
         let total = rendered.len();
-        let limit = args.limit.unwrap_or(40).clamp(1, 500);
+        let limit = args.limit.unwrap_or(20).min(500);
         let end = total.saturating_sub(args.offset);
         let start = end.saturating_sub(limit);
         let window = &rendered[start..end];
-        Ok(json!({
-            "chatId": chat.id,
-            "title": chat.title,
+        let mut out = json!({
+            "chat": summary,
+            "pendingInput": pending,
             "total": total,
             "returned": window.len(),
             "olderRemaining": start,
             "newerSkipped": total - end,
-            "pendingInput": last_pending_input(&rendered),
             "messages": window,
-        }))
+        });
+        if out["pendingInput"].is_object() {
+            out["next"] = json!("It waits on a question: answer with respond_to_input {chat, answers}.");
+        }
+        Ok(out)
     }
 
     async fn send_message(&self, args: SendArgs) -> anyhow::Result<Value> {
@@ -1411,7 +1097,7 @@ impl Tools {
         if text.is_empty() {
             anyhow::bail!("text is empty");
         }
-        let chat = self.zeron.resolve_chat(&args.chat).await?;
+        let chat = self.resolve_chat(&args.chat).await?;
         if self.zeron.origin().chat_id.as_deref() == Some(chat.id.as_str()) {
             anyhow::bail!(
                 "refusing to send a message to your own chat ({})",
@@ -1461,7 +1147,7 @@ impl Tools {
     }
 
     async fn wait_for_turn(&self, args: WaitArgs) -> anyhow::Result<Value> {
-        let chat = self.zeron.resolve_chat(&args.chat).await?;
+        let chat = self.resolve_chat(&args.chat).await?;
         let pending = self.pending_turns.lock().await.get(&chat.id).cloned();
         let turn = match pending {
             Some(pending) => {
@@ -1479,11 +1165,17 @@ impl Tools {
                 .await?
             }
         };
-        Ok(json!({ "chatId": chat.id, "title": chat.title, "turn": turn }))
+        let mut out = json!({ "chatId": chat.id, "title": chat.title, "turn": turn });
+        if out["turn"]["timedOut"] == true {
+            out["next"] = json!("Still working. Call wait_for_turn again, or do other work first.");
+        } else if out["turn"]["pendingInput"].is_object() {
+            out["next"] = json!("It waits on a question: answer with respond_to_input {chat, answers}.");
+        }
+        Ok(out)
     }
 
     async fn archive_chat(&self, args: ArchiveArgs) -> anyhow::Result<Value> {
-        let chat = self.zeron.resolve_chat(&args.chat).await?;
+        let chat = self.resolve_chat(&args.chat).await?;
         let archived = args.archived.unwrap_or(true);
         self.zeron
             .mutate(json!({ "op": "setChatArchived", "chatId": chat.id, "archived": archived }))
@@ -1491,94 +1183,8 @@ impl Tools {
         Ok(json!({ "chatId": chat.id, "title": chat.title, "archived": archived }))
     }
 
-    async fn show_visual(&self, args: ShowVisualArgs) -> anyhow::Result<Value> {
-        let chat_id = self
-            .zeron
-            .origin()
-            .chat_id
-            .clone()
-            .context("show_visual only works from an agent Zeron launched in a chat")?;
-        let assets = read_visual_assets(&args.assets).await?;
-        let shown = self
-            .zeron
-            .call(
-                zeron_rpc::methods::PUBLISH_VISUAL,
-                json!({
-                    "chatId": chat_id,
-                    "title": args.title,
-                    "script": args.script,
-                    "assets": assets,
-                }),
-            )
-            .await?;
-        Ok(json!({
-            "visual": shown,
-            "message": "Shown to the reader above your reply. Don't mention or describe the visual; reply with only what it doesn't already say.",
-        }))
-    }
-
-    async fn show_image(&self, args: ShowImageArgs) -> anyhow::Result<Value> {
-        use base64::Engine as _;
-        let chat_id = self
-            .zeron
-            .origin()
-            .chat_id
-            .clone()
-            .context("show_image only works from an agent Zeron launched in a chat")?;
-        let bytes = read_image(&args.path).await?;
-        let name = std::path::Path::new(&args.path)
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "image".into());
-        let shown = self
-            .zeron
-            .call(
-                zeron_rpc::methods::PUBLISH_IMAGE,
-                json!({
-                    "chatId": chat_id,
-                    "name": name,
-                    "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-                }),
-            )
-            .await?;
-        Ok(json!({
-            "image": shown,
-            "message": "Shown to the reader above your reply. Don't mention or describe the image; reply with only what it doesn't already show.",
-        }))
-    }
-
-    async fn wait_on_background(&self, args: WaitOnBackgroundArgs) -> anyhow::Result<Value> {
-        let chat_id = self
-            .zeron
-            .origin()
-            .chat_id
-            .clone()
-            .context("wait_on_background only works from an agent Zeron launched in a chat")?;
-        let waiting = args.waiting.unwrap_or(true);
-        let marked = self
-            .zeron
-            .call(
-                zeron_rpc::methods::AWAIT_BACKGROUND,
-                json!({ "chatId": chat_id, "taskIds": args.task_ids, "waiting": waiting }),
-            )
-            .await?;
-        let none_matched = marked["matched"].as_array().is_none_or(Vec::is_empty);
-        let message = if none_matched {
-            "None of those are running background tasks of yours now (they may have ended): nothing is waited on."
-        } else if waiting {
-            "This chat reads as waiting on that work after your turn, until it ends and you're woken."
-        } else {
-            "No longer waited on."
-        };
-        Ok(json!({
-            "matched": marked["matched"],
-            "unmatched": marked["unmatched"],
-            "message": message,
-        }))
-    }
-
     async fn interrupt_chat(&self, args: ChatArgs) -> anyhow::Result<Value> {
-        let chat = self.zeron.resolve_chat(&args.chat).await?;
+        let chat = self.resolve_chat(&args.chat).await?;
         let command_id = self
             .zeron
             .queue_command(&chat.id, &SessionCommandPayload::Interrupt {})
@@ -1587,7 +1193,7 @@ impl Tools {
     }
 
     async fn respond_to_input(&self, args: RespondArgs) -> anyhow::Result<Value> {
-        let chat = self.zeron.resolve_chat(&args.chat).await?;
+        let chat = self.resolve_chat(&args.chat).await?;
         let request_id = match args.request_id {
             Some(id) => id,
             None => {
@@ -1873,13 +1479,56 @@ fn default_harness(harnesses: &[HarnessInfo]) -> anyhow::Result<HarnessId> {
         })
         .map(|h| h.id)
         .ok_or_else(|| {
-            anyhow::anyhow!("no harness is available on this device (see list_harnesses)")
+            anyhow::anyhow!("no harness is available on this device (catalog {{kind: \"harnesses\"}})")
         })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl Tools {
+        async fn legacy(&self, name: &str, args: Value) -> Result<Value, ToolError> {
+            let one = |tool: &'static str| (tool, json!({ "requests": [args.clone()] }));
+            let (tool, call) = match name {
+                "create_chat" => one(defs::CREATE_CHATS),
+                "send_message" => one(defs::SEND_MESSAGES),
+                _ => {
+                    let kind = match name {
+                        "whoami" => "self",
+                        "list_devices" => "devices",
+                        "list_projects" => "projects",
+                        "list_harnesses" => "harnesses",
+                        _ => "models",
+                    };
+                    let mut call = args.clone();
+                    call["kind"] = json!(kind);
+                    let out = self.call(defs::CATALOG, call).await?;
+                    let items = out["items"].clone();
+                    return Ok(match kind {
+                        "self" => items[0].clone(),
+                        "models" => json!({ "harness": args["harness"], "models": items }),
+                        other => json!({ other: items }),
+                    });
+                }
+            };
+            let out = self.call(tool, call).await?;
+            let row = out["results"][0].clone();
+            if row["ok"] == true {
+                let mut row = row;
+                let fields = row.as_object_mut().unwrap();
+                fields.remove("index");
+                fields.remove("ok");
+                Ok(row)
+            } else {
+                Err(ToolError {
+                    code: crate::error::REJECTED,
+                    message: row["error"]["message"].as_str().unwrap_or_default().to_owned(),
+                })
+            }
+        }
+    }
+
     use crate::zeron::Origin;
     use async_trait::async_trait;
     use futures::StreamExt;
@@ -2064,17 +1713,145 @@ mod tests {
         for def in &defs {
             assert_eq!(def.input_schema["type"], "object", "{}", def.name);
             assert!(!def.description.is_empty());
+            assert!(def.name.len() <= 63, "{}", def.name);
+            assert!(
+                def.name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                "{}",
+                def.name
+            );
+            assert!(!def.title.is_empty(), "{}", def.name);
+            let cap = if def.name == SHOW_VISUAL { 3_072 } else { 1_024 };
+            assert!(def.description.len() <= cap, "{}: {}", def.name, def.description.len());
+            assert_eq!(def.always_load, def.name == WAIT_ON_BACKGROUND, "{}", def.name);
+            let example: Value = serde_json::from_str(def.example).unwrap_or_else(|e| panic!("{}: {e}", def.name));
+            assert!(example.is_object(), "{}", def.name);
+            if def.hints.read_only {
+                assert!(!def.hints.destructive, "{}", def.name);
+            }
+            if let Some(output) = &def.output_schema {
+                assert_eq!(output["type"], "object", "{}", def.name);
+            }
         }
+        let listed: Vec<ListedTool> = defs.into_iter().map(ListedTool::from).collect();
+        for tool in &listed {
+            let annotations = tool.annotations.as_ref().unwrap();
+            for hint in ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"] {
+                assert!(annotations[hint].is_boolean(), "{} {hint}", tool.name);
+            }
+            assert_eq!(annotations["title"], json!(tool.title), "{}", tool.name);
+        }
+        let always: Vec<&str> = listed
+            .iter()
+            .filter(|t| t.meta.as_ref().is_some_and(|m| m["anthropic/alwaysLoad"] == true))
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(always, [WAIT_ON_BACKGROUND]);
+    }
+
+    #[tokio::test]
+    async fn structured_results_match_their_output_schemas() {
+        let world = Arc::new(World::default());
+        let tools = tools(world, Origin::default());
+        let defs = catalog();
+        let calls = [
+            (defs::CATALOG, json!({ "kind": "devices" })),
+            (defs::LIST_CHATS, json!({})),
+            (defs::READ_CHAT, json!({ "chat": "alpha", "limit": 0 })),
+            (defs::CREATE_CHATS, json!({ "requests": [{ "project": "space-1" }] })),
+            (defs::WAIT_FOR_TURN, json!({ "chat": "alpha", "timeout_secs": 1 })),
+        ];
+        for (name, args) in calls {
+            let out = tools.call(name, args).await.unwrap_or_else(|e| panic!("{name}: {e}"));
+            let schema = defs.iter().find(|d| d.name == name).unwrap().output_schema.clone().unwrap();
+            for key in schema["required"].as_array().unwrap() {
+                assert!(out.get(key.as_str().unwrap()).is_some(), "{name} lacks {key}: {out}");
+            }
+            for (key, prop) in schema["properties"].as_object().unwrap() {
+                let (Some(value), Some(kind)) = (out.get(key), prop.get("type")) else { continue };
+                let kinds: Vec<&str> = match kind {
+                    Value::String(k) => vec![k.as_str()],
+                    Value::Array(ks) => ks.iter().filter_map(Value::as_str).collect(),
+                    _ => vec![],
+                };
+                let actual = match value {
+                    Value::Null => "null",
+                    Value::Bool(_) => "boolean",
+                    Value::Number(n) if n.is_i64() || n.is_u64() => "integer",
+                    Value::Number(_) => "number",
+                    Value::String(_) => "string",
+                    Value::Array(_) => "array",
+                    Value::Object(_) => "object",
+                };
+                assert!(kinds.contains(&actual) || (actual == "integer" && kinds.contains(&"number")), "{name}.{key}: {actual} not in {kinds:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repeated_client_request_id_replays_instead_of_creating_twice() {
+        let world = Arc::new(World::default());
+        let tools = tools(world.clone(), Origin::default());
+        let request = json!({ "requests": [{ "project": "space-1", "clientRequestId": "docs-1" }] });
+        let first = tools.call(defs::CREATE_CHATS, request.clone()).await.unwrap();
+        let again = tools.call(defs::CREATE_CHATS, request).await.unwrap();
+        assert_eq!(first["results"][0]["chatId"], again["results"][0]["chatId"]);
+        assert!(first["results"][0].get("replayed").is_none());
+        assert_eq!(again["results"][0]["replayed"], true);
+        let creates = world.writes.lock().unwrap().iter().filter(|(_, p)| p["op"] == "createChat").count();
+        assert_eq!(creates, 1);
+    }
+
+    #[tokio::test]
+    async fn a_mistyped_chat_gets_a_did_you_mean_and_a_code() {
+        let world = Arc::new(World::default());
+        let tools = tools(world, Origin::default());
+        let error = tools.call(defs::READ_CHAT, json!({ "chat": "Alpah" })).await.unwrap_err();
+        assert_eq!(error.code, crate::error::NOT_FOUND);
+        assert!(error.message.contains("Did you mean \"Alpha\""), "{error}");
+        let me = tools.call(defs::READ_CHAT, json!({ "chat": "me" })).await.unwrap_err();
+        assert_eq!(me.code, crate::error::INVALID_ARGUMENTS);
+    }
+
+    #[tokio::test]
+    async fn an_async_create_says_how_to_collect_and_never_to_end_the_turn() {
+        let world = Arc::new(World::default());
+        let tools = tools(world, Origin::default());
+        let out = tools
+            .call(defs::CREATE_CHATS, json!({ "requests": [{ "project": "space-1", "prompt": "go" }] }))
+            .await
+            .unwrap();
+        let next = out["next"].as_str().unwrap();
+        assert!(next.contains("wait_for_turn") && !next.contains("end your turn"), "{next}");
+        let idle = tools
+            .call(defs::CREATE_CHATS, json!({ "requests": [{ "project": "space-1" }] }))
+            .await
+            .unwrap();
+        assert!(idle["next"].as_str().unwrap().contains("send_messages"));
+    }
+
+    #[test]
+    fn visual_reference_answers_topics_and_its_examples_pass_the_check() {
+        let list = visual::reference(Default::default()).unwrap();
+        assert!(list["topics"].as_array().unwrap().len() >= 10);
+        let basics = visual::reference(serde_json::from_value(json!({ "topic": "basics" })).unwrap()).unwrap();
+        let body = basics["reference"].as_str().unwrap();
+        let code = body.split("```lua\n").nth(1).unwrap().split("```").next().unwrap();
+        zeron_visual::check(code, 1).unwrap();
+        let skill = zeron_proto::visual_reference::skill_markdown();
+        for name in zeron_visual::TOKEN_NAMES {
+            assert!(skill.contains(name), "{name}");
+        }
+        assert!(visual::reference(serde_json::from_value(json!({ "topic": "nope" })).unwrap()).is_err());
     }
 
     #[test]
     fn the_show_visual_example_passes_its_own_check() {
-        let start = SHOW_VISUAL_DESCRIPTION.find("local s = ui.state").unwrap();
+        let start = visual::SHOW_VISUAL_DESCRIPTION.find("local s = ui.state").unwrap();
         let end = start
-            + SHOW_VISUAL_DESCRIPTION[start..]
+            + visual::SHOW_VISUAL_DESCRIPTION[start..]
                 .find("\n\nZeron runs the script")
                 .unwrap();
-        let report = zeron_visual::check(&SHOW_VISUAL_DESCRIPTION[start..end], 1).unwrap();
+        let report = zeron_visual::check(&visual::SHOW_VISUAL_DESCRIPTION[start..end], 1).unwrap();
         assert_eq!(report.interactions, 2, "both tabs");
     }
 
@@ -2104,7 +1881,7 @@ mod tests {
         assert!(inside.has("show_visual"));
         // The guidance names every color the runtime accepts.
         for name in zeron_visual::TOKEN_NAMES {
-            assert!(SHOW_VISUAL_DESCRIPTION.contains(name), "{name}");
+            assert!(visual::SHOW_VISUAL_DESCRIPTION.contains(name), "{name}");
         }
         let shown = inside
             .call(
@@ -2230,13 +2007,13 @@ mod tests {
             },
         );
         let err = tools
-            .call("send_message", json!({ "chat": "beta", "text": "loop" }))
+            .legacy("send_message", json!({ "chat": "beta", "text": "loop" }))
             .await
             .unwrap_err();
         assert!(err.contains("own chat"), "{err}");
 
         let sent = tools
-            .call(
+            .legacy(
                 "send_message",
                 json!({ "chat": "alpha", "text": "please review" }),
             )
@@ -2291,7 +2068,7 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("2 chats start with"), "{error}");
         orchestrator
-            .call(
+            .legacy(
                 "send_message",
                 json!({
                     "chat": "alpha", "text": "please review"
@@ -2323,7 +2100,7 @@ mod tests {
             },
         );
         worker
-            .call(
+            .legacy(
                 "send_message",
                 json!({
                     "chat": reply_id, "text": "review complete"
@@ -2377,7 +2154,7 @@ mod tests {
         let world = Arc::new(World::default());
         let tools = tools(world.clone(), Origin::default());
         let err = tools
-            .call(
+            .legacy(
                 "create_chat",
                 json!({ "project": "space-1", "model": "nope" }),
             )
@@ -2386,7 +2163,7 @@ mod tests {
         assert!(err.contains("not offered"), "{err}");
 
         let created = tools
-            .call(
+            .legacy(
                 "create_chat",
                 json!({ "project": "space-1", "model": "sonnet", "title": "Review", "prompt": "go" }),
             )
@@ -2421,7 +2198,7 @@ mod tests {
             },
         );
         let created = tools
-            .call("create_chat", json!({ "project": "space-1" }))
+            .legacy("create_chat", json!({ "project": "space-1" }))
             .await
             .unwrap();
         assert_eq!(created["parentChatId"], "chat-beta-2");
@@ -2432,7 +2209,7 @@ mod tests {
 
         // An explicit parent (by title) overrides the origin.
         let created = tools
-            .call(
+            .legacy(
                 "create_chat",
                 json!({ "project": "space-1", "parent": "Alpha" }),
             )
@@ -2440,7 +2217,7 @@ mod tests {
             .unwrap();
         assert_eq!(created["parentChatId"], "chat-alpha-1");
         let err = tools
-            .call(
+            .legacy(
                 "create_chat",
                 json!({ "project": "space-1", "parent": "nope" }),
             )
@@ -2472,7 +2249,7 @@ mod tests {
         let tools = tools(world, Origin::default());
         let started = std::time::Instant::now();
         let sent = tools
-            .call(
+            .legacy(
                 "send_message",
                 json!({ "chat": "alpha", "text": "hi", "wait": true, "timeout_secs": 1 }),
             )
@@ -2522,11 +2299,12 @@ mod tests {
             let results = &reply["result"]["structuredContent"]["results"];
             for i in [0, 2] {
                 assert_eq!(results[i]["index"], i);
-                assert_eq!(results[i]["isError"], false, "{reply}");
-                assert_eq!(results[i]["result"]["turn"]["outcome"], "timedOut");
+                assert_eq!(results[i]["ok"], true, "{reply}");
+                assert_eq!(results[i]["turn"]["outcome"], "timedOut");
             }
             assert_eq!(results[1]["index"], 1);
-            assert_eq!(results[1]["isError"], true);
+            assert_eq!(results[1]["ok"], false);
+            assert!(results[1]["error"]["code"].is_string());
             let writes = world.writes.lock().unwrap();
             let dispatched: Vec<_> = writes
                 .iter()
@@ -2618,15 +2396,15 @@ mod tests {
             ..Default::default()
         });
         let tools = tools_from(&world, "chat-careful");
-        tools.call("create_chat", json!({})).await.unwrap();
+        tools.legacy("create_chat", json!({})).await.unwrap();
         tools
-            .call("create_chat", json!({"access": "supervised", "plan": true}))
+            .legacy("create_chat", json!({"access": "supervised", "plan": true}))
             .await
             .unwrap();
         // Asking for more is lowered to its own, silently, and said in the
         // reply: no full-access child, no wider sandbox.
         let capped = tools
-            .call("create_chat", json!({"access": "full-access", "sandbox": "danger-full-access"}))
+            .legacy("create_chat", json!({"access": "full-access", "sandbox": "danger-full-access"}))
             .await
             .unwrap();
         assert!(capped["accessCapped"].as_str().unwrap().contains("no more"), "{capped}");
@@ -2645,7 +2423,7 @@ mod tests {
         // A top-level chat with no mode of its own runs with full access,
         // which its chats inherit (the field is omitted on the wire).
         tools_from(&world, "chat-alpha-1")
-            .call("create_chat", json!({}))
+            .legacy("create_chat", json!({}))
             .await
             .unwrap();
         let writes = world.writes.lock().unwrap();
@@ -2666,7 +2444,7 @@ mod tests {
         });
         // A top-level chat delegates.
         let created = tools(world.clone(), origin("chat-alpha-1"))
-            .call("create_chat", json!({}))
+            .legacy("create_chat", json!({}))
             .await
             .unwrap();
         assert_eq!(created["parentChatId"], "chat-alpha-1");
@@ -2679,7 +2457,7 @@ mod tests {
             ("chat-delta-4", json!({})),
         ] {
             let refused = tools(world.clone(), origin(from))
-                .call("create_chat", args)
+                .legacy("create_chat", args)
                 .await
                 .unwrap_err();
             assert!(
@@ -2692,7 +2470,7 @@ mod tests {
         // reports it per item.
         let root = tools(world.clone(), Origin::default());
         assert!(
-            root.call("create_chat", json!({"parent":"Beta"}))
+            root.legacy("create_chat", json!({"parent":"Beta"}))
                 .await
                 .unwrap_err()
                 .contains("itself a delegated chat")
@@ -2705,8 +2483,8 @@ mod tests {
             .await
             .unwrap();
         let results = batch["results"].as_array().unwrap();
-        assert_eq!(results[0]["isError"], true);
-        assert_ne!(results[1]["isError"], true);
+        assert_eq!(results[0]["ok"], false);
+        assert_eq!(results[1]["ok"], true);
         assert!(
             world
                 .writes
@@ -2722,7 +2500,7 @@ mod tests {
         let world = Arc::new(World::default());
         let alpha = tools(world.clone(), origin("chat-alpha-1"));
         let created = alpha
-            .call("create_chat", json!({"cloud": true}))
+            .legacy("create_chat", json!({"cloud": true}))
             .await
             .unwrap();
         // The engine names the new machine and its checkout.
@@ -2743,7 +2521,7 @@ mod tests {
         assert_eq!(sent["parentChatId"], "chat-alpha-1");
         // Only Cloud's agents.
         let refused = alpha
-            .call("create_chat", json!({"cloud": true, "harness": "cursor"}))
+            .legacy("create_chat", json!({"cloud": true, "harness": "cursor"}))
             .await
             .unwrap_err();
         assert!(refused.contains("Codex and Claude Code"), "{refused}");
@@ -2759,7 +2537,7 @@ mod tests {
         };
         // No accounts endpoint: login state unknown, nothing held against it.
         let unknown = tools(Arc::new(World::default()), Origin::default());
-        let listed = unknown.call("list_harnesses", json!({})).await.unwrap();
+        let listed = unknown.legacy("list_harnesses", json!({})).await.unwrap();
         let claude = &listed["harnesses"][0];
         assert_eq!(claude["signedIn"], Value::Null);
         assert_eq!(claude["connected"], true);
@@ -2771,12 +2549,12 @@ mod tests {
             ..Default::default()
         });
         let tools_out = tools(signed_out.clone(), Origin::default());
-        let listed = tools_out.call("list_harnesses", json!({})).await.unwrap();
+        let listed = tools_out.legacy("list_harnesses", json!({})).await.unwrap();
         assert_eq!(listed["harnesses"][0]["signedIn"], false);
         assert_eq!(listed["harnesses"][0]["connected"], false);
         assert_eq!(listed["harnesses"][0]["available"], true);
         let created = tools_out
-            .call("create_chat", json!({"harness": "claude-code"}))
+            .legacy("create_chat", json!({"harness": "claude-code"}))
             .await
             .unwrap();
         assert!(
@@ -2792,10 +2570,10 @@ mod tests {
             ..Default::default()
         });
         let tools_in = tools(signed_in, Origin::default());
-        let listed = tools_in.call("list_harnesses", json!({})).await.unwrap();
+        let listed = tools_in.legacy("list_harnesses", json!({})).await.unwrap();
         assert_eq!(listed["harnesses"][0]["signedIn"], true);
         assert_eq!(listed["harnesses"][0]["connected"], true);
-        let created = tools_in.call("create_chat", json!({})).await.unwrap();
+        let created = tools_in.legacy("create_chat", json!({})).await.unwrap();
         assert!(created.get("warning").is_none());
     }
 
@@ -2813,14 +2591,14 @@ mod tests {
         });
         let top = tools(world.clone(), origin("chat-alpha-1"));
         let listed = top
-            .call("list_harnesses", json!({"device":"Worker"}))
+            .legacy("list_harnesses", json!({"device":"Worker"}))
             .await
             .unwrap();
         assert_eq!(listed["harnesses"][0]["signedIn"], true);
         assert_eq!(listed["harnesses"][0]["connected"], true);
         assert_eq!(listed["harnesses"][1]["connected"], false);
         let created = top
-            .call("create_chat", json!({"kind":"side", "device":"Worker"}))
+            .legacy("create_chat", json!({"kind":"side", "device":"Worker"}))
             .await
             .unwrap();
         assert_eq!(created["kind"], "side");
@@ -2843,9 +2621,9 @@ mod tests {
                 .await
                 .unwrap();
             for result in batch["results"].as_array().unwrap() {
-                assert_eq!(result["isError"], true);
+                assert_eq!(result["ok"], false);
                 assert!(
-                    result["error"]
+                    result["error"]["message"]
                         .as_str()
                         .unwrap()
                         .contains("can't create chats of its own"),
@@ -2877,7 +2655,7 @@ mod tests {
             json!({"kind":"unknown"}),
             json!({"kind":"chat", "parent":"Alpha", "title":"must not write"}),
         ] {
-            assert!(root.call("create_chat", args).await.is_err());
+            assert!(root.legacy("create_chat", args).await.is_err());
         }
         assert!(world.writes.lock().unwrap().is_empty());
         let from_chat = tools(
@@ -2898,7 +2676,7 @@ mod tests {
             (json!({"parent":"Beta"}), "subagent", json!("chat-beta-2")),
             (json!({"kind":"side", "parent":"Beta"}), "side", json!("chat-beta-2")),
         ] {
-            let created = from_chat.call("create_chat", args).await.unwrap();
+            let created = from_chat.legacy("create_chat", args).await.unwrap();
             assert_eq!(created["kind"], kind);
             assert_eq!(created["parentChatId"], parent);
             let writes = world.writes.lock().unwrap();
@@ -2913,18 +2691,18 @@ mod tests {
             }
         }
         assert_eq!(
-            root.call("create_chat", json!({})).await.unwrap()["kind"],
+            root.legacy("create_chat", json!({})).await.unwrap()["kind"],
             "chat"
         );
         assert_eq!(
-            root.call("create_chat", json!({"kind":"side", "parent":"Alpha"}))
+            root.legacy("create_chat", json!({"kind":"side", "parent":"Alpha"}))
                 .await
                 .unwrap()["kind"],
             "side"
         );
         // An explicit parent from outside any chat: a subagent of it.
         assert_eq!(
-            root.call("create_chat", json!({"parent":"Alpha"})).await.unwrap()["kind"],
+            root.legacy("create_chat", json!({"parent":"Alpha"})).await.unwrap()["kind"],
             "subagent"
         );
     }
@@ -2940,11 +2718,11 @@ mod tests {
             json!({"project":"missing", "device":"Worker"}),
             json!({"device":"missing"}),
         ] {
-            let error = tools.call("create_chat", args).await.unwrap_err();
+            let error = tools.legacy("create_chat", args).await.unwrap_err();
             assert!(world.writes.lock().unwrap().is_empty(), "{error}");
         }
         let error = tools
-            .call("create_chat", json!({"project":"/repo/comet"}))
+            .legacy("create_chat", json!({"project":"/repo/comet"}))
             .await
             .unwrap_err();
         for candidate in ["space-1", "space-remote", "dev-local", "dev-remote"] {
@@ -2952,7 +2730,7 @@ mod tests {
         }
         for project in ["comet", "/repo/comet", "space-remote"] {
             let created = tools
-                .call("create_chat", json!({"project":project,"device":"Worker"}))
+                .legacy("create_chat", json!({"project":project,"device":"Worker"}))
                 .await
                 .unwrap();
             assert_eq!(created["deviceId"], "dev-remote");
@@ -2960,17 +2738,17 @@ mod tests {
             assert_eq!(created["harness"], "codex");
         }
         let created = tools
-            .call("create_chat", json!({"project":"unique"}))
+            .legacy("create_chat", json!({"project":"unique"}))
             .await
             .unwrap();
         assert_eq!(created["deviceId"], "dev-remote");
         let created = tools
-            .call("create_chat", json!({"device":"dev-remote"}))
+            .legacy("create_chat", json!({"device":"dev-remote"}))
             .await
             .unwrap();
         assert!(created["project"].is_null());
         assert_eq!(created["deviceId"], "dev-remote");
-        let created = tools.call("create_chat", json!({})).await.unwrap();
+        let created = tools.legacy("create_chat", json!({})).await.unwrap();
         assert_eq!(created["deviceId"], "dev-local");
     }
 
@@ -2979,14 +2757,14 @@ mod tests {
         let world = Arc::new(World::default());
         let tools = tools(world.clone(), Origin::default());
         assert_eq!(
-            tools.call("list_projects", json!({})).await.unwrap()["projects"]
+            tools.legacy("list_projects", json!({})).await.unwrap()["projects"]
                 .as_array()
                 .unwrap()
                 .len(),
             3
         );
         let projects = tools
-            .call("list_projects", json!({"device":"Worker"}))
+            .legacy("list_projects", json!({"device":"Worker"}))
             .await
             .unwrap();
         assert_eq!(projects["projects"].as_array().unwrap().len(), 2);
@@ -2998,26 +2776,26 @@ mod tests {
                 .all(|p| p["deviceId"] == "dev-remote")
         );
         assert_eq!(
-            tools.call("list_harnesses", json!({})).await.unwrap()["harnesses"][0]["id"],
+            tools.legacy("list_harnesses", json!({})).await.unwrap()["harnesses"][0]["id"],
             "claude-code"
         );
         assert_eq!(
             tools
-                .call("list_harnesses", json!({"device":"Worker"}))
+                .legacy("list_harnesses", json!({"device":"Worker"}))
                 .await
                 .unwrap()["harnesses"][0]["id"],
             "codex"
         );
         assert_eq!(
             tools
-                .call("list_models", json!({"harness":"codex", "device":"Worker"}))
+                .legacy("list_models", json!({"harness":"codex", "device":"Worker"}))
                 .await
                 .unwrap()["models"][0]["id"],
             "remote-model"
         );
         assert_eq!(
             tools
-                .call("list_models", json!({"harness":"claude-code"}))
+                .legacy("list_models", json!({"harness":"claude-code"}))
                 .await
                 .unwrap()["models"][0]["id"],
             "opus"
@@ -3029,11 +2807,11 @@ mod tests {
             json!({"device":"Laptop", "harness":"mock"}),
             json!({"device":"Worker", "harness":"codex", "model":"opus"}),
         ] {
-            assert!(tools.call("create_chat", args).await.is_err());
+            assert!(tools.legacy("create_chat", args).await.is_err());
             assert!(world.writes.lock().unwrap().is_empty());
         }
         let created = tools
-            .call(
+            .legacy(
                 "create_chat",
                 json!({"device":"Worker", "harness":"codex", "model":"remote-model"}),
             )
@@ -3048,7 +2826,7 @@ mod tests {
             });
             let tools = self::tools(broken.clone(), Origin::default());
             let error = tools
-                .call(
+                .legacy(
                     "create_chat",
                     json!({"device":"Worker", "model":"remote-model"}),
                 )
@@ -3070,7 +2848,7 @@ mod tests {
         });
         let tools = tools(world.clone(), Origin::default());
         tools
-            .call("send_message", json!({"chat":"Beta", "text":"go"}))
+            .legacy("send_message", json!({"chat":"Beta", "text":"go"}))
             .await
             .unwrap();
         assert_eq!(
@@ -3107,12 +2885,12 @@ mod tests {
             .await
             .unwrap();
         let results = &result["results"];
-        assert_eq!(results[0]["result"]["kind"], "chat");
-        assert_eq!(results[0]["result"]["deviceId"], "dev-remote");
-        assert_eq!(results[1]["isError"], true);
-        assert_eq!(results[2]["result"]["kind"], "side");
-        assert_eq!(results[2]["result"]["parentChatId"], "chat-alpha-1");
-        assert_eq!(results[3]["isError"], true);
+        assert_eq!(results[0]["kind"], "chat");
+        assert_eq!(results[0]["deviceId"], "dev-remote");
+        assert_eq!(results[1]["ok"], false);
+        assert_eq!(results[2]["kind"], "side");
+        assert_eq!(results[2]["parentChatId"], "chat-alpha-1");
+        assert_eq!(results[3]["ok"], false);
         for i in 0..4 {
             assert_eq!(results[i]["index"], i);
         }
@@ -3231,7 +3009,7 @@ mod tests {
                     json!({"chat":"Beta", "text":"go", "wait":true, "timeout_secs":2}),
                 )
             };
-            let result = tools.call(name, args).await.unwrap();
+            let result = tools.legacy(name, args).await.unwrap();
             assert_eq!(result["turn"]["outcome"], "completed", "{result}");
             assert_eq!(
                 result["turn"]["replies"].as_array().unwrap().len(),
@@ -3261,7 +3039,7 @@ mod tests {
             )));
             let sent = if create {
                 tools
-                    .call(
+                    .legacy(
                         "create_chat",
                         json!({"kind":"chat", "device":"Worker", "prompt":"go", "wait":false}),
                     )
@@ -3269,7 +3047,7 @@ mod tests {
                     .unwrap()
             } else {
                 tools
-                    .call(
+                    .legacy(
                         "send_message",
                         json!({"chat":"Beta", "text":"go", "wait":false}),
                     )
@@ -3319,7 +3097,7 @@ mod tests {
                     json!({"chat":"Beta", "text":"go", "wait":true, "timeout_secs":2}),
                 )
             };
-            let result = tools.call(name, args).await.unwrap();
+            let result = tools.legacy(name, args).await.unwrap();
             assert_eq!(result["turn"]["outcome"], "completed", "{result}");
             let replies = result["turn"]["replies"].as_array().unwrap();
             assert!(replies.iter().any(|r| r["text"] == "new reply"), "{result}");
@@ -3343,7 +3121,7 @@ mod tests {
             Origin::default(),
         )));
         let result = tools
-            .call(
+            .legacy(
                 "send_message",
                 json!({"chat":"Beta", "text":"go", "wait":true, "timeout_secs":1}),
             )
@@ -3372,7 +3150,7 @@ mod tests {
                     Origin::default(),
                 )));
                 let sent = tools
-                    .call(
+                    .legacy(
                         "send_message",
                         json!({
                             "chat":"Beta", "text":"go", "wait":wait, "timeout_secs":2
@@ -3442,11 +3220,20 @@ mod tests {
         .await;
         assert!(!without.contains("## Plugins"));
         let gone = said(Origin {
+            chat_id: Some("chat-alpha-1".into()),
             plugin_instructions: Some(dir.path().join("missing.md")),
             ..Default::default()
         })
         .await;
         assert_eq!(gone, without);
+        let delivered = said(Origin {
+            chat_id: Some("chat-alpha-1".into()),
+            plugin_instructions: Some(file.clone()),
+            guidance_in_prompt: true,
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(delivered, zeron_proto::agent_guidance::MCP_INSTRUCTIONS);
     }
 
     #[tokio::test]
@@ -3454,7 +3241,7 @@ mod tests {
         let world = Arc::new(World::default());
         // A server whose agent launched without its own subagent tools
         // tells it to delegate through chats; any other doesn't.
-        let rule = "with `create_chats` (or `create_chat`).";
+        let rule = "delegate with Zeron's `create_chats` instead.";
         for side_chats_only in [true, false] {
             let origin = Origin {
                 side_chats_only,
@@ -3468,7 +3255,7 @@ mod tests {
             )
             .await;
             let instructions = init["result"]["instructions"].as_str().unwrap();
-            assert_eq!(instructions.ends_with(rule), side_chats_only);
+            assert_eq!(instructions.contains(rule), side_chats_only);
         }
         let tools = tools(world, Origin::default());
         let init = crate::jsonrpc::handle_request(
@@ -3495,13 +3282,27 @@ mod tests {
             &tools,
             json!(4),
             "tools/call",
-            json!({ "name": "whoami" }),
+            json!({ "name": "catalog", "arguments": { "kind": "self" } }),
         )
         .await;
         assert_eq!(whoami["result"]["isError"], false);
         assert_eq!(
-            whoami["result"]["structuredContent"]["localDeviceId"],
+            whoami["result"]["structuredContent"]["items"][0]["localDeviceId"],
             "dev-local"
         );
+        let text = whoami["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains('\n'), "compact JSON text: {text}");
+        let invalid = crate::jsonrpc::handle_request(
+            &tools,
+            json!(5),
+            "tools/call",
+            json!({ "name": "read_chat", "arguments": { "chat": "alpha", "lmit": 3 } }),
+        )
+        .await;
+        assert_eq!(invalid["result"]["isError"], true);
+        let error = &invalid["result"]["structuredContent"];
+        assert_eq!(error["code"], "invalid_arguments");
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("unknown field `lmit`") && message.contains("Valid call: read_chat {"), "{message}");
     }
 }
