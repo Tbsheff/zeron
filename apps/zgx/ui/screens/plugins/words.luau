@@ -275,6 +275,10 @@ function M.permission(item: any, permission: string): Line
 		return line(true, "chat-round-line", "plugins.words.permission.messages_send.title", "plugins.words.permission.messages_send.detail")
 	elseif permission == "chats.create" then
 		return line(true, "chat-add", "plugins.words.permission.chats_create.title", "plugins.words.permission.chats_create.detail")
+	elseif permission == "hooks.dispatch" then
+		return line(true, "clock-circle", "plugins.words.permission.hooks_dispatch.title", "plugins.words.permission.hooks_dispatch.detail")
+	elseif permission == "hooks.approve" then
+		return line(true, "shield-check", "plugins.words.permission.hooks_approve.title", "plugins.words.permission.hooks_approve.detail")
 	elseif permission == "panel.tabs" then
 		return line(false, "split-columns", "plugins.words.permission.panel_tabs.title")
 	elseif permission == "pages.add" then
@@ -437,6 +441,9 @@ function M.diff(item: any): { Line }
 	end
 	if some(d.events_added) then
 		table.insert(out, line(false, "list", "plugins.words.diff.events", nil, nil, { literal = literal(d.events_added) }))
+	end
+	if some(d.hooks_added) then
+		table.insert(out, line(true, "shield-check", "plugins.words.diff.hooks", nil, nil, { literal = literal(d.hooks_added) }))
 	end
 	if some(d.network_added) then
 		local listed = hosts_said(d.network_added, d.network_local)

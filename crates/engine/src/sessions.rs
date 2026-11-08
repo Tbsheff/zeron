@@ -62,6 +62,37 @@ pub enum SteerOutcome {
 
 type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
 
+fn ask_person(
+    pending: &PendingInputs,
+    engine_tx: &mpsc::UnboundedSender<AgentEvent>,
+    questions: Vec<UserInputQuestion>,
+    mut tx: oneshot::Sender<Vec<UserInputAnswer>>,
+) {
+    let (answer_tx, answer_rx) = oneshot::channel();
+    let request_id = new_id();
+    lock(pending).insert(request_id.clone(), answer_tx);
+    let _ = engine_tx.send(AgentEvent::InputRequested {
+        request_id: request_id.clone(),
+        questions,
+    });
+    let pending = pending.clone();
+    let engine_tx = engine_tx.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            // A dropped resolver stays an error for the harness, as before.
+            answer = answer_rx => if let Ok(answer) = answer { let _ = tx.send(answer); },
+            _ = tx.closed() => {
+                lock(&pending).remove(&request_id);
+                // The run stopped waiting: closed unanswered.
+                let _ = engine_tx.send(AgentEvent::InputResolved {
+                    request_id,
+                    answers: Some(Vec::new()),
+                });
+            }
+        }
+    });
+}
+
 /// A harness-native session id plus the cwd it was created under. Harness
 /// session stores are cwd-scoped (claude keys conversations by project
 /// directory — zeron sessions.ts:563 "harness session stores are keyed by
@@ -402,6 +433,10 @@ impl SessionsEngine {
     /// Wire the plugins service: local runs get its native MCP servers.
     pub fn set_plugins(&self, plugins: crate::plugins::Plugins) {
         let _ = self.inner.plugins.set(plugins);
+    }
+
+    pub(crate) fn plugins(&self) -> Option<crate::plugins::Plugins> {
+        self.inner.plugins.get().cloned()
     }
 
     /// Wire the doc host (called once at engine assembly; the two services are mutually
@@ -1082,31 +1117,32 @@ impl SessionsEngine {
         let request_input = {
             let pending = pending_inputs.clone();
             let engine_tx = engine_tx.clone();
+            let plugins = self.inner.plugins.get().cloned();
+            let (chat, cwd) = (chat_id.to_owned(), request.cwd.clone());
             Box::new(move |questions: Vec<UserInputQuestion>| {
-                let (mut tx, rx) = oneshot::channel();
-                let (answer_tx, answer_rx) = oneshot::channel();
-                let request_id = new_id();
-                lock(&pending).insert(request_id.clone(), answer_tx);
-                let _ = engine_tx.send(AgentEvent::InputRequested {
-                    request_id: request_id.clone(),
-                    questions,
-                });
-                let pending = pending.clone();
-                let engine_tx = engine_tx.clone();
-                tokio::spawn(async move {
-                    tokio::select! {
-                        // A dropped resolver stays an error for the harness, as before.
-                        answer = answer_rx => if let Ok(answer) = answer { let _ = tx.send(answer); },
-                        _ = tx.closed() => {
-                            lock(&pending).remove(&request_id);
-                            // The run stopped waiting: closed unanswered.
-                            let _ = engine_tx.send(AgentEvent::InputResolved {
-                                request_id,
-                                answers: Some(Vec::new()),
-                            });
-                        }
+                let (tx, rx) = oneshot::channel();
+                let hooked = plugins
+                    .as_ref()
+                    .filter(|p| p.hooks(crate::plugins::hooks::APPROVE));
+                match hooked.zip(crate::plugins::hooks::approval_ctx(&questions, &chat, &cwd)) {
+                    Some((plugins, ctx)) => {
+                        let (plugins, pending, engine_tx) =
+                            (plugins.clone(), pending.clone(), engine_tx.clone());
+                        tokio::spawn(async move {
+                            let decided = plugins.decide_approval(ctx).await;
+                            let answers =
+                                crate::plugins::hooks::approval_answers(&decided, &questions[0]);
+                            match answers {
+                                Some(answers) => drop(tx.send(answers)),
+                                None if !tx.is_closed() => {
+                                    ask_person(&pending, &engine_tx, questions, tx)
+                                }
+                                None => {}
+                            }
+                        });
                     }
-                });
+                    None => ask_person(&pending, &engine_tx, questions, tx),
+                }
                 rx
             })
         };

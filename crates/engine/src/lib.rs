@@ -369,7 +369,9 @@ impl EngineCore {
                 files: workspace_files.clone(),
                 default_harness,
             };
-            plugins.set_actor(move |_plugin, action, args| actions.act(action, args));
+            plugins.set_actor(move |plugin, action, args| actions.act(plugin, action, args));
+            let drains = doc_host.clone();
+            plugins.set_rechecker(move || drains.kick_drains());
         }
         let terminals = Terminals::new();
         sessions.track_terminal_activity(terminals.clone(), workspace.clone());

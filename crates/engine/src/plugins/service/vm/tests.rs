@@ -48,6 +48,8 @@ fn spec(dir: &Path, limits: Limits) -> Spec {
         device: json!({ "id": "dev-1", "name": "Laptop" }),
         store: Some(dir.join(".store.json")),
         events: vec!["turn.done".into(), "tool.call".into()],
+        hooks: Vec::new(),
+        settings: Settings::default(),
         limits,
     }
 }

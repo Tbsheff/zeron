@@ -1,0 +1,10 @@
+{
+  "id": "safe-commands",
+  "name": "Safe commands",
+  "version": "1.0.0",
+  "description": "Answers your agents' command approvals: allows a few read-only commands, refuses ones that wipe a disk, and leaves the rest to you.",
+  "entry": "init.luau",
+  "service": "service.luau",
+  "permissions": ["service", "hooks.approve", "messages.read"],
+  "hooks": ["tool.approve"]
+}

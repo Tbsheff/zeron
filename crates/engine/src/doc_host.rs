@@ -289,6 +289,8 @@ struct DocHostInner {
     /// deferred on in-transit attachment bytes re-checks on a cadence, and
     /// each deferral must not stack another timer.
     drain_waiting: Mutex<HashSet<String>>,
+    plugin_rows: Mutex<HashMap<String, String>>,
+    dispatch_wakes: Mutex<HashMap<String, i64>>,
     /// Uploads store (engine assembly) — resolves `pending://` attachment
     /// refs and jails transfer reads to the uploads dir.
     uploads: OnceLock<crate::uploads::Uploads>,
@@ -1071,6 +1073,8 @@ impl DocHost {
                 seeding: Mutex::new(HashSet::new()),
                 seed_waiting: Mutex::new(HashSet::new()),
                 drain_waiting: Mutex::new(HashSet::new()),
+                plugin_rows: Mutex::new(HashMap::new()),
+                dispatch_wakes: Mutex::new(HashMap::new()),
                 uploads: OnceLock::new(),
                 connectivity: OnceLock::new(),
                 connectivity_started: AtomicBool::new(false),
@@ -3677,8 +3681,31 @@ impl DocHost {
         attachments: Vec<String>,
         hold_for_turn_end: bool,
     ) -> Result<String, EngineError> {
+        self.queue_row(chat_id, text, attachments, hold_for_turn_end, None)
+    }
+
+    pub fn queue_plugin_message(
+        &self,
+        chat_id: &str,
+        text: &str,
+        plugin: &str,
+    ) -> Result<String, EngineError> {
+        self.queue_row(chat_id, text, Vec::new(), true, Some(plugin))
+    }
+
+    fn queue_row(
+        &self,
+        chat_id: &str,
+        text: &str,
+        attachments: Vec<String>,
+        hold_for_turn_end: bool,
+        plugin: Option<&str>,
+    ) -> Result<String, EngineError> {
         let handle = self.open(chat_id)?;
         let id = new_id();
+        if let Some(plugin) = plugin {
+            lock(&self.inner.plugin_rows).insert(id.clone(), plugin.to_owned());
+        }
         handle.doc.push_queued(&QueuedMessage {
             id: id.clone(),
             text: text.to_string(),
@@ -4291,6 +4318,11 @@ impl DocHost {
                     "queued row held: attachment bytes in transit");
                 self.arm_attachment_wait(handle);
                 return;
+            }
+            match self.dispatch_hook(handle, &head).await {
+                RowHook::Go => {}
+                RowHook::Hold => return,
+                RowHook::Again => continue,
             }
             let send = QueueSend::NextTurn;
             // Take it only once we know it is going out — a row that stays in
@@ -5327,6 +5359,11 @@ impl DocHost {
                     );
                     continue;
                 }
+            }
+            match self.run_hook(handle, &entry, &disposition).await {
+                RowHook::Go => {}
+                RowHook::Hold => return,
+                RowHook::Again => continue,
             }
             // In-flight claim: guards the dead-command sweep (an id in
             // `executing` is alive, not crashed) and serializes racing
@@ -6948,3 +6985,7 @@ mod sync_lifecycle_tests;
 
 #[path = "doc_host_delivery.rs"]
 mod remote_delivery;
+
+#[path = "doc_host_dispatch_hook.rs"]
+mod dispatch_hook;
+use dispatch_hook::RowHook;

@@ -26,7 +26,7 @@ use mlua::{Function, Lua, LuaOptions, StdLib, Table, Value, VmState};
 use serde_json::Value as Json;
 use tokio::sync::oneshot;
 
-use crate::plugins::manifest::KNOWN_EVENTS;
+use crate::plugins::manifest::{KNOWN_EVENTS, KNOWN_HOOKS};
 
 const PRELUDE: &str = include_str!("prelude.luau");
 pub const DROPPED_EVENT: &str = "events.dropped";
@@ -71,7 +71,35 @@ pub struct Spec {
     /// `zeron.store`'s file (`None`: kept in memory only).
     pub store: Option<PathBuf>,
     pub events: Vec<String>,
+    pub hooks: Vec<String>,
+    pub settings: Settings,
     pub limits: Limits,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Settings {
+    pub file: Option<PathBuf>,
+    pub defaults: serde_json::Map<String, Json>,
+}
+
+impl Settings {
+    pub fn value(&self, id: &str) -> Json {
+        let fallback = self.defaults.get(id).cloned().unwrap_or(Json::Null);
+        let held = self
+            .file
+            .as_ref()
+            .and_then(|file| std::fs::read(file).ok())
+            .and_then(|bytes| serde_json::from_slice::<Json>(&bytes).ok())
+            .and_then(|all| all.get(id).cloned());
+        match held {
+            Some(value) if fallback.is_null() || same_kind(&value, &fallback) => value,
+            _ => fallback,
+        }
+    }
+}
+
+fn same_kind(a: &Json, b: &Json) -> bool {
+    std::mem::discriminant(a) == std::mem::discriminant(b)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +107,7 @@ pub enum Kind {
     Method,
     Tool,
     Timer,
+    Hook,
 }
 
 impl Kind {
@@ -87,6 +116,7 @@ impl Kind {
             Kind::Method => "method",
             Kind::Tool => "tool",
             Kind::Timer => "timer",
+            Kind::Hook => "hook",
         }
     }
 }
@@ -703,6 +733,16 @@ fn natives(
     }
     events.raw_set(DROPPED_EVENT, !spec.events.is_empty())?;
     host.set("events", events)?;
+    let hooks = lua.create_table()?;
+    for (name, _) in KNOWN_HOOKS {
+        hooks.raw_set(*name, spec.hooks.iter().any(|h| h == name))?;
+    }
+    host.set("hooks", hooks)?;
+    let settings = spec.settings.clone();
+    host.set(
+        "setting",
+        lua.create_function(move |lua, id: String| to_lua(lua, &settings.value(&id), 0))?,
+    )?;
 
     let json = lua.create_table()?;
     json.set(

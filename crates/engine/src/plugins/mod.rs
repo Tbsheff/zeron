@@ -20,6 +20,7 @@ pub mod capability;
 pub mod events;
 pub mod files;
 pub mod guides;
+pub mod hooks;
 pub mod install;
 pub mod keys;
 mod lifecycle;
@@ -251,6 +252,8 @@ struct Inner {
     own_key_checked: Mutex<Option<Instant>>,
     heard: Mutex<events::Heard>,
     listening: AtomicBool,
+    hooked: Mutex<Vec<Plan>>,
+    rechecker: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 type StepUpFn = Arc<dyn Fn() -> Option<String> + Send + Sync>;
@@ -513,6 +516,8 @@ impl Plugins {
                 own_key_checked: Mutex::new(None),
                 heard: Mutex::new(events::Heard::new(device_id)),
                 listening: AtomicBool::new(false),
+                hooked: Mutex::new(Vec::new()),
+                rechecker: Mutex::new(None),
             }),
         };
         plugins.inner.services.set_hooks(Arc::new(ServiceHooks {
@@ -2564,7 +2569,22 @@ fn service_plan(entry: &Entry) -> Option<Plan> {
         commands: item.commands.clone(),
         hosts: item.network_hosts.clone(),
         events: item.events.clone(),
+        hooks: item.hooks.clone(),
+        settings: setting_defaults(entry),
     })
+}
+
+fn setting_defaults(entry: &Entry) -> serde_json::Map<String, serde_json::Value> {
+    let raw = entry
+        .inspected
+        .manifest
+        .as_ref()
+        .map(|m| &m.raw["settings"]);
+    raw.and_then(|s| s.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|s| Some((s["id"].as_str()?.to_owned(), s["default"].clone())))
+        .collect()
 }
 
 /// What services borrow from the plugins module.
@@ -2613,6 +2633,16 @@ impl service::Hooks for ServiceHooks {
         }
     }
 
+    fn recheck(&self, _hook: &str) {
+        let recheck = self
+            .inner
+            .upgrade()
+            .and_then(|inner| lock(&inner.rechecker).clone());
+        if let Some(recheck) = recheck {
+            recheck();
+        }
+    }
+
     /// R11: the snapshot a service loads from is the version allowed, or it
     /// isn't loaded: it's removed, and a rescan makes it again from the
     /// plugin's (checked) folder.
@@ -2641,6 +2671,7 @@ impl Plugins {
         let plans: Vec<Plan> = lock(&self.inner.entries).iter().filter_map(service_plan).collect();
         let listening = plans.iter().any(|p| !p.events.is_empty() && p.allows("sessions.read"));
         self.inner.listening.store(listening, Ordering::SeqCst);
+        *lock(&self.inner.hooked) = hooks::in_install_order(&self.inner.plugins_dir, &plans);
         self.inner.services.sync(plans);
     }
 

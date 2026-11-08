@@ -45,6 +45,13 @@ pub const KNOWN_PERMISSIONS: &[&str] = &[
     "messages.send",
     "chats.create",
     "files.contents",
+    "hooks.dispatch",
+    "hooks.approve",
+];
+
+pub const KNOWN_HOOKS: &[(&str, &str)] = &[
+    ("message.dispatch", "hooks.dispatch"),
+    ("tool.approve", "hooks.approve"),
 ];
 
 pub const KNOWN_EVENTS: &[&str] = &[
@@ -221,6 +228,7 @@ pub struct Manifest {
     /// alone, a private one (`localhost:8080`) only so (plugin-guard's `net`).
     pub network_hosts: Vec<String>,
     pub events: Vec<String>,
+    pub hooks: Vec<String>,
     /// `None` when absent; `Some(Err)` when present but malformed.
     pub signature: Option<Result<SignatureSpec, ()>>,
     /// The first thing wrong with it, in plain words.
@@ -418,6 +426,10 @@ impl Manifest {
             problems.push(e);
             Vec::new()
         });
+        let hooks = string_list(object.get("hooks"), "\"hooks\"").unwrap_or_else(|e| {
+            problems.push(e);
+            Vec::new()
+        });
         let signature = object.get("signature").map(parse_signature);
         let mut manifest = Manifest {
             raw: raw.clone(),
@@ -435,6 +447,7 @@ impl Manifest {
             service,
             network_hosts,
             events,
+            hooks,
             signature,
             problem: None,
         };
@@ -494,7 +507,7 @@ impl Manifest {
             }
             _ => {}
         }
-        if let Some(problem) = self.events_problem() {
+        if let Some(problem) = self.events_problem().or_else(|| self.hooks_problem()) {
             return Some(problem);
         }
         if !self.ui.change.is_empty() && !asks("ui.change") {
@@ -525,6 +538,25 @@ impl Manifest {
                 "Its tool \"{}\" needs a name of lowercase letters, digits and underscores",
                 tool.name
             ));
+        }
+        None
+    }
+
+    fn hooks_problem(&self) -> Option<String> {
+        for hook in &self.hooks {
+            let Some((_, permission)) = KNOWN_HOOKS.iter().find(|(name, _)| name == hook) else {
+                return Some(format!(
+                    "It hooks \"{hook}\", which isn't a hook Zeron knows"
+                ));
+            };
+            if self.service.is_none() {
+                return Some("It lists hooks but has no service to run them".into());
+            }
+            if !self.asks(permission) {
+                return Some(format!(
+                    "It hooks \"{hook}\" but doesn't ask for \"{permission}\""
+                ));
+            }
         }
         None
     }
@@ -715,6 +747,57 @@ mod tests {
         assert!(contents_alone.unwrap().contains("not \"files.read\""));
         let unknown = problem(with(serde_json::json!(["messages.write"])));
         assert!(unknown.unwrap().contains("isn't a permission Zeron knows"));
+    }
+
+    #[test]
+    fn a_service_hooks_only_known_hooks_with_their_permissions() {
+        let with = |hooks: serde_json::Value, permissions: serde_json::Value, service: bool| {
+            let mut m = base();
+            m["hooks"] = hooks;
+            m["permissions"] = permissions;
+            if service {
+                m["service"] = serde_json::json!("service.luau");
+            }
+            m
+        };
+        let ok = Manifest::from_value(with(
+            serde_json::json!(["message.dispatch", "tool.approve"]),
+            serde_json::json!(["service", "hooks.dispatch", "hooks.approve"]),
+            true,
+        ))
+        .unwrap();
+        assert_eq!(ok.problem(), None);
+        assert_eq!(ok.hooks, ["message.dispatch", "tool.approve"]);
+        let unknown = problem(with(
+            serde_json::json!(["message.modify"]),
+            serde_json::json!(["service", "hooks.dispatch"]),
+            true,
+        ));
+        assert!(unknown.unwrap().contains("isn't a hook Zeron knows"));
+        let no_service = problem(with(
+            serde_json::json!(["tool.approve"]),
+            serde_json::json!(["hooks.approve"]),
+            false,
+        ));
+        assert!(no_service.unwrap().contains("no service"));
+        let no_permission = problem(with(
+            serde_json::json!(["message.dispatch", "tool.approve"]),
+            serde_json::json!(["service", "hooks.dispatch"]),
+            true,
+        ));
+        assert!(
+            no_permission
+                .unwrap()
+                .contains("\"tool.approve\" but doesn't ask for \"hooks.approve\"")
+        );
+        assert!(
+            problem(with(
+                serde_json::json!("tool.approve"),
+                serde_json::json!(["service", "hooks.approve"]),
+                true
+            ))
+            .is_some()
+        );
     }
 
     #[test]

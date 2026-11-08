@@ -26,12 +26,12 @@ pub struct Actions {
 }
 
 impl Actions {
-    pub fn act(&self, action: &str, args: Json) -> Acting {
-        let (this, action) = (self.clone(), action.to_owned());
+    pub fn act(&self, plugin: &str, action: &str, args: Json) -> Acting {
+        let (this, plugin, action) = (self.clone(), plugin.to_owned(), action.to_owned());
         Box::pin(async move {
             match action.as_str() {
-                "chats.send" => this.send(&args),
-                "chats.create" => this.create(&args),
+                "chats.send" => this.send(&plugin, &args),
+                "chats.create" => this.create(&plugin, &args),
                 "chats.stop" => this.stop(&args),
                 "files.read" => this.read(&args).await,
                 other => Err(format!("zeron.{other} isn't something a service can do")),
@@ -48,17 +48,17 @@ impl Actions {
             .ok_or_else(|| format!("zeron.{what}: there's no session {id}"))
     }
 
-    fn queue(&self, chat_id: &str, text: &str, what: &str) -> Result<(), String> {
+    fn queue(&self, plugin: &str, chat_id: &str, text: &str, what: &str) -> Result<(), String> {
         self.doc_host
-            .queue_message_with_behavior(chat_id, &quote_headers(text), Vec::new(), true)
+            .queue_plugin_message(chat_id, &quote_headers(text), plugin)
             .map(drop)
             .map_err(|e| format!("zeron.{what}: {e}"))
     }
 
-    fn send(&self, args: &Json) -> Result<Json, String> {
+    fn send(&self, plugin: &str, args: &Json) -> Result<Json, String> {
         let chat = self.chat(args, "chats.send")?;
         let text = said(args, "text").ok_or("zeron.chats.send: say what to send")?;
-        self.queue(&chat.id, text, "chats.send")?;
+        self.queue(plugin, &chat.id, text, "chats.send")?;
         Ok(Json::Bool(true))
     }
 
@@ -70,7 +70,7 @@ impl Actions {
         Ok(Json::Bool(true))
     }
 
-    fn create(&self, args: &Json) -> Result<Json, String> {
+    fn create(&self, plugin: &str, args: &Json) -> Result<Json, String> {
         let failed = |e: crate::EngineError| format!("zeron.chats.create: {e}");
         let project = field(args, "project");
         let device = field(args, "device");
@@ -131,7 +131,7 @@ impl Actions {
             self.workspace.rename_chat(&id, title).map_err(failed)?;
         }
         if let Some(prompt) = said(args, "prompt") {
-            self.queue(&id, prompt, "chats.create")?;
+            self.queue(plugin, &id, prompt, "chats.create")?;
         }
         Ok(json!(id))
     }

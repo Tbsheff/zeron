@@ -113,6 +113,7 @@ local stops: { () -> () } = {}
 -- `zeron.watch`es, by id: each one's folders and listener.
 local watches: { [number]: { folders: { string }, fn: (any) -> () } } = {}
 local listeners: { [string]: { { fn: (any) -> () } } } = {}
+local deciders: { [string]: { { fn: (any) -> any } } } = {}
 
 local function dispatch(kind: string, name: string, args: any, call: any, reply: number)
 	local fn
@@ -123,6 +124,9 @@ local function dispatch(kind: string, name: string, args: any, call: any, reply:
 	elseif kind == "timer" then
 		local timer = timers[tonumber(string.sub(name, 2)) or 0]
 		fn = timer and timer.fn
+	elseif kind == "hook" then
+		local decider = (deciders[name] or {})[(tonumber(call) or 0) + 1]
+		fn = decider and decider.fn
 	end
 	if not fn then
 		host.unknown(reply)
@@ -290,6 +294,43 @@ local function service(id: string): any
 				table.remove(list, at)
 			end
 		end
+	end
+
+	-- Decides before Zeron goes on (one the manifest's "hooks" lists):
+	-- `fn(ctx)` returns the decision, in the order hooks were added.
+	-- Returns a function that removes it.
+	function M.hook(name: string, fn: (any) -> any): () -> ()
+		assert(type(name) == "string" and type(fn) == "function", "zeron.hook(name, fn)")
+		local declared = host.hooks[name]
+		if declared == nil then
+			error(`zeron.hook: Zeron has no hook "{name}"`, 2)
+		elseif not declared then
+			error(`zeron.hook: "{name}" isn't in the manifest's "hooks"`, 2)
+		end
+		local entry = { fn = fn }
+		local list = deciders[name] or {}
+		deciders[name] = list
+		table.insert(list, entry)
+		return function()
+			local at = table.find(list, entry)
+			if at then
+				table.remove(list, at)
+			end
+		end
+	end
+
+	M.hooks = {}
+
+	-- Ask Zeron to run a hook again for what it holds (a "wait" on
+	-- message.dispatch): a promise of true.
+	function M.hooks.recheck(name: string): any
+		return op("hooks.recheck", { hook = name })
+	end
+
+	-- A setting's value (the manifest's "settings"), as the person set it,
+	-- or its default.
+	function M.setting(id: string): any
+		return host.setting(id)
 	end
 
 	-- This device's chats' and projects' folders, whole paths ("sessions.read"):

@@ -97,6 +97,9 @@ pub fn record(manifest: &Manifest) -> Value {
     if !manifest.events.is_empty() {
         record["events"] = json!(sorted_unique(&manifest.events));
     }
+    if !manifest.hooks.is_empty() {
+        record["hooks"] = json!(sorted_unique(&manifest.hooks));
+    }
     record
 }
 
@@ -196,6 +199,7 @@ pub struct Diff {
     pub entry_changed: Option<Before<Value>>,
     pub network_added: Vec<String>,
     pub events_added: Vec<String>,
+    pub hooks_added: Vec<String>,
     pub settings_changed: bool,
 }
 
@@ -215,6 +219,7 @@ impl Diff {
             || self.service_changed.as_ref().is_some_and(|c| c.before.is_null() && !c.after.is_null())
             || !self.network_added.is_empty()
             || !self.events_added.is_empty()
+            || !self.hooks_added.is_empty()
             || self.settings_changed
     }
 
@@ -280,6 +285,7 @@ pub fn diff(before: &Value, after: &Value) -> Diff {
                 .collect()
         },
         events_added: added(&before["events"], &after["events"]),
+        hooks_added: added(&before["hooks"], &after["hooks"]),
         settings_changed,
     }
 }
@@ -396,6 +402,22 @@ mod tests {
         assert!(diff(&none, &one).grew() && diff(&none, &one).events_added == ["turn.done"]);
         assert!(diff(&one, &two).grew() && diff(&one, &two).events_added == ["tool.call"]);
         assert!(!diff(&two, &one).grew(), "an event dropped doesn't ask");
+    }
+
+    #[test]
+    fn plugins_capability_a_hook_added_grows_and_none_keeps_the_digest() {
+        let service = json!({ "permissions": ["service", "hooks.dispatch", "hooks.approve"], "service": "service.luau" });
+        let none = record(&manifest(service.clone()));
+        assert!(none.get("hooks").is_none());
+        let mut one = service.clone();
+        one["hooks"] = json!(["message.dispatch"]);
+        let one = record(&manifest(one));
+        let mut two = service;
+        two["hooks"] = json!(["message.dispatch", "tool.approve"]);
+        let two = record(&manifest(two));
+        assert!(diff(&none, &one).grew() && diff(&none, &one).hooks_added == ["message.dispatch"]);
+        assert!(diff(&one, &two).grew() && diff(&one, &two).hooks_added == ["tool.approve"]);
+        assert!(!diff(&two, &one).grew(), "a hook dropped doesn't ask");
     }
 
     #[test]

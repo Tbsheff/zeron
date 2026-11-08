@@ -28,6 +28,7 @@ A plugin is a folder: `zeron-plugin.json` (its manifest), `init.luau` (its code)
 - `commands`: the programs it runs as you (`["gh", "git"]`), each by its name as it's found on the PATH, never a path. Needs `"commands"`, and the person sees each name when allowing it (see [Programs and a database](#programs-and-a-database)).
 - `service`: its headless half (`"service.luau"`), which Zeron's engine runs on each device that allowed the plugin. Needs `"service"` (see [Services](#services)).
 - `events`: the app events its service hears (`["turn.done"]`, see [Events](#events)). Needs a `service` and `"sessions.read"`.
+- `hooks`: the decisions its service makes before Zeron goes on (`["message.dispatch", "tool.approve"]`, see [Hooks](#hooks)). Needs a `service`, and `"hooks.dispatch"` or `"hooks.approve"` for each.
 - `network`: `{ "hosts": ["api.example.com", "*.example.org", "localhost:8080"] }`, the hosts its requests may reach, from its window and its service alike (see [Reaching the network](#reaching-the-network)). Without it, `network` reaches any public address and never this device, your network or a cloud's metadata address. With it, only those hosts; a private one (`localhost`, `10.…`, `nas.local`) is reachable only when it's named exactly, and the consent sheet says so. `Authorization` and `Cookie` headers go only to hosts named here. Needs `"network"`.
 
 Your own plugins are signed as yours, and re-signed and reloaded each time you save.
@@ -59,6 +60,8 @@ Your own plugins are signed as yours, and re-signed and reloaded each time you s
 | `messages.send` | send messages to your chats, and stop their turns, from its service (`zeron.chats.send`, `zeron.chats.stop`). See [Actions](#actions) |
 | `chats.create` | start chats from its service (`zeron.chats.create`) |
 | `files.contents` | read a file's contents in a session's folder from its service (`zeron.files.read`). Needs `files.read` |
+| `hooks.dispatch` | hold or refuse a message before it reaches an agent (`zeron.hook("message.dispatch")`). See [Hooks](#hooks) |
+| `hooks.approve` | answer an agent's approval request for you (`zeron.hook("tool.approve")`). See [Hooks](#hooks) |
 
 ## Reaching the network
 
@@ -350,6 +353,8 @@ end)
 | `zeron.folders()` | a promise of this device's chats' and projects' folders (whole paths) | `sessions.read` |
 | `zeron.notify { title, body?, session? }` | as the window's | `notifications` |
 | `zeron.chats.send(session, text)`, `zeron.chats.stop(session)`, `zeron.chats.create { … }`, `zeron.files.read(session, path)` | act in your chats. See [Actions](#actions) | `messages.send`, `chats.create`, `files.contents` |
+| `zeron.hook(name, fn)`, `zeron.hooks.recheck(name)` | decide before Zeron goes on (one the manifest's `hooks` lists); run a hook again. Returns a function that removes it. See [Hooks](#hooks) | `hooks.dispatch`, `hooks.approve` |
+| `zeron.setting(id)` | a setting's value (the manifest's `settings`), as the person set it on its page, or its default | |
 | `zeron.store(key, default)` | `:get()`, `:set(v)`: kept on this device between runs (1 MB), the service's own (not the window's store) | |
 | `zeron.sleep(seconds)`, `zeron.task(fn)` | a promise done later; run `fn` as a task of its own | |
 | `zeron.json.encode(v)`, `zeron.json.decode(text)`, `zeron.device` | JSON; this device's `{ id, name }` | |
@@ -460,6 +465,82 @@ end)
 ```
 
 `plugins-dev/auto-continue` is this, whole, with `"permissions": ["service", "sessions.read", "messages.send"]` and `"events": ["turn.done"]`. A window reaches these through its service: serve a method that acts, and call it with `zeron.service():call`.
+
+### Hooks
+
+A hook lets a service decide before Zeron goes on: whether a message goes to the agent now, and how to answer an agent's approval request. List the hooks in the manifest, ask for each one's permission, and add a function with `zeron.hook`.
+
+```json
+"service": "service.luau",
+"permissions": ["service", "hooks.dispatch", "hooks.approve"],
+"hooks": ["message.dispatch", "tool.approve"]
+```
+
+| hook | runs | needs |
+|---|---|---|
+| `message.dispatch` | before a message goes to the agent as a new turn: a queued row (yours, or a plugin's `zeron.chats.send`), and what you send to an idle chat | `hooks.dispatch` |
+| `tool.approve` | when an agent asks you to approve a command, a file change or a tool use, before the question reaches you | `hooks.approve` |
+
+Hooks run on the device that hosts the chat, for that device's chats. The consent sheet marks both as risky. `zeron.hook` with a name Zeron doesn't know, or one the manifest doesn't list, is an error.
+
+**`message.dispatch`.** `fn(ctx)` returns a decision:
+
+| ctx field | what |
+|---|---|
+| `session` | the chat |
+| `source` | `"person"` (you sent it to an idle chat), `"queue"` (a queued row), or `"plugin"` (a plugin sent it) |
+| `plugin?` | the sending plugin's id, when `source` is `"plugin"` |
+| `text?` | the message. Only with `messages.read` |
+
+| return | Zeron |
+|---|---|
+| `nil`, or `{ action = "proceed" }` | sends it |
+| `{ action = "wait", reason, ["until"] = seconds? }` | keeps it in the queue, and runs the hook again at `until` (Unix seconds; 1 second from now at the soonest), when your service calls `zeron.hooks.recheck("message.dispatch")`, or when the chat's queue changes. The messages after it wait too, in order |
+| `{ action = "reject", message }` | doesn't send it: it lands in the transcript unsent, with a notice that names your plugin and says `message` |
+
+There's no "change it" answer. A message sent while a turn runs (a steer) goes into that turn and isn't asked about. Write `["until"]` with brackets: `until` is a Luau keyword.
+
+**`tool.approve`.** It runs only for what would ask you: what the chat's access already allows never reaches it.
+
+| ctx field | what |
+|---|---|
+| `session` | the chat |
+| `kind` | `"command"`, `"edit"` or `"tool"` |
+| `name` | the program (`"git"`), `"edit"`, or the tool's name |
+| `input?` | `{ command }`, `{ paths }` or `{ detail }`. Only with `messages.read` |
+| `cwd?` | the chat's folder. Only with `files.read` |
+
+| return | Zeron |
+|---|---|
+| `"allow"` | approves it, without asking you |
+| `"deny"` | refuses it: the agent is told "denied by" your plugin's name (Claude Code hears the words; Codex, OpenCode and other agents hear a plain no) |
+| `"ask"`, or `nil` | asks you, as usual |
+
+Some approvals aren't asked about: Codex's requests for more permissions, Claude Code's plan approval, and a step of a long Muse command. Every allow and deny goes to your service's log (`plugin_status`), with the chat and the tool's name. `input.requested` is told only when the question reaches you.
+
+**Order.** Plugins decide in the order they were installed (one put in the plugins folder by hand, by its id), and a plugin's own functions in the order it added them. For `message.dispatch`, the first answer that isn't proceed wins, and the rest aren't asked. For `tool.approve`, a deny from any plugin beats an allow from another.
+
+**Fail open.** A function has 2 seconds. One that fails (`error()`), takes longer, or answers something that isn't a decision counts as no decision: the message goes, the approval asks you, and your service's log says why. A broken plugin never locks you out of your agents. A service with hooks starts when Zeron does, and stays running: a hook never waits for a cold start. If it isn't running (it crashed, or failed to load), there's no decision, and Zeron starts it again within a few seconds.
+
+```lua
+-- service.luau: hold what plugins send after 23:00
+zeron.hook("message.dispatch", function(ctx)
+	if ctx.source == "plugin" and os.date("*t").hour >= 23 then
+		return { action = "wait", reason = "quiet hours" }
+	end
+	return nil
+end)
+
+-- answer approvals for read-only commands ("messages.read" for input)
+zeron.hook("tool.approve", function(ctx)
+	if ctx.kind == "command" and ctx.input.command == "git status" then
+		return "allow"
+	end
+	return "ask"
+end)
+```
+
+`plugins-dev/quiet-hours` and `plugins-dev/safe-commands` are these, whole: quiet hours you set on its settings page, and an allowlist of read-only commands that refuses `rm -rf /`.
 
 ## Settings
 

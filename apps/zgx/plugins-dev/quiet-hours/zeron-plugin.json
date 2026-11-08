@@ -1,0 +1,14 @@
+{
+  "id": "quiet-hours",
+  "name": "Quiet hours",
+  "version": "1.0.0",
+  "description": "At night, holds what plugins and your queue send to your agents until morning. What you send yourself goes at once.",
+  "entry": "init.luau",
+  "service": "service.luau",
+  "permissions": ["service", "hooks.dispatch"],
+  "hooks": ["message.dispatch"],
+  "settings": [
+    { "id": "start", "kind": "number", "label": "Quiet from", "description": "The hour quiet hours start, on this device's clock.", "min": 0, "max": 23, "step": 1, "unit": "h", "default": 23 },
+    { "id": "end", "kind": "number", "label": "Quiet until", "description": "The hour they end. The same hour as the start: never quiet.", "min": 0, "max": 23, "step": 1, "unit": "h", "default": 7 }
+  ]
+}

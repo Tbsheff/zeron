@@ -8,6 +8,7 @@ struct Recorder {
     emitted: Mutex<Vec<(String, String, Json)>>,
     notified: Mutex<Vec<String>>,
     acted: Mutex<Vec<(String, Json)>>,
+    rechecked: Mutex<Vec<String>>,
 }
 
 impl Hooks for Recorder {
@@ -25,6 +26,9 @@ impl Hooks for Recorder {
         lock(&self.acted).push((action.into(), args));
         let answer = if action == "chats.create" { json!("chat-new") } else { json!(true) };
         Box::pin(async move { Ok(answer) })
+    }
+    fn recheck(&self, hook: &str) {
+        lock(&self.rechecked).push(hook.into());
     }
 }
 
@@ -68,7 +72,19 @@ impl Rig {
             commands: vec!["echo".into()],
             hosts: Vec::new(),
             events: Vec::new(),
+            hooks: Vec::new(),
+            settings: serde_json::Map::new(),
         }
+    }
+
+    fn hooked(&self, source: &str, hooks: &[&str]) -> Plan {
+        let mut plan = self.plan(
+            "1.0.0",
+            source,
+            &["service", "hooks.dispatch", "hooks.approve"],
+        );
+        plan.hooks = hooks.iter().map(|h| h.to_string()).collect();
+        plan
     }
 
     async fn ask(&self, plan: &Plan, method: &str, args: Json) -> Result<Json, Refusal> {
@@ -647,4 +663,159 @@ zeron.serve("start", function() return zeron.chats.create({ calling = { "forged"
         json!([]),
         "a method call names none, and the plugin can't"
     );
+}
+
+const DECIDES: &str = r#"
+local zeron = require("./zeron")("svc")
+local stop_first = zeron.hook("message.dispatch", function(ctx) return { action = "proceed" } end)
+zeron.hook("message.dispatch", function(ctx)
+	if ctx.text == "boom" then error("it broke") end
+	if ctx.text == "slow" then zeron.sleep(5):await() end
+	if ctx.text == "hold" then return { action = "wait", reason = "later" } end
+	return nil
+end)
+zeron.hook("message.dispatch", function(ctx) return { action = "reject", message = "third" } end)
+zeron.serve("drop_first", function() stop_first() return true end)
+zeron.serve("recheck", function(a) return zeron.hooks.recheck(a.hook):await() end)
+zeron.serve("undeclared", function() return zeron.hook("tool.approve", function() end) end)
+zeron.serve("unknown", function() return zeron.hook("message.modify", function() end) end)
+"#;
+
+fn decide_all(_: &Json) -> bool {
+    false
+}
+
+fn not_proceed(value: &Json) -> bool {
+    !value.is_null() && value["action"] != "proceed"
+}
+
+#[tokio::test]
+async fn a_hooked_service_starts_at_sync_and_stays_up() {
+    let r = rig(quick());
+    let plan = r.hooked(DECIDES, &["message.dispatch"]);
+    assert!(
+        r.services
+            .decide(&plan, "message.dispatch", json!({}), &decide_all)
+            .await
+            .is_empty(),
+        "never a cold start"
+    );
+    assert_eq!(r.starts(), 0);
+    r.services.sync(vec![plan.clone()]);
+    until("started at sync", || r.running()).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(r.running(), "no idle stop with hooks");
+    let running = lock(&r.services.slot("svc").state).running.clone().unwrap();
+    running.vm.stop();
+    until("restarted", || r.starts() == 2 && r.running()).await;
+}
+
+#[tokio::test]
+async fn hooks_answer_in_order_until_settled_and_failures_count_as_nothing() {
+    let r = rig(quick());
+    let plan = r.hooked(DECIDES, &["message.dispatch"]);
+    r.services.sync(vec![plan.clone()]);
+    until("started", || r.running()).await;
+    let decide = |text: &'static str| {
+        r.services.decide(
+            &plan,
+            "message.dispatch",
+            json!({ "text": text }),
+            &not_proceed,
+        )
+    };
+    let answers = decide("go").await;
+    assert_eq!(
+        answers,
+        [
+            Ok(json!({ "action": "proceed" })),
+            Ok(Json::Null),
+            Ok(json!({ "action": "reject", "message": "third" }))
+        ]
+    );
+    let held = decide("hold").await;
+    assert_eq!(held.len(), 2, "settled at the wait: {held:?}");
+    let broke = decide("boom").await;
+    assert!(
+        broke[1].as_ref().is_err_and(|why| why.contains("it broke")),
+        "{broke:?}"
+    );
+    assert_eq!(broke.len(), 3, "the next still answers");
+    let slow = decide("slow").await;
+    assert!(
+        slow[1]
+            .as_ref()
+            .is_err_and(|why| why.contains("within 2 s")),
+        "{slow:?}"
+    );
+    let log = r.services.status("svc")["log"].to_string();
+    assert!(
+        log.contains("went on as if it said nothing") && log.contains("it broke"),
+        "{log}"
+    );
+    r.ask(&plan, "drop_first", json!({})).await.unwrap();
+    assert_eq!(decide("hold").await.len(), 1, "a removed hook isn't asked");
+}
+
+#[tokio::test]
+async fn hook_names_and_rechecks_are_the_manifests() {
+    let r = rig(Config::default());
+    let plan = r.hooked(DECIDES, &["message.dispatch"]);
+    assert!(
+        r.ask(&plan, "undeclared", json!({}))
+            .await
+            .unwrap_err()
+            .message
+            .contains("isn't in the manifest's \"hooks\"")
+    );
+    assert!(
+        r.ask(&plan, "unknown", json!({}))
+            .await
+            .unwrap_err()
+            .message
+            .contains("no hook \"message.modify\"")
+    );
+    let refused = r
+        .ask(&plan, "recheck", json!({ "hook": "tool.approve" }))
+        .await
+        .unwrap_err();
+    assert!(
+        refused
+            .message
+            .contains("isn't in the manifest's \"hooks\""),
+        "{refused:?}"
+    );
+    assert_eq!(
+        r.ask(&plan, "recheck", json!({ "hook": "message.dispatch" }))
+            .await
+            .unwrap(),
+        json!(true)
+    );
+    assert_eq!(*lock(&r.hooks.rechecked), ["message.dispatch"]);
+}
+
+#[tokio::test]
+async fn a_setting_reads_what_the_person_set_or_its_default() {
+    let r = rig(Config::default());
+    let source = r#"
+local zeron = require("./zeron")("svc")
+zeron.serve("get", function(a) return zeron.setting(a.id) end)
+"#;
+    let mut plan = r.plan("1.0.0", source, &["service"]);
+    plan.settings = serde_json::from_value(json!({ "start": 23, "name": "x" })).unwrap();
+    let get = |id: &'static str| r.ask(&plan, "get", json!({ "id": id }));
+    assert_eq!(get("start").await.unwrap(), json!(23));
+    std::fs::create_dir_all(r.dir.path().join(".storage")).unwrap();
+    std::fs::write(
+        r.dir.path().join(".storage/svc.settings.json"),
+        r#"{ "start": 21, "name": 5 }"#,
+    )
+    .unwrap();
+    assert_eq!(get("start").await.unwrap(), json!(21));
+    assert_eq!(
+        get("name").await.unwrap(),
+        json!("x"),
+        "a value of another kind reads the default"
+    );
+    assert_eq!(get("none").await.unwrap(), Json::Null);
 }

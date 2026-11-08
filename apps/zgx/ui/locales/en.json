@@ -3174,6 +3174,14 @@
           "title": "Start new chats",
           "detail": "Its chats start supervised: your agents ask before commands and file changes. A chat can start with a message of its own."
         },
+        "hooks_dispatch": {
+          "title": "Hold or refuse messages before they reach your agents",
+          "detail": "Your messages and its own can wait in the queue or be refused, with a reason you see. If it fails or is slow, messages go as usual."
+        },
+        "hooks_approve": {
+          "title": "Answer your agents' approval requests for you",
+          "detail": "It can allow or refuse a command, a file change or a tool use that would ask you. If it doesn't answer, you're asked as usual."
+        },
         "panel_tabs": {
           "title": "Open tabs in your chats' panels"
         },
@@ -3273,6 +3281,7 @@
       "diff": {
         "commands": "Run more programs as you",
         "events": "Hear more of what your chats do",
+        "hooks": "Decide more of what your agents do",
         "mcp": "Run a different program beside your agents",
         "mcp_gone": "Stop running its program beside your agents",
         "tools_added": "New tools for your agents",

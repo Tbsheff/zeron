@@ -116,7 +116,7 @@ impl Rig {
     }
 
     async fn act(&self, action: &str, args: Json) -> Result<Json, String> {
-        self.actions().act(action, args).await
+        self.actions().act("a-plugin", action, args).await
     }
 
     fn said(&self, chat: &str, role: MessageRole) -> Vec<String> {

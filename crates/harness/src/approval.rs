@@ -2,10 +2,64 @@
 //! before what its [`AccessMode`] does not cover; every driver asks the same
 //! way — a yes/no question through [`crate::RunControls::request_input`] —
 //! so an approval reads alike whichever agent raised it.
+use std::collections::VecDeque;
+use std::sync::{Mutex, PoisonError};
+
+use serde_json::{Value, json};
 use zeron_proto::{AccessMode, UserInputAnswer, UserInputQuestion};
 
 pub const ALLOW: &str = "Yes";
 pub const DENY: &str = "No";
+const ASKED_KEPT: usize = 64;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Asked {
+    pub kind: &'static str,
+    pub name: String,
+    pub input: Value,
+}
+
+static ASKED: Mutex<VecDeque<(String, Asked)>> = Mutex::new(VecDeque::new());
+
+fn keep(question: UserInputQuestion, asked: Asked) -> UserInputQuestion {
+    let mut kept = ASKED.lock().unwrap_or_else(PoisonError::into_inner);
+    if kept.len() >= ASKED_KEPT {
+        kept.pop_front();
+    }
+    kept.push_back((question.id.clone(), asked));
+    question
+}
+
+pub fn asked(question: &UserInputQuestion) -> Option<Asked> {
+    let mut kept = ASKED.lock().unwrap_or_else(PoisonError::into_inner);
+    let at = kept.iter().position(|(id, _)| *id == question.id)?;
+    kept.remove(at).map(|(_, asked)| asked)
+}
+
+pub fn denial(reason: &str, question: &UserInputQuestion) -> Vec<UserInputAnswer> {
+    vec![UserInputAnswer {
+        question_id: question.id.clone(),
+        labels: vec![DENY.into(), reason.into()],
+    }]
+}
+
+pub fn approval(question: &UserInputQuestion) -> Vec<UserInputAnswer> {
+    vec![UserInputAnswer {
+        question_id: question.id.clone(),
+        labels: vec![ALLOW.into()],
+    }]
+}
+
+pub fn denied_because<'a>(
+    question: &UserInputQuestion,
+    answers: &'a [UserInputAnswer],
+) -> Option<&'a str> {
+    let answer = answers.iter().find(|a| a.question_id == question.id)?;
+    match answer.labels.as_slice() {
+        [no, reason] if no == DENY => Some(reason),
+        _ => None,
+    }
+}
 
 /// What an agent wants to do, for deciding whether its mode covers it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,38 +105,62 @@ pub fn approved(question: &UserInputQuestion, answers: &[UserInputAnswer]) -> bo
 /// "`agent` wants to run `command`. Allow it?"
 pub fn command(agent: &str, command: &str) -> UserInputQuestion {
     let command = command.trim();
-    question(
+    let asked = Asked {
+        kind: "command",
+        name: command
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned(),
+        input: json!({ "command": command }),
+    };
+    let question = question(
         "Approve command",
         if command.is_empty() {
             format!("{agent} wants to run a command. Allow it?")
         } else {
             format!("{agent} wants to run `{command}`. Allow it?")
         },
-    )
+    );
+    keep(question, asked)
 }
 
 /// "`agent` wants to modify a, b. Allow it?"
 pub fn edit(agent: &str, paths: &[&str]) -> UserInputQuestion {
-    question(
+    let asked = Asked {
+        kind: "edit",
+        name: "edit".into(),
+        input: json!({ "paths": paths }),
+    };
+    let question = question(
         "Approve file change",
         if paths.is_empty() {
             format!("{agent} wants to modify files. Allow it?")
         } else {
             format!("{agent} wants to modify {}. Allow it?", paths.join(", "))
         },
-    )
+    );
+    keep(question, asked)
 }
 
 /// "`agent` wants to use `tool`. Allow it?", with what it says it is for.
 pub fn tool(agent: &str, tool: &str, detail: Option<&str>) -> UserInputQuestion {
-    let detail = detail
+    let detail_said = detail
         .map(str::trim)
         .filter(|d| !d.is_empty())
         .map(|d| format!(" ({d})"))
         .unwrap_or_default();
-    question(
-        "Approve tool",
-        format!("{agent} wants to use {tool}{detail}. Allow it?"),
+    let asked = Asked {
+        kind: "tool",
+        name: tool.to_owned(),
+        input: json!({ "detail": detail.map(str::trim).unwrap_or_default() }),
+    };
+    keep(
+        question(
+            "Approve tool",
+            format!("{agent} wants to use {tool}{detail_said}. Allow it?"),
+        ),
+        asked,
     )
 }
 
@@ -113,5 +191,44 @@ mod tests {
         assert!(!approved(&q, &answer(&["No"])));
         assert!(!approved(&q, &answer(&["sure, go ahead"])));
         assert!(!approved(&q, &[]));
+    }
+
+    #[test]
+    fn an_approval_keeps_what_it_asks_until_read_once() {
+        let q = command("Codex", "git status --short");
+        assert_eq!(
+            asked(&q),
+            Some(Asked {
+                kind: "command",
+                name: "git".into(),
+                input: json!({ "command": "git status --short" })
+            })
+        );
+        assert_eq!(asked(&q), None, "read once");
+        let e = edit("Claude", &["a.rs"]);
+        assert_eq!(
+            asked(&e).map(|a| (a.kind, a.input)),
+            Some(("edit", json!({ "paths": ["a.rs"] })))
+        );
+        let t = tool("Claude", "WebFetch", Some("docs"));
+        assert_eq!(
+            asked(&t).map(|a| (a.kind, a.name)),
+            Some(("tool", "WebFetch".to_owned()))
+        );
+        assert_eq!(
+            asked(&question("Approve plan", "Go?")),
+            None,
+            "only commands, edits and tools"
+        );
+    }
+
+    #[test]
+    fn a_denial_carries_its_reason() {
+        let q = command("Claude", "rm -rf /");
+        let no = denial("denied by Safe commands", &q);
+        assert!(!approved(&q, &no));
+        assert_eq!(denied_because(&q, &no), Some("denied by Safe commands"));
+        assert!(approved(&q, &approval(&q)));
+        assert_eq!(denied_because(&q, &approval(&q)), None);
     }
 }

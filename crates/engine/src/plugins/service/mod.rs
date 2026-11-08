@@ -31,7 +31,7 @@ use futures::future::BoxFuture;
 use serde_json::{Value as Json, json};
 use zeron_plugin_guard::net;
 
-pub use vm::{DROPPED_EVENT, Described, Failure, Kind, Limits};
+pub use vm::{DROPPED_EVENT, Described, Failure, Kind, Limits, Settings};
 use vm::{Done, Ops, Spec, Vm};
 
 /// Why a call didn't get an answer from the service, as callers branch on.
@@ -108,6 +108,8 @@ pub struct Plan {
     /// The hosts its manifest names (`network.hosts`; none: any public).
     pub hosts: Vec<String>,
     pub events: Vec<String>,
+    pub hooks: Vec<String>,
+    pub settings: serde_json::Map<String, Json>,
 }
 
 impl Plan {
@@ -132,6 +134,7 @@ pub trait Hooks: Send + Sync + 'static {
         let refused = format!("zeron.{action} isn't available on this device");
         Box::pin(async move { Err(refused) })
     }
+    fn recheck(&self, _hook: &str) {}
     /// Whether `plan`'s snapshot is still what was allowed, checked before
     /// each load (a changed one is never run).
     fn verify(&self, _plan: &Plan) -> Result<(), String> {
@@ -168,6 +171,7 @@ pub const MAX_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MAX_EMIT_BYTES: usize = 64 * 1024;
 pub const MAX_QUEUED_EVENTS: usize = 256;
 pub const MAX_ACTS_PER_MINUTE: usize = 20;
+pub const HOOK_BUDGET: Duration = Duration::from_secs(2);
 pub type Acting = BoxFuture<'static, Result<Json, String>>;
 const ACT_WINDOW: Duration = Duration::from_secs(60);
 /// A service's log lines kept for `PluginStatus`.
@@ -377,6 +381,7 @@ impl Services {
             // flight): with none, it stops again at once.
             if let Ok(running) = loaded
                 && !swap
+                && running.plan.hooks.is_empty()
                 && running.described.timers.is_empty()
                 && !running.vm.status().busy()
                 && st.running.as_ref().is_some_and(|r| r.vm.same(&running.vm))
@@ -442,6 +447,15 @@ impl Services {
             device: hooks.device(),
             store: Some(Self::store_path(&self.inner.store_dir, &plan.plugin)),
             events: plan.events.clone(),
+            hooks: plan.hooks.clone(),
+            settings: Settings {
+                file: Some(
+                    self.inner
+                        .store_dir
+                        .join(format!("{}.settings.json", plan.plugin)),
+                ),
+                defaults: plan.settings.clone(),
+            },
             limits: self.inner.config.limits.clone(),
         };
         let (vm, loaded) = Vm::start(spec, ops);
@@ -547,7 +561,7 @@ impl Services {
             let safe = match kind {
                 Kind::Method => *running.described.methods.get(name).ok_or_else(unknown)?,
                 Kind::Tool if !running.described.tools.iter().any(|t| t == name) => return Err(unknown()),
-                Kind::Tool | Kind::Timer => false,
+                Kind::Tool | Kind::Timer | Kind::Hook => false,
             };
             let reply = running.vm.call(kind, name, args.clone(), call.clone());
             match tokio::time::timeout(timeout, reply).await {
@@ -662,6 +676,57 @@ impl Services {
         }
     }
 
+    pub async fn decide(
+        &self,
+        plan: &Plan,
+        hook: &str,
+        ctx: Json,
+        settled: &(dyn Fn(&Json) -> bool + Sync),
+    ) -> Vec<Result<Json, String>> {
+        let Some(running) = self.running(plan) else {
+            return Vec::new();
+        };
+        let mut answers = Vec::new();
+        for index in 0u32.. {
+            let reply = running.vm.call(Kind::Hook, hook, ctx.clone(), json!(index));
+            let answer = match tokio::time::timeout(HOOK_BUDGET, reply).await {
+                Ok(Ok(Ok(value))) => Ok(value),
+                Ok(Ok(Err(Failure::Unknown))) | Ok(Err(_)) => break,
+                Ok(Ok(Err(Failure::Error(why)))) => Err(why),
+                Err(_) => Err(format!(
+                    "it didn't answer within {} s",
+                    HOOK_BUDGET.as_secs()
+                )),
+            };
+            if let Err(why) = &answer {
+                self.note(&plan.plugin, &format!("zeron.hook(\"{hook}\") failed, so Zeron went on as if it said nothing: {why}"));
+            }
+            let done = answer.as_ref().is_ok_and(settled);
+            answers.push(answer);
+            if done {
+                break;
+            }
+        }
+        answers
+    }
+
+    fn running(&self, plan: &Plan) -> Option<Running> {
+        let slot = lock(&self.inner.slots).get(&plan.plugin).cloned()?;
+        let st = lock(&slot.state);
+        st.running
+            .as_ref()
+            .filter(|r| r.plan == *plan && !r.vm.status().ended())
+            .cloned()
+    }
+
+    pub fn note(&self, plugin: &str, line: &str) {
+        let slot = lock(&self.inner.slots)
+            .get(plugin)
+            .map(Arc::downgrade)
+            .unwrap_or_default();
+        note(&slot, plugin, line);
+    }
+
     /// The tools `plan`'s service answers (starting it if need be).
     pub async fn tools(&self, plan: &Plan) -> Result<Vec<String>, Refusal> {
         let slot = self.slot(&plan.plugin);
@@ -679,6 +744,27 @@ impl Services {
         }
         let (weak_slot, weak_shared) = (Arc::downgrade(slot), Arc::downgrade(&self.inner));
         st.supervisor = Some(runtime.spawn(supervisor(weak_slot, weak_shared)));
+    }
+
+    fn keep_hooks_up(&self, slot: &Arc<Slot>, plan: Option<&Plan>) {
+        let Some(plan) = plan.filter(|p| !p.hooks.is_empty()).cloned() else {
+            return;
+        };
+        let down = {
+            let st = lock(&slot.state);
+            st.running.is_none()
+                && !st.swapping
+                && st
+                    .failed
+                    .as_ref()
+                    .is_none_or(|(hash, _)| *hash != plan.hash)
+        };
+        if down {
+            let (services, slot) = (self.clone(), slot.clone());
+            tokio::spawn(async move {
+                let _ = services.ensure(&slot, &plan, false).await;
+            });
+        }
     }
 
     /// How `plugin`'s service stands (`PluginStatus`), or null without one.
@@ -754,7 +840,10 @@ async fn supervisor(slot: Weak<Slot>, shared: Weak<Shared>) {
                 let status = running.vm.status();
                 if status.ended() {
                     st.running = None;
-                } else if !status.busy() && status.idle_for() >= config.idle {
+                } else if running.plan.hooks.is_empty()
+                    && !status.busy()
+                    && status.idle_for() >= config.idle
+                {
                     running.vm.stop();
                     st.running = None;
                     slot.note("stopped (idle)".into());
@@ -770,6 +859,7 @@ async fn supervisor(slot: Weak<Slot>, shared: Weak<Shared>) {
             let next = st.timers.iter().map(|t| t.due).min();
             (fire, st.plan.clone(), next)
         };
+        services.keep_hooks_up(&slot, plan.as_ref());
         if let Some(plan) = plan {
             for key in fire {
                 let (services, plan, slot) = (services.clone(), plan.clone(), slot.clone());
@@ -851,6 +941,7 @@ impl Ops for PluginOps {
                 });
             }
             "chats.send" | "chats.create" | "chats.stop" | "files.read" => self.act(kind, args, done),
+            "hooks.recheck" => done(self.recheck(&args)),
             other => done(Err(format!("zeron.{other} isn't something a service can do"))),
         }
     }
@@ -955,6 +1046,18 @@ impl PluginOps {
             }
             done(outcome)
         });
+    }
+
+    fn recheck(&self, args: &Json) -> Result<Json, String> {
+        let hook = args["hook"].as_str().unwrap_or_default();
+        if !self.plan.hooks.iter().any(|h| h == hook) {
+            return Err(format!(
+                "zeron.hooks.recheck: \"{hook}\" isn't in the manifest's \"hooks\""
+            ));
+        }
+        let _runtime = self.runtime.enter();
+        self.hooks.recheck(hook);
+        Ok(Json::Bool(true))
     }
 
     fn policy(&self) -> net::Policy {

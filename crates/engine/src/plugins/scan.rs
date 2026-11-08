@@ -165,6 +165,8 @@ pub struct PluginItem {
     pub service: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<String>,
     pub mcp: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -292,6 +294,7 @@ pub fn entry(inspected: Inspected, author: Author, state: &State) -> Entry {
         network_hosts: manifest.map(|m| m.network_hosts.clone()).unwrap_or_default(),
         service: manifest.and_then(|m| m.service.clone()),
         events: manifest.map(|m| m.events.clone()).unwrap_or_default(),
+        hooks: manifest.map(|m| m.hooks.clone()).unwrap_or_default(),
         mcp: manifest.is_some_and(|m| m.mcp.is_some()),
         error: inspected.error.clone(),
         builtin: false,

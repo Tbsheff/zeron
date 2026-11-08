@@ -2101,7 +2101,9 @@ fn handle_control_request(
             let response = if approval::approved(&question, &answers) {
                 allow(body.input)
             } else {
-                deny_response(APPROVAL_DENIED)
+                deny_response(
+                    approval::denied_because(&question, &answers).unwrap_or(APPROVAL_DENIED),
+                )
             };
             let line = control_response_line(&req.request_id, response);
             let _ = stdin_tx.send(StdinMsg::Line(line));
