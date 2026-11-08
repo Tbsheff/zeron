@@ -351,6 +351,11 @@ end\n\
 Zeron runs the script before showing it (setup, render, every draw, and each tab, toggle, slider, and \
 button once) and returns the first error with its line; fix it and call again.\n\
 \n\
+Use ui.answer for choices, forms, and plan approvals: in a handler, ui.answer(choice, { label = \
+\"Pick\" }) puts \"Pick: <choice>\" on its own line in the reader's draft. Nothing sends until they \
+send it. Prefer a label. The check's presses fill no draft; the result's answers lists what each \
+would add.\n\
+\n\
 Nodes are props tables: children are the array part, strings are plain text, nil and false children \
 are skipped, and lists of nodes flatten (so ui.map results can be children). Unknown props are errors.\n\
 - ui.column { gap = 8, align = \"start|center|end\", ... }, ui.row { gap = 12, align, justify = \
@@ -374,7 +379,8 @@ hover readout are built in.\n\
 opens like a chat link.\n\
 - Controls: ui.tabs { options = { ... }, value, on_change = function(option) end }, ui.toggle { label, \
 value = bool, on_change = function(on) end }, ui.slider { label, value, min, max, step, unit, on_change \
-= function(n) end }, ui.button { label, on_click = function() end, primary = bool }.\n\
+= function(n) end }, ui.button { label, on_click = function() end, primary = bool }. Any handler \
+may call ui.answer.\n\
 - ui.canvas { height = 240, draw = function(g, w, h, t) ... end, animate = bool, on_click = \
 function(x, y) end }: 2D drawing in pixels, origin top-left, w = the reply column's width. \
 g:line(x1, y1, x2, y2, { color, width, dash }), g:polyline(pts, { color, width }), g:polygon(pts, \

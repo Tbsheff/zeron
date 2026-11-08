@@ -5315,6 +5315,7 @@ impl RpcService for EngineRpc {
                     "title": title,
                     "checkedInteractions": report.interactions,
                     "printed": report.logs,
+                    "answers": report.answers,
                 }))
             }
             methods::PUBLISH_IMAGE => {
