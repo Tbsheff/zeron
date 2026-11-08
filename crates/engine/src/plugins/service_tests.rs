@@ -298,3 +298,154 @@ async fn the_checkout_status_example_answers_from_git() {
     assert_eq!(refused["reason"], reason::FAILED, "{refused}");
     assert!(refused["message"].as_str().unwrap().starts_with("git:"), "{refused}");
 }
+
+async fn until(what: &str, check: impl Fn() -> bool) {
+    for _ in 0..200 {
+        if check() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("never: {what}");
+}
+
+fn done(status: zeron_proto::DoneStatus, error: Option<&str>) -> AgentEvent {
+    AgentEvent::Done {
+        status,
+        result: None,
+        error: error.map(str::to_owned),
+        session_id: None,
+    }
+}
+
+#[tokio::test]
+async fn the_turn_notify_example_says_when_a_turn_ends() {
+    let f = fixture();
+    type Posted = Vec<(String, Option<String>)>;
+    let posted: Arc<Mutex<Posted>> = Arc::default();
+    let seen = posted.clone();
+    f.plugins.set_notifier(move |_, title, _, session| {
+        lock(&seen).push((title.to_owned(), session.map(str::to_owned)));
+        "posted".into()
+    });
+    let example =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/zgx/plugins-dev/turn-notify");
+    let dir = f.plugins.plugins_dir().join("turn-notify");
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in [
+        "zeron-plugin.json",
+        "init.luau",
+        "service.luau",
+        "zeron.luau",
+    ] {
+        std::fs::copy(example.join(file), dir.join(file)).unwrap();
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.join("zeron.luau")).unwrap(),
+        scaffold::SDK,
+        "its zeron.luau is the SDK's"
+    );
+    let signed = call(
+        &f.plugins,
+        methods::SIGN_PLUGIN,
+        json!({ "id": "turn-notify" }),
+    )
+    .await;
+    let decided = call(
+        &f.plugins,
+        methods::DECIDE_PLUGIN,
+        json!({ "id": "turn-notify", "allow": true, "hash": signed["hash"] }),
+    )
+    .await;
+    assert_eq!(decided["status"], "on", "{decided}");
+    until("listening", || {
+        f.plugins.inner.listening.load(Ordering::SeqCst)
+    })
+    .await;
+
+    f.plugins
+        .hear_agent("c1", &done(zeron_proto::DoneStatus::Completed, None));
+    f.plugins
+        .hear_agent("c1", &done(zeron_proto::DoneStatus::Interrupted, None));
+    f.plugins
+        .hear_agent("c2", &done(zeron_proto::DoneStatus::Errored, Some("boom")));
+    until("two notifications", || lock(&posted).len() == 2).await;
+    assert_eq!(
+        lock(&posted).clone(),
+        vec![
+            (
+                "Turn notify: A chat finished".to_string(),
+                Some("c1".to_string())
+            ),
+            (
+                "Turn notify: A chat failed".to_string(),
+                Some("c2".to_string())
+            ),
+        ]
+    );
+}
+
+const RECORDS: &str = r#"
+local zeron = require("./zeron")("svc")
+local last = zeron.store("last", false)
+zeron.on("turn.done", function(e) last:set(e) end)
+zeron.serve("last", function() return last:get() end)
+"#;
+
+#[tokio::test]
+async fn what_was_said_reaches_a_service_only_with_messages_read() {
+    let f = fixture();
+    let events = |extra: &[&str]| {
+        let mut permissions = vec!["service", "sessions.read"];
+        permissions.extend_from_slice(extra);
+        json!({ "permissions": permissions, "service": "service.luau", "events": ["turn.done"] })
+    };
+    write(&f.plugins, "1.0.0", events(&[]), Some(RECORDS)).await;
+    allow(&f.plugins).await;
+    until("listening", || {
+        f.plugins.inner.listening.load(Ordering::SeqCst)
+    })
+    .await;
+    f.plugins.hear_agent(
+        "c1",
+        &done(zeron_proto::DoneStatus::Errored, Some("the secret plan")),
+    );
+    let mut tries = 0;
+    let last = loop {
+        tries += 1;
+        assert!(tries < 200, "never heard");
+        let last = ask(&f.plugins, "last", json!({})).await;
+        if last["value"].is_object() {
+            break last["value"].clone();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(last, json!({ "session": "c1", "status": "errored" }));
+
+    write(
+        &f.plugins,
+        "1.0.1",
+        events(&["messages.read"]),
+        Some(RECORDS),
+    )
+    .await;
+    allow(&f.plugins).await;
+    let mut tries = 0;
+    let said = loop {
+        tries += 1;
+        assert!(tries < 200, "never heard");
+        f.plugins.hear_agent(
+            "c2",
+            &done(zeron_proto::DoneStatus::Errored, Some("the secret plan")),
+        );
+        let last = ask(&f.plugins, "last", json!({})).await;
+        if last["value"]["session"] == "c2" {
+            break last["value"].clone();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        said,
+        json!({ "session": "c2", "status": "errored", "error": "the secret plan" })
+    );
+}

@@ -258,9 +258,13 @@ function M.permission(item: any, permission: string): Line
 	elseif permission == "profile.read" then
 		return line(false, "user-rounded", "plugins.words.permission.profile_read.title")
 	elseif permission == "sessions.read" then
-		return line(false, "list", "plugins.words.permission.sessions_read.title")
+		local events = if type(item.events) == "table" and #item.events > 0 then item.events else nil
+		return line(false, "list", "plugins.words.permission.sessions_read.title", if events then "plugins.words.permission.sessions_read.hears" else nil, if events then function()
+			return { events = table.concat(events, ", ") }
+		end else nil)
 	elseif permission == "messages.read" then
-		return line(false, "chat-round-line", "plugins.words.permission.messages_read.title")
+		local hears = type(item.events) == "table" and #item.events > 0
+		return line(false, "chat-round-line", "plugins.words.permission.messages_read.title", if hears then "plugins.words.permission.messages_read.hears" else nil)
 	elseif permission == "account.email" then
 		return line(false, "eye", "plugins.words.permission.account_email.title")
 	elseif permission == "files.read" then
@@ -424,6 +428,9 @@ function M.diff(item: any): { Line }
 	if type(d.entry_changed) == "table" then
 		local after = d.entry_changed.after
 		table.insert(out, line(false, "document", "plugins.words.diff.entry", nil, nil, { literal = if type(after) == "string" then { after } else nil }))
+	end
+	if some(d.events_added) then
+		table.insert(out, line(false, "list", "plugins.words.diff.events", nil, nil, { literal = literal(d.events_added) }))
 	end
 	if some(d.network_added) then
 		local listed = hosts_said(d.network_added, d.network_local)

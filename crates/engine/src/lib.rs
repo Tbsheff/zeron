@@ -437,6 +437,7 @@ impl EngineCore {
         }));
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
         plugins.start();
+        plugins.hear_sessions(&sessions, &workspace);
         Ok(Self {
             sessions,
             doc_host,

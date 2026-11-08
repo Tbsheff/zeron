@@ -26,7 +26,10 @@ use mlua::{Function, Lua, LuaOptions, StdLib, Table, Value, VmState};
 use serde_json::Value as Json;
 use tokio::sync::oneshot;
 
+use crate::plugins::manifest::KNOWN_EVENTS;
+
 const PRELUDE: &str = include_str!("prelude.luau");
+pub const DROPPED_EVENT: &str = "events.dropped";
 /// A source file, at most.
 const MAX_SCRIPT_BYTES: usize = 1 << 20;
 /// What `zeron.store` keeps, at most (its JSON).
@@ -67,6 +70,7 @@ pub struct Spec {
     pub device: Json,
     /// `zeron.store`'s file (`None`: kept in memory only).
     pub store: Option<PathBuf>,
+    pub events: Vec<String>,
     pub limits: Limits,
 }
 
@@ -209,6 +213,11 @@ enum ToVm {
         watch: u64,
         seen: Seen,
     },
+    Event {
+        name: String,
+        data: Json,
+        told: oneshot::Sender<()>,
+    },
     Stop,
 }
 
@@ -264,6 +273,17 @@ impl Vm {
         if sent.is_err() {
             self.status.in_flight.fetch_sub(1, Ordering::SeqCst);
         }
+        rx
+    }
+
+    pub fn event(&self, name: &str, data: Json) -> oneshot::Receiver<()> {
+        let (told, rx) = oneshot::channel();
+        self.status.touch();
+        let _ = self.tx.send(ToVm::Event {
+            name: name.to_owned(),
+            data,
+            told,
+        });
         rx
     }
 
@@ -491,6 +511,10 @@ fn run(
                 }
             }
             Some(ToVm::Heard { watch, seen }) => state.heard(watch, seen),
+            Some(ToVm::Event { name, data, told }) => {
+                tell_listeners(&lua, &entry, &*ops, &state, &enter, &name, &data);
+                let _ = told.send(());
+            }
             Some(ToVm::Stop) => {
                 stopping.get_or_insert(Instant::now() + limits.drain);
                 // (Nothing more is heard: it's going.)
@@ -538,6 +562,31 @@ fn run(
     status.pending.store(0, Ordering::SeqCst);
 }
 
+type Enter<'a> = dyn Fn(&dyn Fn() -> mlua::Result<()>) -> mlua::Result<()> + 'a;
+
+fn tell_listeners(lua: &Lua, entry: &Entry, ops: &dyn Ops, state: &State, enter: &Enter, name: &str, data: &Json) {
+    let failed = |error: &mlua::Error| ops.log(&format!("zeron.on(\"{name}\") failed: {}", lua_message(error)));
+    let listeners: RefCell<Vec<Function>> = RefCell::default();
+    let listed = enter(&|| {
+        *listeners.borrow_mut() = entry.listening.call::<Vec<Function>>(name)?;
+        Ok(())
+    });
+    if let Err(error) = listed {
+        failed(&error);
+    }
+    for listener in listeners.take() {
+        let outcome = enter(&|| {
+            let data = to_lua(lua, data, 0)?;
+            entry.fire.call::<()>((name, listener.clone(), data))
+        });
+        if let Err(error) = outcome
+            && !state.dead.get()
+        {
+            failed(&error);
+        }
+    }
+}
+
 /// The prelude's entry points.
 struct Entry {
     dispatch: Function,
@@ -545,6 +594,8 @@ struct Entry {
     done: Function,
     stopping: Function,
     heard: Function,
+    listening: Function,
+    fire: Function,
 }
 
 fn setup(
@@ -600,8 +651,16 @@ fn setup(
     install_require(&lua, &spec.dir).map_err(fail)?;
 
     let host = natives(&lua, spec, ops, tx, state).map_err(fail)?;
-    let (service, dispatch, describe, done, stopping, heard): (Function, Function, Function, Function, Function, Function) =
-        lua.load(PRELUDE).set_name("=zeron").set_mode(ChunkMode::Text).call(host).map_err(fail)?;
+    let (service, dispatch, describe, done, stopping, heard, listening, fire): (
+        Function,
+        Function,
+        Function,
+        Function,
+        Function,
+        Function,
+        Function,
+        Function,
+    ) = lua.load(PRELUDE).set_name("=zeron").set_mode(ChunkMode::Text).call(host).map_err(fail)?;
     globals.raw_set("zeron_service", service).map_err(fail)?;
     lua.sandbox(true).map_err(fail)?;
     Ok((
@@ -612,6 +671,8 @@ fn setup(
             done,
             stopping,
             heard,
+            listening,
+            fire,
         },
     ))
 }
@@ -626,6 +687,12 @@ fn natives(
     let host = lua.create_table()?;
     host.set("plugin", spec.plugin.as_str())?;
     host.set("device", to_lua(lua, &spec.device, 0)?)?;
+    let events = lua.create_table()?;
+    for name in KNOWN_EVENTS {
+        events.raw_set(*name, spec.events.iter().any(|e| e == name))?;
+    }
+    events.raw_set(DROPPED_EVENT, !spec.events.is_empty())?;
+    host.set("events", events)?;
 
     let json = lua.create_table()?;
     json.set(

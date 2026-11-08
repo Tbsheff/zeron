@@ -16,6 +16,7 @@
 
 pub mod broker;
 pub mod capability;
+pub mod events;
 pub mod files;
 pub mod guides;
 pub mod install;
@@ -54,6 +55,7 @@ use signing::{SigCheck, SigningKey};
 use snapshot::Retention;
 use service::{Plan, Refusal, Services, reason};
 use status::{Author, State, Status};
+use zeron_proto::AgentEvent;
 
 pub const PLUGINS_DIR: &str = "plugins";
 pub const TEMPLATES_DIR: &str = "templates";
@@ -244,6 +246,8 @@ struct Inner {
     /// When this device's own key was last looked up on a peer's word
     /// (`CheckPluginKey`): at most every few seconds.
     own_key_checked: Mutex<Option<Instant>>,
+    heard: Mutex<events::Heard>,
+    listening: AtomicBool,
 }
 
 type StepUpFn = Arc<dyn Fn() -> Option<String> + Send + Sync>;
@@ -503,6 +507,8 @@ impl Plugins {
                 new_keys: Mutex::new(Vec::new()),
                 key_notices: Mutex::new(Vec::new()),
                 own_key_checked: Mutex::new(None),
+                heard: Mutex::new(events::Heard::new(device_id)),
+                listening: AtomicBool::new(false),
             }),
         };
         plugins.inner.services.set_hooks(Arc::new(ServiceHooks {
@@ -2538,6 +2544,7 @@ fn service_plan(entry: &Entry) -> Option<Plan> {
         allowed: item.allowed.clone(),
         commands: item.commands.clone(),
         hosts: item.network_hosts.clone(),
+        events: item.events.clone(),
     })
 }
 
@@ -2599,7 +2606,79 @@ impl Plugins {
     /// Run what should run, after a scan.
     fn sync_services(&self) {
         let plans: Vec<Plan> = lock(&self.inner.entries).iter().filter_map(service_plan).collect();
+        let listening = plans.iter().any(|p| !p.events.is_empty() && p.allows("sessions.read"));
+        self.inner.listening.store(listening, Ordering::SeqCst);
         self.inner.services.sync(plans);
+    }
+
+    pub fn hear_agent(&self, chat: &str, event: &AgentEvent) {
+        if !self.inner.listening.load(Ordering::SeqCst) {
+            return;
+        }
+        let told = lock(&self.inner.heard).agent(chat, event);
+        if let Some((event, data)) = told {
+            self.tell(event, &data);
+        }
+    }
+
+    pub fn hear_prompt(&self, chat: &str, text: &str) {
+        if !self.inner.listening.load(Ordering::SeqCst) {
+            return;
+        }
+        let (event, data) = lock(&self.inner.heard).prompt(chat, text);
+        self.tell(event, &data);
+    }
+
+    pub fn hear_sessions(&self, sessions: &crate::SessionsEngine, workspace: &crate::WorkspaceHost) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut statuses = sessions.watch_sessions();
+        let mut chats = workspace.watch_chats();
+        let weak = Arc::downgrade(&self.inner);
+        let task = runtime.spawn(async move {
+            {
+                let Some(inner) = weak.upgrade() else { return };
+                let mut heard = lock(&inner.heard);
+                heard.chats(&chats.borrow_and_update());
+                heard.sessions(&statuses.borrow_and_update());
+            }
+            loop {
+                let chats_changed = tokio::select! {
+                    changed = statuses.changed() => { if changed.is_err() { return } false }
+                    changed = chats.changed() => { if changed.is_err() { return } true }
+                };
+                let Some(inner) = weak.upgrade() else { return };
+                let told = {
+                    let mut heard = lock(&inner.heard);
+                    if chats_changed {
+                        heard.chats(&chats.borrow_and_update())
+                    } else {
+                        heard.sessions(&statuses.borrow_and_update())
+                    }
+                };
+                let plugins = Plugins { inner };
+                if plugins.inner.listening.load(Ordering::SeqCst) {
+                    for (event, data) in told {
+                        plugins.tell(event, &data);
+                    }
+                }
+            }
+        });
+        lock(&self.inner.tasks).push(task);
+    }
+
+    fn tell(&self, event: &str, data: &serde_json::Value) {
+        let plans: Vec<Plan> = lock(&self.inner.entries)
+            .iter()
+            .filter(|e| e.item.events.iter().any(|name| name == event))
+            .filter_map(service_plan)
+            .filter(|p| p.allows("sessions.read"))
+            .collect();
+        for plan in plans {
+            let data = if plan.allows("messages.read") { data.clone() } else { events::redact(data) };
+            self.inner.services.deliver(&plan, event, data);
+        }
     }
 
     /// `zeron.emit`: to this device's windows, and to the devices watching.

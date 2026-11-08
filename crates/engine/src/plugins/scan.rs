@@ -163,6 +163,8 @@ pub struct PluginItem {
     /// (plugins/service) while it's on and allowed `service`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<String>,
     pub mcp: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -289,6 +291,7 @@ pub fn entry(inspected: Inspected, author: Author, state: &State) -> Entry {
         commands: manifest.map(|m| m.commands.clone()).unwrap_or_default(),
         network_hosts: manifest.map(|m| m.network_hosts.clone()).unwrap_or_default(),
         service: manifest.and_then(|m| m.service.clone()),
+        events: manifest.map(|m| m.events.clone()).unwrap_or_default(),
         mcp: manifest.is_some_and(|m| m.mcp.is_some()),
         error: inspected.error.clone(),
         builtin: false,

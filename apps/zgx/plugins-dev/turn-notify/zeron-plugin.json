@@ -1,0 +1,10 @@
+{
+  "id": "turn-notify",
+  "name": "Turn notify",
+  "version": "1.0.0",
+  "description": "A notification when a chat on this device finishes or fails, with no window open.",
+  "entry": "init.luau",
+  "service": "service.luau",
+  "permissions": ["service", "sessions.read", "notifications"],
+  "events": ["turn.done"]
+}

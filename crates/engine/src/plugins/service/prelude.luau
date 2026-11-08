@@ -112,6 +112,7 @@ local timers: { { seconds: number, fn: (any) -> () } } = {}
 local stops: { () -> () } = {}
 -- `zeron.watch`es, by id: each one's folders and listener.
 local watches: { [number]: { folders: { string }, fn: (any) -> () } } = {}
+local listeners: { [string]: { { fn: (any) -> () } } } = {}
 
 local function dispatch(kind: string, name: string, args: any, call: any, reply: number)
 	local fn
@@ -170,6 +171,22 @@ local function heard(id: number, changed: { [number]: any })
 		end
 	end
 	task(w.fn, nil, by_folder)
+end
+
+local function listening(name: string): { (any) -> () }
+	local fns = {}
+	for _, l in listeners[name] or {} do
+		table.insert(fns, l.fn)
+	end
+	return fns
+end
+
+local function fire(name: string, fn: (any) -> (), data: any)
+	task(fn, function(ok: boolean, why: any)
+		if not ok then
+			report(`zeron.on("{name}") failed`, why)
+		end
+	end, data)
 end
 
 local function stopping()
@@ -255,6 +272,26 @@ local function service(id: string): any
 		host.emit(event, data)
 	end
 
+	function M.on(name: string, fn: (any) -> ()): () -> ()
+		assert(type(name) == "string" and type(fn) == "function", "zeron.on(event, fn)")
+		local declared = host.events[name]
+		if declared == nil then
+			error(`zeron.on: Zeron has no event "{name}"`, 2)
+		elseif not declared then
+			error(`zeron.on: "{name}" isn't in the manifest's "events"`, 2)
+		end
+		local entry = { fn = fn }
+		local list = listeners[name] or {}
+		listeners[name] = list
+		table.insert(list, entry)
+		return function()
+			local at = table.find(list, entry)
+			if at then
+				table.remove(list, at)
+			end
+		end
+	end
+
 	-- This device's chats' and projects' folders, whole paths ("sessions.read"):
 	-- a promise of a list. Where a service's work on them belongs.
 	function M.folders(): any
@@ -308,4 +345,4 @@ local function service(id: string): any
 	return M
 end
 
-return service, dispatch, describe, done, stopping, heard
+return service, dispatch, describe, done, stopping, heard, listening, fire

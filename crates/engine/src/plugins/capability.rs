@@ -79,7 +79,7 @@ pub fn record(manifest: &Manifest) -> Value {
         .cloned()
         .collect();
     settings.sort_by_key(|s| signing::canonical_json(s));
-    json!({
+    let mut record = json!({
         "v": VERSION,
         "permissions": sorted_unique(&manifest.permissions),
         "commands": sorted_unique(&manifest.commands),
@@ -93,7 +93,11 @@ pub fn record(manifest: &Manifest) -> Value {
         "entry": manifest.entry,
         "network": hosts,
         "settings": settings,
-    })
+    });
+    if !manifest.events.is_empty() {
+        record["events"] = json!(sorted_unique(&manifest.events));
+    }
+    record
 }
 
 /// The empty record: nothing granted (what a plugin that can't be read has).
@@ -191,6 +195,7 @@ pub struct Diff {
     pub service_changed: Option<Before<Value>>,
     pub entry_changed: Option<Before<Value>>,
     pub network_added: Vec<String>,
+    pub events_added: Vec<String>,
     pub settings_changed: bool,
 }
 
@@ -209,6 +214,7 @@ impl Diff {
             || !self.tools_changed.is_empty()
             || self.service_changed.as_ref().is_some_and(|c| c.before.is_null() && !c.after.is_null())
             || !self.network_added.is_empty()
+            || !self.events_added.is_empty()
             || self.settings_changed
     }
 
@@ -273,6 +279,7 @@ pub fn diff(before: &Value, after: &Value) -> Diff {
                 .filter(|h| !any || h == ANY_HOST || zeron_plugin_guard::net::risky(h))
                 .collect()
         },
+        events_added: added(&before["events"], &after["events"]),
         settings_changed,
     }
 }
@@ -372,6 +379,23 @@ mod tests {
         let before = record(&manifest(json!({})));
         let after = record(&manifest(json!({ "permissions": ["service"], "service": "service.luau" })));
         assert!(diff(&before, &after).grew());
+    }
+
+    #[test]
+    fn plugins_capability_an_event_heard_grows_and_none_keeps_the_digest() {
+        let service =
+            json!({ "permissions": ["service", "sessions.read"], "service": "service.luau" });
+        let none = record(&manifest(service.clone()));
+        assert!(none.get("events").is_none());
+        let mut one = service.clone();
+        one["events"] = json!(["turn.done"]);
+        let one = record(&manifest(one));
+        let mut two = service;
+        two["events"] = json!(["tool.call", "turn.done"]);
+        let two = record(&manifest(two));
+        assert!(diff(&none, &one).grew() && diff(&none, &one).events_added == ["turn.done"]);
+        assert!(diff(&one, &two).grew() && diff(&one, &two).events_added == ["tool.call"]);
+        assert!(!diff(&two, &one).grew(), "an event dropped doesn't ask");
     }
 
     #[test]

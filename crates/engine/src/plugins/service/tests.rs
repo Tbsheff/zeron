@@ -61,6 +61,7 @@ impl Rig {
             allowed: allowed.iter().map(|s| s.to_string()).collect(),
             commands: vec!["echo".into()],
             hosts: Vec::new(),
+            events: Vec::new(),
         }
     }
 
@@ -496,4 +497,53 @@ async fn fetch_never_reaches_this_device_or_metadata_unless_named() {
     let open = r.plan("1.0.0", FETCHER, &["service", "network"]);
     let auth = r.ask(&open, "get", json!({ "url": "https://example.invalid/", "headers": { "Authorization": "Bearer x" } })).await;
     assert!(auth.unwrap_err().message.contains("Authorization"));
+}
+
+const LISTENS: &str = r#"
+local zeron = require("./zeron")("svc")
+local heard = zeron.store("heard", {})
+zeron.on("turn.done", function(e)
+	local list = heard:get()
+	table.insert(list, e.session)
+	heard:set(list)
+end)
+zeron.on("events.dropped", function(e)
+	local list = heard:get()
+	table.insert(list, "dropped " .. e.count)
+	heard:set(list)
+end)
+zeron.serve("heard", function() return heard:get() end)
+"#;
+
+#[tokio::test]
+async fn an_event_starts_the_service_and_a_full_queue_says_how_many_it_dropped() {
+    let r = rig(quick());
+    let mut plan = r.plan("1.0.0", LISTENS, &["service", "sessions.read"]);
+    plan.events = vec!["turn.done".into()];
+    let extra = 10;
+    for n in 0..MAX_QUEUED_EVENTS + extra {
+        r.services
+            .deliver(&plan, "turn.done", json!({ "session": n.to_string() }));
+    }
+    let want = MAX_QUEUED_EVENTS + 1;
+    let mut tries = 0;
+    let heard = loop {
+        tries += 1;
+        assert!(tries < 200, "never heard");
+        let heard = r.ask(&plan, "heard", json!({})).await.unwrap();
+        if heard.as_array().is_some_and(|h| h.len() >= want) {
+            break heard;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let heard = heard.as_array().unwrap();
+    assert_eq!(heard.len(), want);
+    assert_eq!(heard[0], json!(format!("dropped {extra}")));
+    assert_eq!(heard[1], json!(extra.to_string()), "the oldest went");
+    assert_eq!(
+        heard[want - 1],
+        json!((MAX_QUEUED_EVENTS + extra - 1).to_string()),
+        "in order"
+    );
+    assert_eq!(r.starts(), 1);
 }

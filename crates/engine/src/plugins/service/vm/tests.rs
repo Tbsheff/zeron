@@ -47,6 +47,7 @@ fn spec(dir: &Path, limits: Limits) -> Spec {
         entry: "service.luau".into(),
         device: json!({ "id": "dev-1", "name": "Laptop" }),
         store: Some(dir.join(".store.json")),
+        events: vec!["turn.done".into(), "tool.call".into()],
         limits,
     }
 }
@@ -294,4 +295,123 @@ fn json_round_trips_through_luau() {
         };
         assert_eq!(back, expected);
     }
+}
+
+const LISTENER: &str = r#"
+local zeron = require("./zeron")("svc")
+local heard = {}
+
+zeron.on("turn.done", function(e)
+	if e.session == "spin" then
+		while true do end
+	end
+	table.insert(heard, "first:" .. e.session)
+end)
+zeron.on("turn.done", function(e)
+	if e.session == "boom" then
+		error("it broke", 0)
+	end
+	table.insert(heard, "second:" .. e.session)
+end)
+local stop = zeron.on("tool.call", function(e)
+	table.insert(heard, "tool:" .. e.name)
+end)
+
+zeron.serve("heard", function() return heard end)
+zeron.serve("stop", function() stop() end)
+zeron.serve("try", function(args)
+	local ok, why = pcall(zeron.on, args.name, function() end)
+	return { ok = ok, why = tostring(why) }
+end)
+"#;
+
+async fn tell(vm: &Vm, name: &str, data: Json) {
+    tokio::time::timeout(Duration::from_secs(10), vm.event(name, data))
+        .await
+        .expect("told in time")
+        .expect("told before it ended");
+}
+
+#[tokio::test]
+async fn zeron_on_hears_only_known_events_its_manifest_lists() {
+    let dir = folder(&[("service.luau", LISTENER)]);
+    let (vm, described, _) = start(dir.path(), Limits::default()).await;
+    described.unwrap();
+    for (name, ok, why) in [
+        ("turn.done", true, ""),
+        ("events.dropped", true, ""),
+        (
+            "turn.finished",
+            false,
+            "Zeron has no event \"turn.finished\"",
+        ),
+        (
+            "message.user",
+            false,
+            "\"message.user\" isn't in the manifest's \"events\"",
+        ),
+    ] {
+        let tried = ask(&vm, "try", json!({ "name": name }))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tried["ok"], ok, "{name}: {tried}");
+        assert!(
+            tried["why"].as_str().unwrap().contains(why),
+            "{name}: {tried}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn each_listener_gets_its_own_budget_and_a_failure_stops_nothing() {
+    let dir = folder(&[("service.luau", LISTENER)]);
+    let limits = Limits {
+        slice: Duration::from_millis(100),
+        ..Limits::default()
+    };
+    let (vm, described, ops) = start(dir.path(), limits).await;
+    described.unwrap();
+    tell(&vm, "turn.done", json!({ "session": "spin" })).await;
+    tell(&vm, "turn.done", json!({ "session": "boom" })).await;
+    tell(&vm, "tool.call", json!({ "session": "a", "name": "exec" })).await;
+    tell(&vm, "turn.done", json!({ "session": "ok" })).await;
+    let heard = ask(&vm, "heard", json!({})).await.unwrap().unwrap();
+    assert_eq!(
+        heard,
+        json!([
+            "second:spin",
+            "first:boom",
+            "tool:exec",
+            "first:ok",
+            "second:ok"
+        ])
+    );
+    let logged = ops.logged.lock().unwrap().clone();
+    assert!(
+        logged
+            .iter()
+            .any(|l| l.contains("zeron.on(\"turn.done\") failed") && l.contains("time budget")),
+        "{logged:?}"
+    );
+    assert!(
+        logged
+            .iter()
+            .any(|l| l.contains("zeron.on(\"turn.done\") failed") && l.contains("it broke")),
+        "{logged:?}"
+    );
+
+    ask(&vm, "stop", json!({})).await.unwrap().unwrap();
+    tell(
+        &vm,
+        "tool.call",
+        json!({ "session": "a", "name": "readFile" }),
+    )
+    .await;
+    let heard = ask(&vm, "heard", json!({})).await.unwrap().unwrap();
+    assert_eq!(
+        heard.as_array().unwrap().len(),
+        5,
+        "stopped listening: {heard}"
+    );
 }

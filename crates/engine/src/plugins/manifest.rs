@@ -44,6 +44,20 @@ pub const KNOWN_PERMISSIONS: &[&str] = &[
     "service",
 ];
 
+pub const KNOWN_EVENTS: &[&str] = &[
+    "session.created",
+    "session.status",
+    "turn.started",
+    "turn.done",
+    "tool.call",
+    "tool.result",
+    "message.user",
+    "message.assistant",
+    "input.requested",
+    "input.resolved",
+    "agent.error",
+];
+
 /// Ids the app keeps for itself.
 pub const RESERVED_IDS: &[&str] = &["templates", "zeron", "app"];
 
@@ -203,6 +217,7 @@ pub struct Manifest {
     /// with the permission): none named, any public host; named, those
     /// alone, a private one (`localhost:8080`) only so (plugin-guard's `net`).
     pub network_hosts: Vec<String>,
+    pub events: Vec<String>,
     /// `None` when absent; `Some(Err)` when present but malformed.
     pub signature: Option<Result<SignatureSpec, ()>>,
     /// The first thing wrong with it, in plain words.
@@ -396,6 +411,10 @@ impl Manifest {
                 Vec::new()
             }
         };
+        let events = string_list(object.get("events"), "\"events\"").unwrap_or_else(|e| {
+            problems.push(e);
+            Vec::new()
+        });
         let signature = object.get("signature").map(parse_signature);
         let mut manifest = Manifest {
             raw: raw.clone(),
@@ -412,6 +431,7 @@ impl Manifest {
             commands,
             service,
             network_hosts,
+            events,
             signature,
             problem: None,
         };
@@ -468,6 +488,9 @@ impl Manifest {
             }
             _ => {}
         }
+        if let Some(problem) = self.events_problem() {
+            return Some(problem);
+        }
         if !self.ui.change.is_empty() && !asks("ui.change") {
             return Some("It changes parts of Zeron but doesn't ask for \"ui.change\"".into());
         }
@@ -496,6 +519,28 @@ impl Manifest {
                 "Its tool \"{}\" needs a name of lowercase letters, digits and underscores",
                 tool.name
             ));
+        }
+        None
+    }
+
+    fn events_problem(&self) -> Option<String> {
+        if let Some(unknown) = self
+            .events
+            .iter()
+            .find(|e| !KNOWN_EVENTS.contains(&e.as_str()))
+        {
+            return Some(format!(
+                "It listens to \"{unknown}\", which isn't an event Zeron knows"
+            ));
+        }
+        if self.events.is_empty() {
+            return None;
+        }
+        if self.service.is_none() {
+            return Some("It lists events but has no service to hear them".into());
+        }
+        if !self.asks("sessions.read") {
+            return Some("It lists events but doesn't ask for \"sessions.read\"".into());
         }
         None
     }
@@ -642,6 +687,59 @@ mod tests {
         assert!(problem(tools.clone()).is_some(), "bad tool name");
         tools["tools"] = serde_json::json!([{ "name": "count_words" }]);
         assert_eq!(problem(tools), None);
+    }
+
+    #[test]
+    fn a_service_hears_only_known_events_with_sessions_read() {
+        let with = |events: serde_json::Value, permissions: serde_json::Value, service: bool| {
+            let mut m = base();
+            m["events"] = events;
+            m["permissions"] = permissions;
+            if service {
+                m["service"] = serde_json::json!("service.luau");
+            }
+            m
+        };
+        let ok = Manifest::from_value(with(
+            serde_json::json!(["turn.done", "tool.call"]),
+            serde_json::json!(["service", "sessions.read"]),
+            true,
+        ))
+        .unwrap();
+        assert_eq!(
+            (ok.problem(), ok.events.clone()),
+            (None, vec!["turn.done".to_string(), "tool.call".to_string()])
+        );
+        let unknown = problem(with(
+            serde_json::json!(["turn.finished"]),
+            serde_json::json!(["service", "sessions.read"]),
+            true,
+        ));
+        assert!(unknown.unwrap().contains("isn't an event Zeron knows"));
+        let no_service = problem(with(
+            serde_json::json!(["turn.done"]),
+            serde_json::json!(["sessions.read"]),
+            false,
+        ));
+        assert!(no_service.unwrap().contains("no service"));
+        let no_read = problem(with(
+            serde_json::json!(["turn.done"]),
+            serde_json::json!(["service"]),
+            true,
+        ));
+        assert!(
+            no_read
+                .unwrap()
+                .contains("doesn't ask for \"sessions.read\"")
+        );
+        assert!(
+            problem(with(
+                serde_json::json!("turn.done"),
+                serde_json::json!(["service", "sessions.read"]),
+                true
+            ))
+            .is_some()
+        );
     }
 
     #[test]

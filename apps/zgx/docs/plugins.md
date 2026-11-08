@@ -27,6 +27,7 @@ A plugin is a folder: `zeron-plugin.json` (its manifest), `init.luau` (its code)
 - `settings`: what the person can set for your plugin (see [Settings](#settings)). Needs no permission.
 - `commands`: the programs it runs as you (`["gh", "git"]`), each by its name as it's found on the PATH, never a path. Needs `"commands"`, and the person sees each name when allowing it (see [Programs and a database](#programs-and-a-database)).
 - `service`: its headless half (`"service.luau"`), which Zeron's engine runs on each device that allowed the plugin. Needs `"service"` (see [Services](#services)).
+- `events`: the app events its service hears (`["turn.done"]`, see [Events](#events)). Needs a `service` and `"sessions.read"`.
 - `network`: `{ "hosts": ["api.example.com", "*.example.org", "localhost:8080"] }`, the hosts its requests may reach, from its window and its service alike (see [Reaching the network](#reaching-the-network)). Without it, `network` reaches any public address and never this device, your network or a cloud's metadata address. With it, only those hosts; a private one (`localhost`, `10.…`, `nas.local`) is reachable only when it's named exactly, and the consent sheet says so. `Authorization` and `Cookie` headers go only to hosts named here. Needs `"network"`.
 
 Your own plugins are signed as yours, and re-signed and reloaded each time you save.
@@ -39,7 +40,7 @@ Your own plugins are signed as yours, and re-signed and reloaded each time you s
 | `ui.change` | replace the elements listed in `ui.change` |
 | `ui.replace` | replace the screens listed in `ui.replace` |
 | `sessions.read` | read sessions' title, status, project, device, times, branch, worktree |
-| `messages.read` | read the open chat's messages (role, text) |
+| `messages.read` | read the open chat's messages (role, text); with `events`, what's said in the events its service hears |
 | `profile.read` | read your id, name, username, avatar |
 | `account.email` | read your email (unless you hide email addresses) |
 | `files.read` | read file paths, and folders: a session's (`cwd`) and a project's (`path`) (without it a file is an id of the plugin's own) |
@@ -339,6 +340,7 @@ end)
 | `zeron.every(seconds, fn)` | now and then (30 s at least), even while nothing calls it: Zeron starts the service to run it. Register timers at the top level, in the same order each time | |
 | `zeron.on_stop(fn)` | told before it stops (idle, an update, Zeron quitting) | |
 | `zeron.emit(event, data)` | to your windows: those on this device, and those watching from another (`:on`). 64 KB at most | |
+| `zeron.on(event, fn)` | an app event on this device's chats (one the manifest's `events` lists): `fn(data)` for each, in order. Returns a stop function. See [Events](#events) | `sessions.read` |
 | `zeron.watch(folders, fn, { quiet? })` | changes under whole paths on this device, each all the way down: `fn(changed)` once a burst has been quiet `quiet` ms (250), `changed` by folder: its changed paths (relative, `/`-separated), or `true` when anything may have (as it starts, too many, events lost). Reads aren't changes. Returns a stop function; it lasts while the service runs. Pair it with `emit` to tell windows, instead of their polling | `files.read` |
 | `zeron.run(program, args, { cwd, stdin, timeout, env })` | a promise of `{ status, stdout, stderr }`, as the window's | `commands` |
 | `zeron.fetch(url, { method, headers, body, timeout })` | a promise of `{ status, headers, body }` (http and https; public addresses, or the manifest's `network.hosts`) | `network` |
@@ -374,6 +376,53 @@ The one exception: when the service stops during a call (it ran out of memory, o
 **When it runs.** A service starts on its first call, tool call or timer, and stops after 5 minutes with nothing to do. An update loads the new version beside the old one, which answers until the new one has loaded and finishes the calls it has. Each call or resumed task has 2 seconds of work before it fails (await between parts: waiting costs nothing), and the service has 64 MB. `plugin_status` shows the service on this device: running or not, what it serves, its last log lines (`print`) and why it didn't load.
 
 Zeron's Git plugin (`plugins-builtin/git`) is built this way: its service does every piece of git work on the device a chat's checkout is on (status, what changed through an index of its own via `GIT_INDEX_FILE`, diffs, staging, commits, pushes, branches, history), and its window says each refusal in its own words. `plugins-dev/checkout-status` is the small version, whole: a session row's menu asks the service on that session's device for the checkout's branch and changes, and agents get the same through a tool.
+
+### Events
+
+A service hears what this device's chats do: a turn ending, a tool call, a question for you. List the events in the manifest, then listen with `zeron.on`.
+
+```json
+"service": "service.luau",
+"permissions": ["service", "sessions.read", "notifications"],
+"events": ["turn.done"]
+```
+
+Only the device that hosts a chat tells its events, once. Zeron starts the service for an event, as for a timer, so it hears them with no window open. Each listener runs as a task with 2 seconds of its own; one that fails is logged (`plugin_status`) and the next event still comes. A service that falls behind keeps the newest 256; then `events.dropped` `{ count }` says how many went, before the rest. `zeron.on` with a name Zeron doesn't know, or one the manifest doesn't list, is an error.
+
+Ids are text. Fields marked * come only with `messages.read`; without it they're left out.
+
+| event | data |
+|---|---|
+| `session.created` | `session`, `title?`, `project?` |
+| `session.status` | `session`, `status`, `previous` (`"idle"`, `"working"`, `"awaiting_input"`, `"errored"`) |
+| `turn.started` | `session` |
+| `turn.done` | `session`, `status` (`"completed"`, `"interrupted"`, `"errored"`), `title?`, `error?`* |
+| `tool.call` | `session`, `call`, `name`, `input`* |
+| `tool.result` | `session`, `call`, `name`, `ok`, `output?`* |
+| `message.user` | `session`, `text`* |
+| `message.assistant` | `session`, `text?`* |
+| `input.requested` | `session`, `kind` (`"choice"` or `"text"`), `summary?`* |
+| `input.resolved` | `session` |
+| `agent.error` | `session`, `message`* |
+| `events.dropped` | `count` (any service with `events` may listen) |
+
+A tool's `name` is its kind (`exec`, `readFile`, `editFile`, `webFetch`, …), `server__tool` for an MCP tool. Text is cut at 16 KB. A subagent's events stay its own.
+
+To tell your windows, emit from the listener and listen in the window:
+
+```lua
+-- service.luau
+zeron.on("turn.done", function(turn)
+	zeron.emit("turn", { session = turn.session, status = turn.status })
+end)
+
+-- init.luau
+zeron.service():on("turn", function(turn)
+	zeron.toast(`{turn.session}: {turn.status}`)
+end)
+```
+
+`plugins-dev/turn-notify` is this, whole: a notification when a chat finishes or fails.
 
 ## Settings
 

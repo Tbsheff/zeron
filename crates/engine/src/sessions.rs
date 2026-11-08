@@ -446,9 +446,12 @@ impl SessionsEngine {
         let _ = self.inner.turn_listener.set(listener);
     }
 
-    fn note_turn_start(&self, chat_id: &str, cwd: &str) {
+    fn note_turn_start(&self, chat_id: &str, cwd: &str, prompt: &str) {
         if let Some(listener) = self.inner.turn_listener.get() {
             listener(chat_id, cwd);
+        }
+        if let Some(plugins) = self.inner.plugins.get() {
+            plugins.hear_prompt(chat_id, prompt);
         }
     }
 
@@ -952,7 +955,7 @@ impl SessionsEngine {
                 }
                 let handle = self.doc_handle(chat_id)?;
                 handle.write_user_message(&user_id, &request.prompt, now_ms())?;
-                self.note_turn_start(chat_id, &request.cwd);
+                self.note_turn_start(chat_id, &request.cwd, &request.prompt);
                 if self.is_live(chat_id, &run_id) {
                     if bootstrap.is_some() {
                         history_sent.store(true, std::sync::atomic::Ordering::Release);
@@ -1451,7 +1454,7 @@ impl SessionsEngine {
         // A routed steer is a turn too. Fired here (not only on the confirmed
         // path) — a reclaim falls back to dispatch, which just re-snapshots.
         if let Some(request) = self.last_request(chat_id) {
-            self.note_turn_start(chat_id, &request.cwd);
+            self.note_turn_start(chat_id, &request.cwd, prompt);
         }
         if self.is_live(chat_id, &run_id) {
             if bootstrap.is_some() {
@@ -2213,6 +2216,9 @@ impl Inner {
                 seq,
                 event: event.clone(),
             });
+        }
+        if let Some(plugins) = self.plugins.get() {
+            plugins.hear_agent(chat_id, event);
         }
         seq
     }

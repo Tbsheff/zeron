@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value as Json, json};
 use zeron_plugin_guard::net;
 
-pub use vm::{Described, Failure, Kind, Limits};
+pub use vm::{DROPPED_EVENT, Described, Failure, Kind, Limits};
 use vm::{Done, Ops, Spec, Vm};
 
 /// Why a call didn't get an answer from the service, as callers branch on.
@@ -106,10 +106,11 @@ pub struct Plan {
     pub commands: Vec<String>,
     /// The hosts its manifest names (`network.hosts`; none: any public).
     pub hosts: Vec<String>,
+    pub events: Vec<String>,
 }
 
 impl Plan {
-    fn allows(&self, permission: &str) -> bool {
+    pub fn allows(&self, permission: &str) -> bool {
         self.allowed.iter().any(|p| p == permission)
     }
 }
@@ -160,6 +161,7 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(300);
 /// What `zeron.emit` sends at once, at most (its JSON).
 pub const MAX_EMIT_BYTES: usize = 64 * 1024;
+pub const MAX_QUEUED_EVENTS: usize = 256;
 /// A service's log lines kept for `PluginStatus`.
 const LOG_LINES: usize = 50;
 /// What a fetch answers with, at most.
@@ -190,6 +192,14 @@ struct Slot {
     /// One start at a time.
     start: tokio::sync::Mutex<()>,
     log: Mutex<VecDeque<String>>,
+    inbox: Mutex<Inbox>,
+}
+
+#[derive(Default)]
+struct Inbox {
+    queue: VecDeque<(String, Json)>,
+    dropped: u64,
+    pumping: bool,
 }
 
 #[derive(Default)]
@@ -267,6 +277,7 @@ impl Services {
                     state: Mutex::new(SlotState::default()),
                     start: tokio::sync::Mutex::new(()),
                     log: Mutex::new(VecDeque::new()),
+                    inbox: Mutex::new(Inbox::default()),
                 })
             })
             .clone()
@@ -407,6 +418,7 @@ impl Services {
             entry: plan.entry.clone(),
             device: hooks.device(),
             store: Some(Self::store_path(&self.inner.store_dir, &plan.plugin)),
+            events: plan.events.clone(),
             limits: self.inner.config.limits.clone(),
         };
         let (vm, loaded) = Vm::start(spec, ops);
@@ -552,6 +564,79 @@ impl Services {
             }
         }
         unreachable!("the loop returns")
+    }
+
+    pub fn deliver(&self, plan: &Plan, event: &str, data: Json) {
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let slot = self.slot(&plan.plugin);
+        {
+            let mut st = lock(&slot.state);
+            if st.plan.is_none() {
+                st.plan = Some(plan.clone());
+            }
+        }
+        let start = {
+            let mut inbox = lock(&slot.inbox);
+            if inbox.queue.len() >= MAX_QUEUED_EVENTS {
+                inbox.queue.pop_front();
+                inbox.dropped += 1;
+            }
+            inbox.queue.push_back((event.to_owned(), data));
+            !std::mem::replace(&mut inbox.pumping, true)
+        };
+        if start {
+            runtime.spawn(self.clone().pump(slot));
+        }
+    }
+
+    async fn pump(self, slot: Arc<Slot>) {
+        loop {
+            let next = {
+                let mut inbox = lock(&slot.inbox);
+                if inbox.dropped > 0 {
+                    let count = std::mem::take(&mut inbox.dropped);
+                    Some((DROPPED_EVENT.to_owned(), json!({ "count": count })))
+                } else if let Some(next) = inbox.queue.pop_front() {
+                    Some(next)
+                } else {
+                    inbox.pumping = false;
+                    None
+                }
+            };
+            let Some((event, data)) = next else { return };
+            let plan = lock(&slot.state).plan.clone();
+            let Some(plan) =
+                plan.filter(|_| self.current(&slot) && !self.inner.closed.load(Ordering::SeqCst))
+            else {
+                let mut inbox = lock(&slot.inbox);
+                inbox.queue.clear();
+                inbox.dropped = 0;
+                inbox.pumping = false;
+                return;
+            };
+            self.supervise(&slot);
+            for _ in 0..2 {
+                let Ok(running) = self.ensure(&slot, &plan, true).await else {
+                    break;
+                };
+                match tokio::time::timeout(DEFAULT_TIMEOUT, running.vm.event(&event, data.clone()))
+                    .await
+                {
+                    Ok(Err(_)) => {
+                        let mut st = lock(&slot.state);
+                        if let Some(dead) = st.running.take_if(|r| r.vm.same(&running.vm)) {
+                            dead.vm.stop();
+                        }
+                    }
+                    Ok(Ok(())) | Err(_) => break,
+                }
+            }
+        }
     }
 
     /// The tools `plan`'s service answers (starting it if need be).

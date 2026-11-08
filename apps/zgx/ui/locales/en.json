@@ -3150,10 +3150,12 @@
           "title": "See your name, username and picture"
         },
         "sessions_read": {
-          "title": "See your sessions' titles and status"
+          "title": "See your sessions' titles and status",
+          "hears": "Its service hears {events} in this device's chats"
         },
         "messages_read": {
-          "title": "Read messages in the open chat"
+          "title": "Read messages in the open chat",
+          "hears": "Its service reads what's said in every chat on this device"
         },
         "account_email": {
           "title": "See your email address"
@@ -3259,6 +3261,7 @@
       "more": "and {n} more",
       "diff": {
         "commands": "Run more programs as you",
+        "events": "Hear more of what your chats do",
         "mcp": "Run a different program beside your agents",
         "mcp_gone": "Stop running its program beside your agents",
         "tools_added": "New tools for your agents",
