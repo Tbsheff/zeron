@@ -172,6 +172,10 @@ impl Plugins {
         sources.into_iter().map(|(_, source)| source).collect()
     }
 
+    pub fn zeron_skills(&self) -> Option<PathBuf> {
+        zeron_skills(&self.inner.plugins_dir)
+    }
+
     pub async fn agent_context(&self, chat: &str, harness: HarnessId) -> Delivery {
         let sources = self.instructing();
         let root = self.inner.plugins_dir.join(AGENTS_DIR);
@@ -293,6 +297,32 @@ impl Plugins {
             .flatten()
             .collect()
     }
+}
+
+pub fn zeron_skills(plugins_dir: &Path) -> Option<PathBuf> {
+    use sha2::Digest as _;
+    let skill = zeron_proto::visual_reference::skill_markdown();
+    let digest = sha2::Sha256::digest(skill.as_bytes());
+    let short: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    let root = plugins_dir.join(AGENTS_DIR).join("zeron");
+    let dir = root.join(&short);
+    if !dir.is_dir() {
+        let staging = root.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
+        let built = (|| -> std::io::Result<()> {
+            std::fs::create_dir_all(staging.join(".claude-plugin"))?;
+            let manifest = json!({ "name": "zeron", "description": "Zeron's own skills" });
+            std::fs::write(staging.join(".claude-plugin").join("plugin.json"), manifest.to_string())?;
+            let folder = staging.join("skills").join(zeron_proto::visual_reference::SKILL_NAME);
+            std::fs::create_dir_all(&folder)?;
+            std::fs::write(folder.join("SKILL.md"), &skill)?;
+            std::fs::rename(&staging, &dir)
+        })();
+        if built.is_err() {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+    }
+    prune(&root, std::slice::from_ref(&short));
+    dir.is_dir().then_some(dir)
 }
 
 fn skills_listing(source: &Source, dir: &Path) -> String {

@@ -3888,10 +3888,15 @@ async fn drive_run(
         .map(crate::plugins::Plugins::native_mcp_servers)
         .unwrap_or_default();
     if let Some(mcp) = request.mcp.as_mut() {
-        let delivery = match inner.plugins.get() {
+        let mut delivery = match inner.plugins.get() {
             Some(plugins) => plugins.agent_context(&chat_id, harness_id).await,
             None => Default::default(),
         };
+        if harness_id == zeron_proto::HarnessId::ClaudeCode
+            && let Some(skills) = inner.plugins.get().and_then(|p| p.zeron_skills())
+        {
+            delivery.skills.push(skills);
+        }
         delivery.stamp(mcp);
     }
     // A revived turn the resumed session already holds: the provider gets

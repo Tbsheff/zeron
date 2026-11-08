@@ -13,7 +13,7 @@ use zeron_proto::{
 };
 use zeron_rpc::{RpcReply, methods};
 
-use super::{MAX_INSTRUCTIONS, MAX_SKILL, files_problem, frontmatter};
+use super::{MAX_INSTRUCTIONS, MAX_SKILL, files_problem, frontmatter, zeron_skills};
 use crate::plugins::hooks::{INSTRUCT, deciding};
 use crate::plugins::manifest::Manifest;
 use crate::plugins::{MANIFEST_FILE, Plugins, authority_tests, scaffold, scan, service};
@@ -680,4 +680,21 @@ async fn the_notes_tool_example_tells_agents_when_to_call_its_tools() {
             .is_file()
     );
     r.core.shutdown().await;
+}
+
+#[test]
+fn zeron_ships_its_visuals_skill_as_a_claude_plugin_folder() {
+    let plugins = tempfile::tempdir().unwrap();
+    let stale = plugins.path().join(".agents/zeron/old");
+    std::fs::create_dir_all(&stale).unwrap();
+    let dir = zeron_skills(plugins.path()).unwrap();
+    let manifest: Json = serde_json::from_str(&std::fs::read_to_string(dir.join(".claude-plugin/plugin.json")).unwrap()).unwrap();
+    assert_eq!(manifest["name"], "zeron");
+    let skill = std::fs::read_to_string(dir.join("skills/visuals/SKILL.md")).unwrap();
+    let (name, description) = frontmatter(&skill).unwrap();
+    assert_eq!(name, "visuals");
+    assert!(description.contains("show_visual"));
+    assert!(skill.contains("## shader") && skill.contains("chart6"));
+    assert_eq!(zeron_skills(plugins.path()).unwrap(), dir, "same text, same folder");
+    assert!(!stale.exists(), "older builds are pruned");
 }
