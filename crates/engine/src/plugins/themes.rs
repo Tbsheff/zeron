@@ -40,7 +40,7 @@ fn text<'a>(params: &'a Json, key: &str) -> Option<&'a str> {
 }
 
 fn id(params: &Json) -> Result<&str, String> {
-    text(params, "id").ok_or_else(|| "Say which theme: `id`, from list_themes.".to_string())
+    text(params, "id").ok_or_else(|| "Say which theme: `id`, from `themes {action: list}`.".to_string())
 }
 
 /// `method` with `params`, over the files in `data_dir`.
@@ -69,7 +69,7 @@ pub fn answer(data_dir: &Path, method: &str, params: &Json) -> Result<Json, Stri
         methods::UPDATE_THEME => {
             let id = id(params)?;
             if params.get("vscode").is_some() {
-                return Err("update_theme takes palettes (`light`, `dark`). To bring in a VS Code theme, make a new one with create_theme.".into());
+                return Err("`themes {action: update}` takes palettes (`light`, `dark`). To bring in a VS Code theme, make a new one with `themes {action: create}`.".into());
             }
             catalog::update(data_dir, id, text(params, "name"), params.get("light"), params.get("dark")).map(|s| s.to_json()).map_err(said)
         }

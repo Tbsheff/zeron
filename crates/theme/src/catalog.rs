@@ -809,7 +809,7 @@ pub fn get(data_dir: &Path, id: &str) -> Result<Json> {
     let entry = entries
         .iter()
         .find(|e| e["id"] == id || e["variants"].as_array().is_some_and(|v| v.iter().any(|x| x == id)))
-        .ok_or_else(|| anyhow!("There's no theme {id}. list_themes names them."))?;
+        .ok_or_else(|| anyhow!("There's no theme {id}. `themes {{action: list}}` names them."))?;
     let source = entry["source"].as_str().unwrap_or("");
     let list = described["list"].as_array().cloned().unwrap_or_default();
     let mut out = json!({
@@ -835,7 +835,7 @@ pub fn get(data_dir: &Path, id: &str) -> Result<Json> {
     }
     out["adjusted"] = json!(adjusted);
     if source != "imported" {
-        out["note"] = json!("Read-only. To change it, call create_theme with these colours and a new name.");
+        out["note"] = json!("Read-only. To change it, call `themes {action: create}` with these colours and a new name.");
     }
     Ok(out)
 }
@@ -1039,9 +1039,9 @@ fn not_yours(data_dir: &Path, id: &str) -> anyhow::Error {
     let described = describe_dir(data_dir);
     let known = described["entries"].as_array().into_iter().flatten().find(|e| e["id"] == id);
     match known.and_then(|e| e["source"].as_str()) {
-        Some("builtin") => anyhow!("{id} is built in, so it can't be changed. Make a copy: get_theme {id}, then create_theme with its colours and a new name."),
-        Some("template") => anyhow!("{id} is a template's own theme, so it can't be changed here. Make a copy: get_theme {id}, then create_theme with its colours and a new name."),
-        _ => anyhow!("There's no theme of yours {id}. list_themes names them."),
+        Some("builtin") => anyhow!("{id} is built in, so it can't be changed. Make a copy: `themes {{action: get}}`, then `themes {{action: create}}` with its colours and a new name."),
+        Some("template") => anyhow!("{id} is a template's own theme, so it can't be changed here. Make a copy: `themes {{action: get}}`, then `themes {{action: create}}` with its colours and a new name."),
+        _ => anyhow!("There's no theme of yours {id}. `themes {{action: list}}` names them."),
     }
 }
 
@@ -1172,7 +1172,7 @@ pub fn use_theme(data_dir: &Path, id: &str, slot: &str) -> Result<Json> {
         .into_iter()
         .flatten()
         .find(|e| e["id"] == id || e["variants"].as_array().is_some_and(|v| v.iter().any(|x| x == id)))
-        .ok_or_else(|| anyhow!("There's no theme {id}. list_themes names them."))?;
+        .ok_or_else(|| anyhow!("There's no theme {id}. `themes {{action: list}}` names them."))?;
     let name = entry["name"].as_str().unwrap_or(id);
     let variants: Vec<String> = if entry["id"] == id {
         entry["variants"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect()
@@ -1313,7 +1313,7 @@ mod tests {
         let d = data();
         let dir = d.path();
         let err = update(dir, "gruvbox", None, Some(&palette("nord")), None).unwrap_err().to_string();
-        assert!(err.contains("built in") && err.contains("create_theme"), "{err}");
+        assert!(err.contains("built in") && err.contains("`themes {action: create}`"), "{err}");
         assert!(delete(dir, "dracula").unwrap_err().to_string().contains("built in"));
         // A template's own theme.
         let t = dir.join("templates/ledger");
@@ -1327,7 +1327,7 @@ mod tests {
         // A copy from a built-in's colours is yours.
         let dracula = get(dir, "dracula").unwrap();
         assert_eq!(dracula["editable"], false);
-        assert!(dracula.get("light").is_none() && dracula["note"].as_str().unwrap().contains("create_theme"));
+        assert!(dracula.get("light").is_none() && dracula["note"].as_str().unwrap().contains("`themes {action: create}`"));
         let copy = create(dir, "My Dracula", None, Some(&dracula["dark"])).unwrap();
         assert_eq!(get(dir, &copy.id).unwrap()["dark"], dracula["dark"]);
         assert_eq!(copy.adjusted, get(dir, "dracula").unwrap()["adjusted"].as_array().unwrap().clone());

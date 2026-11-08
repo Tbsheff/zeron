@@ -57,10 +57,10 @@ screens/chat is a chat and the composer.
 screens/files is the files pane.
 ds/ is the design system: tokens.luau, themes/*.json, and the components.
 assets/ holds icons and art.
-Elements are named by id and class (id = \"…\", class = \"…\"): plugins place their nodes by those (describe_elements lists them), so keep the names to keep plugins working.
+Elements are named by id and class (id = \"…\", class = \"…\"): plugins place their nodes by those (`plugins {action: elements}` lists them), so keep the names to keep plugins working.
 screens/plugins and account/ always load Zeron's own, whatever the template has.
 Each saved edit shows live while Zeron is open and this template is in use.
-A file with an error falls back to Zeron's own for that file; template_status gives the error.";
+A file with an error falls back to Zeron's own for that file; `templates {action: status}` gives the error.";
 
 #[derive(Debug, Default, Deserialize)]
 struct Manifest {
@@ -472,7 +472,7 @@ pub fn create(dir: &Path, id: &str, name: &str, from: Option<&str>, guide: &Path
     } else {
         Some(
             template_dir(dir, from)
-                .ok_or_else(|| format!("There's no template {from}. list_templates names them."))?,
+                .ok_or_else(|| format!("There's no template {from}. `templates {{action: list}}` names them."))?,
         )
     };
 
@@ -514,7 +514,7 @@ pub fn use_template(dir: &Path, id: &str, by: Option<&Value>) -> Result<Value, S
     let id = id.trim();
     if id != ZERON && template_dir(dir, id).is_none() {
         return Err(format!(
-            "There's no template {id}. list_templates names them."
+            "There's no template {id}. `templates {{action: list}}` names them."
         ));
     }
     match by {
@@ -544,7 +544,7 @@ pub fn status(dir: &Path, id: &str) -> Result<Value, String> {
         zeron.clone()
     } else {
         template_dir(dir, id)
-            .ok_or_else(|| format!("There's no template {id}. list_templates names them."))?
+            .ok_or_else(|| format!("There's no template {id}. `templates {{action: list}}` names them."))?
     };
     let health = health(dir, id);
     let theirs = zeron_files(&zeron);
@@ -579,7 +579,7 @@ pub fn delete(dir: &Path, id: &str) -> Result<Value, String> {
         return Err("The default template can't be deleted.".into());
     }
     let folder = template_dir(dir, id)
-        .ok_or_else(|| format!("There's no template {id}. list_templates names them."))?;
+        .ok_or_else(|| format!("There's no template {id}. `templates {{action: list}}` names them."))?;
     let manifest: Manifest = read_json(&folder.join(MANIFEST));
     if official(id, &folder, &manifest) {
         let name = manifest.name.unwrap_or_else(|| id.to_owned());

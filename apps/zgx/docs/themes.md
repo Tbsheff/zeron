@@ -4,16 +4,16 @@ A theme is the colours Zeron's window wears. It's only colours, so it works with
 
 ## The tools
 
-- **`list_themes`**: every theme, with its `id`, `name`, where it comes from (`built in`, `a template's`, `yours`), whether you can change it (`editable`), its variant for each scheme (`variants: { light?, dark? }`) and which schemes it's worn for now (`in_use`). `wearing` says what each scheme wears now.
-- **`get_theme { id }`**: a theme's colours, a palette for each scheme it has, in the shape the next two take. `adjusted` lists what the window moves to keep it legible.
-- **`create_theme { name, light?, dark? }`**: a new theme of yours from palettes (one at least). Or **`create_theme { name?, vscode }`** from a VS Code colour theme's JSON (`colors`, `tokenColors`, `type`), through the importer Settings → Themes uses.
-- **`update_theme { id, name?, light?, dark? }`**: change one of yours. A palette replaces that scheme's; `null` takes it away. Its ids stay the same, so while it's worn the window restyles at once.
-- **`delete_theme { id }`**: yours only. A scheme it was worn for goes back to the template's theme, or to Zeron's.
-- **`use_theme { id, slot? }`**: wear it. `slot` is `"light"`, `"dark"` or `"both"` (the default: each scheme it has).
+- **`themes {action: list}`**: every theme, with its `id`, `name`, where it comes from (`built in`, `a template's`, `yours`), whether you can change it (`editable`), its variant for each scheme (`variants: { light?, dark? }`) and which schemes it's worn for now (`in_use`). `wearing` says what each scheme wears now.
+- **`themes {action: get, id }`**: a theme's colours, a palette for each scheme it has, in the shape the next two take. `adjusted` lists what the window moves to keep it legible.
+- **`themes {action: create, name, light?, dark? }`**: a new theme of yours from palettes (one at least). Or **`themes {action: create, name?, vscode }`** from a VS Code colour theme's JSON (`colors`, `tokenColors`, `type`), through the importer Settings → Themes uses.
+- **`themes {action: update, id, name?, light?, dark? }`**: change one of yours. A palette replaces that scheme's; `null` takes it away. Its ids stay the same, so while it's worn the window restyles at once.
+- **`themes {action: delete, id }`**: yours only. A scheme it was worn for goes back to the template's theme, or to Zeron's.
+- **`themes {action: use, id, slot? }`**: wear it. `slot` is `"light"`, `"dark"` or `"both"` (the default: each scheme it has).
 
-Built-in themes and a template's own theme are read-only. To change one, copy it: `get_theme`, edit the colours, then `create_theme` with a new name.
+Built-in themes and a template's own theme are read-only. To change one, copy it: `themes {action: get}`, edit the colours, then `themes {action: create}` with a new name.
 
-"Make me a theme and switch to it" is two calls: `create_theme`, then `use_theme` with the `id` it returns.
+"Make me a theme and switch to it" is two calls: `themes {action: create}`, then `themes {action: use}` with the `id` it returns.
 
 ## A palette
 
@@ -42,7 +42,7 @@ A minimal dark palette:
 }
 ```
 
-So `create_theme { "name": "Harbor", "dark": { …that… } }` makes a dark-only theme. Give `light` too for both.
+So `themes {action: create, "name": "Harbor", "dark": { …that… } }` makes a dark-only theme. Give `light` too for both.
 
 ## Legibility
 

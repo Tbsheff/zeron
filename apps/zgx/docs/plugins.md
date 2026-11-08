@@ -108,7 +108,7 @@ end }
 - What fails in your node draws nothing there. It's reported once, as your plugin's, and the rest goes on.
 - **A replacement sees what's provided above the replaced element, not the element's own `provide`.** Zeron puts each element's context on its parent for this reason (see the table). To place inside an element that provides something, place by a part inside it (`.session-title`, not `.session-row`).
 
-`describe_elements` (MCP) lists every named element in the window running now: its selector, where it is, what it provides, whether it's present, and whether it's **stable**. Stable names are kept across Zeron's updates and by every template. Place by stable names where you can.
+`plugins {action: elements}` (MCP) lists every named element in the window running now: its selector, where it is, what it provides, whether it's present, and whether it's **stable**. Stable names are kept across Zeron's updates and by every template. Place by stable names where you can.
 
 | stable selector | where | provides |
 |---|---|---|
@@ -231,7 +231,7 @@ Zeron draws that row on your settings page: "Use as wallpaper", and while it's o
 | `zeron.open_url(url)` | an http(s) link, where you open links (Settings → Links) | `links.open` |
 | `zeron.sessions()`, `zeron.projects()` | your sessions and projects by id, as they change | `sessions.read` |
 
-**Cost.** Zeron times each build of your nodes. Past 1 ms a build (a row's badge) or 8 ms of builds in one frame, your row in Settings → Plugins says so ("Slow: 4.2 ms per row"), and `plugin_status` gives the numbers. Do the work outside the build (in `zeron.every`, or once per id), and read what changes in reactive functions.
+**Cost.** Zeron times each build of your nodes. Past 1 ms a build (a row's badge) or 8 ms of builds in one frame, your row in Settings → Plugins says so ("Slow: 4.2 ms per row"), and `plugins {action: status}` gives the numbers. Do the work outside the build (in `zeron.every`, or once per id), and read what changes in reactive functions.
 
 **Commands and shortcuts.** zgx's own `ui.command { id, title, menu, key, run }` works in a plugin. It shows in Zeron's menu bar as `<plugin>/<id>`, with `key` as its shortcut (`"cmd+shift+t"`). A shortcut Zeron (or an earlier plugin) already has stays theirs: yours shows without it, and your row in Settings → Plugins says so.
 
@@ -385,7 +385,7 @@ Handlers, tools, timers and `:after` callbacks each run as a task, so `:await()`
 
 The one exception: when the service stops during a call (it ran out of memory, or crashed), a method marked `safe = true` runs once more on a fresh start. Mark only what can run twice: reading, not posting.
 
-**When it runs.** A service starts on its first call, tool call or timer, and stops after 5 minutes with nothing to do. An update loads the new version beside the old one, which answers until the new one has loaded and finishes the calls it has. Each call or resumed task has 2 seconds of work before it fails (await between parts: waiting costs nothing), and the service has 64 MB. `plugin_status` shows the service on this device: running or not, what it serves, its last log lines (`print`) and why it didn't load.
+**When it runs.** A service starts on its first call, tool call or timer, and stops after 5 minutes with nothing to do. An update loads the new version beside the old one, which answers until the new one has loaded and finishes the calls it has. Each call or resumed task has 2 seconds of work before it fails (await between parts: waiting costs nothing), and the service has 64 MB. `plugins {action: status}` shows the service on this device: running or not, what it serves, its last log lines (`print`) and why it didn't load.
 
 Zeron's Git plugin (`plugins-builtin/git`) is built this way: its service does every piece of git work on the device a chat's checkout is on (status, what changed through an index of its own via `GIT_INDEX_FILE`, diffs, staging, commits, pushes, branches, history), and its window says each refusal in its own words. `plugins-dev/checkout-status` is the small version, whole: a session row's menu asks the service on that session's device for the checkout's branch and changes, and agents get the same through a tool.
 
@@ -399,7 +399,7 @@ A service hears what this device's chats do: a turn ending, a tool call, a quest
 "events": ["turn.done"]
 ```
 
-Only the device that hosts a chat tells its events, once. Zeron starts the service for an event, as for a timer, so it hears them with no window open. Each listener runs as a task with 2 seconds of its own; one that fails is logged (`plugin_status`) and the next event still comes. A service that falls behind keeps the newest 256; then `events.dropped` `{ count }` says how many went, before the rest. `zeron.on` with a name Zeron doesn't know, or one the manifest doesn't list, is an error.
+Only the device that hosts a chat tells its events, once. Zeron starts the service for an event, as for a timer, so it hears them with no window open. Each listener runs as a task with 2 seconds of its own; one that fails is logged (`plugins {action: status}`) and the next event still comes. A service that falls behind keeps the newest 256; then `events.dropped` `{ count }` says how many went, before the rest. `zeron.on` with a name Zeron doesn't know, or one the manifest doesn't list, is an error.
 
 Ids are text. Fields marked * come only with `messages.read`; without it they're left out.
 
@@ -451,7 +451,7 @@ A service can act in your chats: send a message, stop a turn, start a chat, read
 - **The person's Stop wins.** A Stop holds the chat's queue until the person sends next, so a plugin's send after a Stop waits there, a plugin's own `zeron.chats.stop` included.
 - **Rate limit.** Sends and new chats together: 20 a minute per plugin on each device; the 21st is an error that starts with `rate limited`. Stops and reads aren't counted.
 - **Loops.** A plugin's send is a turn like any other: it produces `message.user`, `turn.started`, `turn.done` and the rest, its own listeners included. A listener that sends on every `turn.done` triggers itself; the rate limit stops it, but keep track of what you sent (`zeron.store`) and send once.
-- **Who sent it.** The message reads as yours in the chat; the service's log (`plugin_status`) names each chat it sent to, stopped or started. A message that copies the header of a message from another chat is marked as quoted, as for agents.
+- **Who sent it.** The message reads as yours in the chat; the service's log (`plugins {action: status}`) names each chat it sent to, stopped or started. A message that copies the header of a message from another chat is marked as quoted, as for agents.
 
 ```lua
 -- service.luau: "continue" once to a chat whose turn failed
@@ -519,7 +519,7 @@ There's no "change it" answer. A message sent while a turn runs (a steer) goes i
 | `"deny"` | refuses it: the agent is told "denied by" your plugin's name (Claude Code hears the words; Codex, OpenCode and other agents hear a plain no) |
 | `"ask"`, or `nil` | asks you, as usual |
 
-Some approvals aren't asked about: Codex's requests for more permissions, Claude Code's plan approval, and a step of a long Muse command. Every allow and deny goes to your service's log (`plugin_status`), with the chat and the tool's name. `input.requested` is told only when the question reaches you.
+Some approvals aren't asked about: Codex's requests for more permissions, Claude Code's plan approval, and a step of a long Muse command. Every allow and deny goes to your service's log (`plugins {action: status}`), with the chat and the tool's name. `input.requested` is told only when the question reaches you.
 
 **Order.** Plugins decide in the order they were installed (one put in the plugins folder by hand, by its id), and a plugin's own functions in the order it added them. For `message.dispatch`, the first answer that isn't proceed wins, and the rest aren't asked. For `tool.approve`, a deny from any plugin beats an allow from another.
 
@@ -568,7 +568,7 @@ Call notes_tool__count_words with the text, then ...
 
 The consent sheet marks `agents.instruct` as risky: it steers what agents do.
 
-**What an agent gets.** Each run Zeron starts on this device gets a "Plugins" section: each plugin that is on and allowed `agents.instruct`, in install order, with its name, its instructions, then its `zeron.instruct` text. All plugins together have 24 KB; a plugin that would go past that is left out whole, and its log (`plugin_status`) says so. Turning a plugin on or off reaches the next run of a chat's agent, with no restart. An agent already running keeps what it started with.
+**What an agent gets.** Each run Zeron starts on this device gets a "Plugins" section: each plugin that is on and allowed `agents.instruct`, in install order, with its name, its instructions, then its `zeron.instruct` text. All plugins together have 24 KB; a plugin that would go past that is left out whole, and its log (`plugins {action: status}`) says so. Turning a plugin on or off reaches the next run of a chat's agent, with no restart. An agent already running keeps what it started with.
 
 | agent | instructions | skills |
 |---|---|---|
@@ -675,26 +675,26 @@ zeron.toast(zeron.s("timer.done"))
 
 ## The loop
 
-1. **`create_plugin { id, name, description, permissions }`** makes the folder and signs it as yours. Its reply gives the folder, its files and a link to this guide.
+1. **`plugins {action: create, id, name, description, permissions }`** makes the folder and signs it as yours. Its reply gives the folder, its files and a link to this guide.
 2. **Edit `init.luau`** (and the manifest, for permissions). Zeron re-signs and reloads it on every save. If the manifest asks for something new, the person allows it in Zeron.
-3. **`plugin_status { id, snapshot = true }`** answers without a person:
+3. **`plugins {action: status, id, snapshot = true }`** answers without a person:
    - its status (on, off, pending review, tampered, broken, and why) and what it was allowed;
    - each place it made: its selector, how many elements it matched and their boxes;
    - what its Settings row says (a need its place doesn't give, places this template lacks, an error);
    - with `snapshot`, a PNG of the window around its nodes. Read the file at `snapshot`.
-4. **Fix and save**, then ask again. Matched 0? Check the selector against `describe_elements`. A need? Place it inside something that provides it.
+4. **Fix and save**, then ask again. Matched 0? Check the selector against `plugins {action: elements}`. A need? Place it inside something that provides it.
 
-`list_plugins` lists them all. Selectors that aren't stable may move; templates may rename elements. `plugin_status` and Settings show "Not shown in this template" when yours aren't there.
+`plugins {action: list}` lists them all. Selectors that aren't stable may move; templates may rename elements. `plugins {action: status}` and Settings show "Not shown in this template" when yours aren't there.
 
 ## Sharing and installing
 
 A plugin travels as its folder, signed. The person installs it with Settings → Plugins → Install…; an agent uses these tools:
 
-- **`install_plugin { path }`** installs a `.zeron-plugin` file. **`install_plugin { url, ref?, folder? }`** installs from a link:
+- **`plugins {action: install, path }`** installs a `.zeron-plugin` file. **`plugins {action: install, url, ref?, folder? }`** installs from a link:
   - a link to a `.zeron-plugin` file;
   - a GitHub release (`…/releases/latest`, `…/releases/tag/<tag>`), from its `.zeron-plugin` asset;
   - a git repository: `owner/repo`, its GitHub page, `…/tree/<branch>/<folder>`, or any https git URL.
-- **`update_plugin { id }`** installs the newest version from wherever the plugin came from. **`update_plugin { check = true }`** only reports what's new: each update's version and the permissions it adds or removes.
+- **`plugins {action: updates, id }`** installs the newest version from wherever the plugin came from. **`plugins {action: updates, check = true }`** only reports what's new: each update's version and the permissions it adds or removes.
 
 Zeron checks the signature over every file before anything is written, so an unsigned or changed plugin is refused.
 - **Signed by the person's own key:** it turns on at once.

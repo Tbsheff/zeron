@@ -161,7 +161,7 @@ User bearers are unaffected by all of the above.
 #### Delegation
 
 The one widening: a session's machine may start and manage **delegates** of the chat it runs
-(Zeron MCP `create_chat { cloud: true }`), one level deep. A delegate is a Cloud session of
+(Zeron MCP `create_chats {cloud: true}`), one level deep. A delegate is a Cloud session of
 its own, on its own machine, recorded with `parentChatId` = the parent's chat.
 
 - **Start** (`POST /cloud/{org}/sessions {chatId, parentChatId, branch?, config?}` with a

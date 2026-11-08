@@ -131,7 +131,7 @@ pub fn export(dir: &Path, id: &str, out: &Path, key: &SigningKey) -> Result<Valu
         return Err("Everyone already has the default interface. Export one of your own templates.".into());
     }
     let folder = templates::template_dir(dir, id)
-        .ok_or_else(|| format!("There's no template {id}. list_templates names them."))?;
+        .ok_or_else(|| format!("There's no template {id}. `templates {{action: list}}` names them."))?;
     if !out.is_absolute() || out.extension().and_then(|e| e.to_str()) != Some(EXTENSION) {
         return Err(format!("Say where to save it: a full path ending in .{EXTENSION}."));
     }

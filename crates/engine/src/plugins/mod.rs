@@ -2003,7 +2003,7 @@ impl Plugins {
                             v
                         }),
                         (_, None) => {
-                            Err("Say which template: its id, from list_templates.".to_string())
+                            Err("Say which template: its id, from `templates {action: list}`.".to_string())
                         }
                         (methods::CREATE_TEMPLATE, Some(id)) => {
                             let name = p.name.as_deref().map(str::trim).filter(|n| !n.is_empty());
