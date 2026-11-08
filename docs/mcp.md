@@ -9,7 +9,11 @@ install, a few MB resident.
 Crate: `crates/mcp` (`zeron-mcp`). The protocol layer is hand-rolled
 (`initialize`, `ping`, `tools/list`, `tools/call`; newline-delimited JSON-RPC
 2.0) — the repo already owns JSON-RPC framing for the Codex and ACP drivers and
-the stdio tool-server subset is tiny, so no SDK dependency was taken.
+the stdio tool-server subset is tiny, so no SDK dependency was taken. It
+accepts protocol `2025-11-25` and `2025-06-18` (older revisions are echoed
+too) and answers `server/discover` and any other unknown method with `-32601`
+at once, so a client that probes the 2026 stateless draft first falls back
+without a wait.
 
 ## Identity
 
@@ -23,9 +27,12 @@ originating chat in the environment:
 | `ZERON_CHAT_ID`         | The chat whose agent spawned this server.                |
 | `ZERON_DEVICE_ID`       | That chat's host device.                                 |
 | `ZERON_SIDE_CHATS_ONLY` | `1`: the agent has no subagent tools of its own (below). |
+| `ZERON_WAITS_ON_BACKGROUND` | `1`: the runtime wakes the agent as background work ends; `wait_on_background` is offered. |
+| `ZERON_PLUGIN_INSTRUCTIONS` | Path of the run's plugin instructions (step 4). |
+| `ZERON_MCP_GUIDANCE`    | `prompt`: the harness put Zeron's guidance in the system prompt (below). |
 
 `ZERON_SIDE_CHATS_ONLY=1`: the host device turned the provider's native
-subagents off (Settings → Providers), so `initialize` tells the agent to
+subagents off (Settings → Providers), so the guidance tells the agent to
 delegate with `create_chats`. Never set for a chat that has a parent, nor
 for one whose host doesn't know its parent yet.
 
@@ -50,7 +57,7 @@ its command line (`--mcp-config <inline json>`), which other local users can
 read with `ps`. A client run against a different data dir (e.g. a viewport on
 a daemon's port) sets `ZERON_IPC_TOKEN_FILE` to the daemon's file.
 
-When `ZERON_CHAT_ID` is set, every `send_message` is prefixed with a
+When `ZERON_CHAT_ID` is set, every message `send_messages` sends is prefixed with a
 `[Message from Zeron chat <title> (<id8>) …]` line so the receiving agent and the
 human reading that transcript can tell an agent-to-agent message from a typed
 one, and the server refuses to message its own chat. The transcript renders
@@ -59,7 +66,7 @@ instructions in the stored prompt for agents.
 
 ### Parent links
 
-`create_chat` and each request in `create_chats` accept `kind`:
+Each request in `create_chats` accepts `kind`:
 
 | Input | Placement |
 | --- | --- |
@@ -125,6 +132,33 @@ the MCP child when the Pi session shuts down.
 Title runs never carry it. A run with no served port (embedded engine that
 lost the bind) gets no Zeron tools rather than a dead server.
 
+### Guidance
+
+What tells an agent when to use these tools lives in the agent's system
+prompt, not in the MCP `instructions` (Claude Code cuts those at 4 KB, Codex
+shows only the first ~233 chars). `zeron_proto::agent_guidance` builds it from
+sections that match the run: core (always; opens "Ordinary coding tasks need
+no Zeron tools.", then a task → tool map and five rules), waits
+(`wait_on_background` offered), side chats (own subagents off), visuals (in a
+chat). Plugin instructions follow it.
+
+| Harness | Where the guidance goes |
+| ------- | ----------------------- |
+| Claude | `--append-system-prompt` (sections); plugin text via `--append-system-prompt-file` |
+| Codex | `turn/start` `additionalContext`: one `application` entry per section, plugin text split, each < 4,000 B, keys `zeron_01`… |
+| OpenCode 1.x | the prompt body's `system` field on every prompt |
+| ACP, OpenCode 2.x, Pi, Cursor, a person's own client | the server's `instructions` |
+
+A harness that delivers it sets `ZERON_MCP_GUIDANCE=prompt` on the server, and
+`initialize` answers with `MCP_INSTRUCTIONS` only (under 230 chars, so Codex's
+one-line summary is complete). Otherwise `instructions` is that line plus the
+sections and plugin text. Claude chats also get the `zeron:visuals` skill (the
+full `show_visual` reference) through `--plugin-dir`.
+
+Known gap: Codex drops client context on compaction and resends
+`additionalContext` only when it changes, so a long Codex thread can lose the
+guidance after compaction until the next run starts.
+
 ### Forks and the session card
 
 `ForkSideChat { chatId, sourceChatId, parentChatId? }` copies a chat's
@@ -153,32 +187,51 @@ Chats are referenced by full id, a unique id prefix, or an exact title.
 Projects by id, path, display name, or unique path suffix. Devices by id or
 name (default: the local engine's device).
 
-| Tool               | Engine calls                                              |
-| ------------------ | --------------------------------------------------------- |
-| `whoami`           | `LocalDevice`, `EngineInfo`, origin chat summary          |
-| `list_devices`     | `WatchDevices` snapshot                                   |
-| `list_projects`    | `WatchSpaces` snapshot                                    |
-| `list_harnesses`   | `ListHarnesses` + `ListAgentAccounts` (`targetDeviceId?`) |
-| `list_models`      | `ListModels {harness, targetDeviceId?}`                                    |
-| `list_chats`       | `WatchChats` + `WatchSessions` snapshots (status merged)  |
-| `get_chat`         | above + `WatchDocMessages` opening frame (pending input)  |
-| `create_chat`      | `Mutate createChat` (+ `renameChat`; optional first send) |
-| `create_chats`     | Concurrent `create_chat` requests with per-request results |
-| `send_messages`    | Concurrent `send_message` requests with per-request results |
-| `read_chat`        | `WatchDocMessages` opening `reset` frame, rendered        |
-| `send_message`     | `QueueCommand` Run / Steer, or `QueueMessage`             |
-| `wait_for_turn`    | `WatchSessions` until the chat settles                    |
-| `interrupt_chat`   | `QueueCommand` Interrupt                                  |
-| `respond_to_input` | `QueueCommand` RespondInput                               |
-| `archive_chat`     | `Mutate setChatArchived`                                  |
-| `show_visual`      | `PublishVisual {chatId, title, script, assets}` (origin chat only; assets base64 by name, read by the MCP server from the agent's cwd) |
-| `show_image`       | `PublishImage {chatId, name, data}` (origin chat only; the file base64, read by the MCP server from the agent's cwd) |
+| Tool | Engine calls |
+| ---- | ------------ |
+| `catalog {kind}` | `self`: `LocalDevice`, `EngineInfo`, origin chat; `devices`: `WatchDevices`; `projects`: `WatchSpaces`; `harnesses`: `ListHarnesses` + `ListAgentAccounts`; `models`: `ListModels` (`targetDeviceId?` from `device`) |
+| `list_chats` | `WatchChats` + `WatchSessions` snapshots (status merged) |
+| `read_chat` | above + `WatchDocMessages` opening frame: chat summary, `pendingInput`, newest messages (`limit: 0` is status only) |
+| `create_chats` | 1–32 × `Mutate createChat` (+ `renameChat`; optional first send), concurrent |
+| `send_messages` | 1–32 × `QueueCommand` Run / Steer, or `QueueMessage`, concurrent |
+| `wait_for_turn` | `WatchSessions` until the chat settles |
+| `interrupt_chat` | `QueueCommand` Interrupt |
+| `respond_to_input` | `QueueCommand` RespondInput |
+| `archive_chat` | `Mutate setChatArchived` |
+| `show_visual` | `PublishVisual {chatId, title, script, assets}` (origin chat only; assets base64 by name, read by the MCP server from the agent's cwd) |
+| `show_image` | `PublishImage {chatId, name, data}` (origin chat only; the file base64, read by the MCP server from the agent's cwd) |
+| `visual_reference {topic}` | none: the full `show_visual` API by topic (origin chat only) |
+| `wait_on_background` | `AwaitBackground` (origin chat on a runtime that wakes it) |
+| `plugins {action}` | list, status, elements, updates, create, install → `ListPlugins`, `PluginStatus`, `DescribeElements`, `CheckPluginUpdates`, `NewPlugin`, `InstallPlugin` |
+| `templates {action}` | list, status, app, create, use, delete, export, import → the engine's template methods |
+| `themes {action}` | list, get, create, update (`remove: ["light"]` drops a scheme), delete, use → the engine's theme methods |
+
+Every tool has a `title` and the four annotations (`readOnlyHint`,
+`destructiveHint`, `idempotentHint`, `openWorldHint`). Only
+`wait_on_background` carries `_meta["anthropic/alwaysLoad"]`: the guidance
+requires it at turn end, and Claude Code defers every other tool. Input
+schemas are compacted when listed (no `additionalProperties: true`,
+`$schema`, null type branches; const-tagged unions flattened). A call to a
+removed name (`create_chat`, `list_devices`, `create_theme`, …) fails with a
+message naming its replacement.
+
+Results are `structuredContent` with a compact JSON text copy. `catalog`,
+`list_chats`, `read_chat`, `create_chats`, `send_messages` and `wait_for_turn`
+declare an `outputSchema`. Where agents tend to poll, a result carries `next`
+(after an async create or send: collect with `wait_for_turn`, do not poll
+`read_chat`). Errors are `isError: true` with `{code, message}` in both
+`structuredContent` and text; codes are `invalid_arguments` (with a valid
+example call), `not_found` (with "Did you mean …" for chats), `ambiguous`,
+`rejected`, `engine_unavailable`, `unknown_tool`. `"me"` names the origin chat
+(`list_chats {parent: "me"}`). A `clientRequestId` on a create or send request
+returns the first result again on retry (per server connection) instead of a
+second write.
 
 Watch streams are the engine's only read surface (there is no one-shot "get
 transcript" RPC); a snapshot is "subscribe, take the first item, drop" — drop
 cancels server-side, exactly what the sidebar does on attach.
 
-`send_message` mode `auto` starts idle chats and steers working chats through
+`send_messages` mode `auto` starts idle chats and steers working chats through
 their live mailbox without interrupting tools or child processes. Providers
 consume it at their next supported input boundary. Only explicit `queue` mode
 creates a held queue row. `awaitingInput` refuses and points at
@@ -292,15 +345,15 @@ tool search) and answers "show me" with `![alt](/abs/path.png)`, the way its
 own app displays local files; the transcript draws such an image in place,
 from the chat's own folder only and never copied (see
 [image-preview.md](image-preview.md#images-in-agent-replies)). Nothing tells
-an agent about that: the tool description and server instructions name only
-`show_image`, and no harness prompt changes.
+an agent about that: the tool description and the guidance name only
+`show_image`.
 
 ## Selecting a host and project
 
-`list_projects {device?}` filters by device id or exact name; without arguments
-it lists all projects. `list_harnesses {device?}` and
-`list_models {harness, device?}` query the selected host with `targetDeviceId`;
-without `device` they retain the local engine catalogs.
+`catalog {kind: "projects", device?}` filters by device id or exact name;
+without `device` it lists all projects. `catalog {kind: "harnesses", device?}`
+and `catalog {kind: "models", harness, device?}` query the selected host with
+`targetDeviceId`; without `device` they read the local engine's catalogs.
 
 For creation, project alone determines the host. Device alone creates a session
 without a project on that device. With both, the project is resolved **within**
@@ -320,23 +373,22 @@ fallback to the local catalog. A successful remote query checks reachability;
 Discover and launch a standalone session:
 
 ```text
-list_devices {}
-list_projects { device: "<device-id>" }
-list_harnesses { device: "<device-id>" }
-list_models { device: "<device-id>", harness: "codex" }
-create_chat {
+catalog { kind: "devices" }
+catalog { kind: "projects", device: "<device-id>" }
+catalog { kind: "harnesses", device: "<device-id>" }
+catalog { kind: "models", device: "<device-id>", harness: "codex" }
+create_chats { requests: [{
   kind: "chat",
   device: "<device-id>",
   project: "<project-id>",
   harness: "codex",
   model: "<model-id from that host's catalog>",
   title: "Implement feature",
-  prompt: "Implement the feature...",
-  wait: false
-}
+  prompt: "Implement the feature..."
+}] }
 ```
 
-Without a project (the host uses its home directory unless `cwd` is given):
+One request without a project (the host uses its home directory unless `cwd` is given):
 
 ```json
 {"kind":"chat", "device":"<device-id>", "harness":"codex", "prompt":"Reply with pong", "wait":true}
@@ -367,20 +419,20 @@ transcript or missing response at the deadline returns `timedOut`.
 ## Delegating across providers
 
 The `zeron` server is injected into every real harness (table above), and
-`create_chat` takes any `harness`, so every provider agent can hand work to any
+`create_chats` takes any `harness`, so every provider agent can hand work to any
 other: Claude Code → Codex and the reverse, or to Cursor, OpenCode, and so on.
-`list_harnesses` marks each provider:
+`catalog {kind: "harnesses"}` marks each provider:
 
 - `available` — installed and enabled on this device.
 - `signedIn` — whether a login for it is present on the selected host
   (`ListAgentAccounts`), or `null` when that could not be determined.
 - `connected` — available and not known to be signed out. This is what a
-  delegating agent should choose from; `create_chat` without a `harness` also
+  delegating agent should choose from; a request without a `harness` also
   prefers a connected provider (claude-code first).
 
 `signedIn` is advisory: credential detection does not see every source (an API
 key in the environment, say), so only an explicit `false` counts against a
-provider. `create_chat` still creates the chat but returns a `warning` when the
+provider. `create_chats` still creates the chat but returns a `warning` when the
 chosen provider looks signed out, rather than refusing.
 
 ## Switching a chat's provider
@@ -418,28 +470,25 @@ one tool call, including when the harness executes its tool calls sequentially:
 }
 ```
 
-Use `send_messages` with the same envelope for existing chats; each item uses
-`send_message` arguments. Both accept 1–32 requests, run them concurrently,
-and return `results` in input order with `index`, `isError`, and either `result`
-or `error`. A failed request does not cancel or roll back successful requests.
-Each request defaults to `wait: false`; explicit waits also run concurrently.
-Only batch independent work, not ordered messages to the same chat.
-
-When using individual tools, launch **all** chats/messages with `wait: false`
-first, then collect replies with `wait_for_turn`. Waiting on each individual
-launch before issuing the next serializes work at the caller, even though
-both the MCP transport and engine support concurrent chat runs.
+Use `send_messages` with the same envelope for existing chats (`chat`, `text`,
+`mode?`, `wait?`). Both accept 1–32 requests, run them concurrently, and
+return `results` in input order, each `{index, ok: true, chatId, …}` or
+`{index, ok: false, error: {code, message}}`. A failed request does not cancel
+or roll back successful requests. Each request defaults to `wait: false`;
+explicit waits also run concurrently. Only batch independent work, not ordered
+messages to the same chat. Launch **all** work first, then collect replies
+with `wait_for_turn`.
 
 ## Smoke recipe
 
 ```sh
 BIN=target/debug/zeron
-{ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}'
+{ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}'
   echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_chats","arguments":{"limit":5}}}'
   sleep 5; } | ZERON_IPC_PORT=27655 ZERON_DATA_DIR=/path/to/that/engine/data $BIN mcp
 ```
 
-`create_chat` with `"prompt": "Reply with exactly the word pong", "wait": true`
+`create_chats` with one request `{"prompt": "Reply with exactly the word pong", "wait": true}`
 against a live daemon returns the assistant's `pong` in a few seconds; archive
 the chat afterwards with `archive_chat`. Unit tests (`cargo test -p zeron-mcp`)
 drive the whole tool set against an in-memory stub `RpcService`.
@@ -448,7 +497,7 @@ An isolated stdio instance is available with
 `cargo run -p zeron-engine --example mcp_standalone_smoke`. It provides a temporary
 project, an origin coordinator and a scripted `codex` adapter (`smoke-1`) returning
 `pong`. Discover its ids with the list tools, create `kind: "chat"` with a prompt
-and `wait: true`, then check `read_chat`, `send_message` and a mixed batch. The
+and `wait: true`, then check `read_chat`, `send_messages` and a mixed batch. The
 profile is removed on exit. This checks MCP dispatch and engine execution without
 changing your running app's sessions or requiring provider credentials.
 
@@ -456,3 +505,35 @@ The `mcp_standalone_session_executes_on_the_selected_device` test in
 `device_routing` additionally runs two engines with a shared registry and device
 relay, verifies execution on the selected host (and absence of execution on the
 caller), and retrieves responses through MCP.
+
+## Snapshot for evals
+
+The server answers `initialize` and `tools/list` with no engine running (the
+plugin-tool lookup fails fast and the static catalog goes out), so an eval
+harness can snapshot what agents see over stdio. Build the standalone binary
+once (it is the same server as `zeron mcp`):
+
+```sh
+cargo build -p zeron-mcp --bin zeron-mcp
+```
+
+Then, from the repo root:
+
+```sh
+{ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"eval","version":"0"}}}'
+  echo '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+  echo '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+  sleep 1; } | ZERON_IPC_PORT=1 ZERON_CHAT_ID=eval-chat ZERON_WAITS_ON_BACKGROUND=1 target/debug/zeron-mcp
+```
+
+- `ZERON_IPC_PORT=1` points at a closed port, so nothing reaches a running Zeron.
+- `ZERON_CHAT_ID` adds the in-chat tools (`show_visual`, `show_image`,
+  `visual_reference`); `ZERON_WAITS_ON_BACKGROUND=1` adds `wait_on_background`.
+- `ZERON_MCP_GUIDANCE=prompt` gives the one-line instructions a Claude, Codex
+  or OpenCode 1.x run sees; without it, `instructions` holds the full
+  guidance (what ACP agents see). `ZERON_SIDE_CHATS_ONLY=1` adds that section.
+
+`crates/mcp/scripts/measure.py [binary] [--json]` runs the same exchange and
+prints bytes per tool and totals. `crates/mcp/budget.json` is the checked-in
+budget the `budget` unit test holds the catalog and guidance to.
+
