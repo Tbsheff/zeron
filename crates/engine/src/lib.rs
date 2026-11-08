@@ -367,6 +367,7 @@ impl EngineCore {
                 workspace: workspace.clone(),
                 doc_host: doc_host.clone(),
                 files: workspace_files.clone(),
+                default_harness,
             };
             plugins.set_actor(move |_plugin, action, args| actions.act(action, args));
         }

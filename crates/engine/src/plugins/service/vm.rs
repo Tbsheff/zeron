@@ -317,6 +317,7 @@ struct State {
     /// `zeron.watch`es, by id.
     watches: RefCell<HashMap<u64, Watching>>,
     next_watch: Cell<u64>,
+    tool_call_chats: RefCell<HashMap<u64, String>>,
 }
 
 impl State {
@@ -357,7 +358,14 @@ impl State {
         out
     }
 
+    fn note_calling(&self, id: u64, kind: Kind, call: &Json) {
+        if let Some(chat) = call["chat"].as_str().filter(|_| kind == Kind::Tool) {
+            self.tool_call_chats.borrow_mut().insert(id, chat.to_owned());
+        }
+    }
+
     fn answer(&self, id: u64, reply: Reply) {
+        self.tool_call_chats.borrow_mut().remove(&id);
         if let Some(tx) = self.replies.borrow_mut().remove(&id) {
             self.status.in_flight.fetch_sub(1, Ordering::SeqCst);
             let _ = tx.send(reply);
@@ -401,6 +409,7 @@ fn run(
         status: status.clone(),
         watches: RefCell::default(),
         next_watch: Cell::new(1),
+        tool_call_chats: RefCell::default(),
     });
     let deadline: Rc<Cell<Option<Instant>>> = Rc::default();
     let (lua, entry) = match setup(&spec, &ops, &tx, &state, &deadline) {
@@ -485,6 +494,7 @@ fn run(
                 let id = state.next_reply.get();
                 state.next_reply.set(id + 1);
                 state.replies.borrow_mut().insert(id, reply);
+                state.note_calling(id, kind, &call);
                 let result = enter(&|| {
                     let args = to_lua(&lua, &args, 0)?;
                     let call = to_lua(&lua, &call, 0)?;
@@ -738,7 +748,13 @@ fn natives(
                 op_state.sleepers.borrow_mut().push(Reverse((at, id)));
                 return Ok(id);
             }
-            let args = to_json(&args, 0).map_err(mlua::Error::runtime)?;
+            let mut args = to_json(&args, 0).map_err(mlua::Error::runtime)?;
+            if kind == "chats.create"
+                && let Some(args) = args.as_object_mut()
+            {
+                let calling: Vec<String> = op_state.tool_call_chats.borrow().values().cloned().collect();
+                args.insert("calling".into(), calling.into());
+            }
             let tx = op_tx.clone();
             op_ops.start(
                 &kind,

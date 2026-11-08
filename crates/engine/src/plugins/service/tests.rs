@@ -616,3 +616,35 @@ async fn sends_and_creates_are_rate_limited_per_plugin() {
     assert!(after_restart.message.starts_with("rate limited"), "a new VM doesn't reset it: {after_restart:?}");
     assert_eq!(lock(&r.hooks.acted).len(), MAX_ACTS_PER_MINUTE + 1);
 }
+
+#[tokio::test]
+async fn a_create_names_the_agent_chats_whose_tool_calls_are_in_flight() {
+    let r = rig(Config::default());
+    let source = r#"
+local zeron = require("./zeron")("svc")
+zeron.tool { name = "start", run = function() return zeron.chats.create({}):await() end }
+zeron.serve("start", function() return zeron.chats.create({ calling = { "forged" } }):await() end)
+"#;
+    let plan = r.plan("1.0.0", source, &["service", "tools", "chats.create"]);
+    let call = json!({ "kind": "tool", "chat": "c-agent" });
+    let created = r
+        .services
+        .call(
+            &plan,
+            Kind::Tool,
+            "start",
+            json!({}),
+            call,
+            Duration::from_secs(10),
+        )
+        .await;
+    assert_eq!(created.unwrap(), json!("chat-new"));
+    r.ask(&plan, "start", json!({})).await.unwrap();
+    let acted = lock(&r.hooks.acted);
+    assert_eq!(acted[0].1["calling"], json!(["c-agent"]));
+    assert_eq!(
+        acted[1].1["calling"],
+        json!([]),
+        "a method call names none, and the plugin can't"
+    );
+}

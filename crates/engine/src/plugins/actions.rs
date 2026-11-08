@@ -4,8 +4,8 @@ use serde_json::{Value as Json, json};
 use zeron_doc::SessionCommandPayload;
 use zeron_proto::agent_messages::quote_headers;
 use zeron_proto::{
-    Chat, ChatConfig, HarnessId, ReadWorkspaceFileRequest, SandboxLevel, WorkspaceReadOnlyReason,
-    WorkspaceTarget,
+    AccessMode, Chat, ChatConfig, HarnessId, ReadWorkspaceFileRequest, SandboxLevel,
+    WorkspaceReadOnlyReason, WorkspaceTarget, cap_access,
 };
 
 use super::service::Acting;
@@ -13,6 +13,8 @@ use crate::workspace_files::WORKSPACE_FILE_RPC_TIMEOUT;
 use crate::{DocHost, WorkspaceFiles, WorkspaceHost};
 
 pub const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
+pub const PLUGIN_CHAT_ACCESS: (SandboxLevel, AccessMode) =
+    (SandboxLevel::WorkspaceWrite, AccessMode::Supervised);
 
 #[derive(Clone)]
 pub struct Actions {
@@ -20,6 +22,7 @@ pub struct Actions {
     pub workspace: WorkspaceHost,
     pub doc_host: DocHost,
     pub files: WorkspaceFiles,
+    pub default_harness: HarnessId,
 }
 
 impl Actions {
@@ -110,18 +113,19 @@ impl Actions {
         if model.is_some() && harness.is_none() {
             return Err("zeron.chats.create: a model needs its harness".into());
         }
-        let config = harness.map(|harness| ChatConfig {
-            harness,
+        let (sandbox, access) = self.capped_at_calling_chats(args)?;
+        let config = ChatConfig {
+            harness: harness.unwrap_or(self.default_harness),
             model: model.map(str::to_owned),
             reasoning: None,
             model_options: Default::default(),
-            sandbox: SandboxLevel::WorkspaceWrite,
-            access: Default::default(),
+            sandbox,
+            access,
             plan: false,
-        });
+        };
         let id = uuid::Uuid::new_v4().to_string();
         self.workspace
-            .create_chat_hosted(&id, project, device, None, config, None, None, None)
+            .create_chat_hosted(&id, project, device, None, Some(config), None, None, None)
             .map_err(failed)?;
         if let Some(title) = field(args, "title") {
             self.workspace.rename_chat(&id, title).map_err(failed)?;
@@ -130,6 +134,25 @@ impl Actions {
             self.queue(&id, prompt, "chats.create")?;
         }
         Ok(json!(id))
+    }
+
+    fn capped_at_calling_chats(&self, args: &Json) -> Result<(SandboxLevel, AccessMode), String> {
+        let mut most = PLUGIN_CHAT_ACCESS;
+        for calling in args["calling"].as_array().into_iter().flatten() {
+            let id = calling.as_str().unwrap_or_default();
+            let chat = self
+                .workspace
+                .chat(id)
+                .map_err(|e| format!("zeron.chats.create: {e}"))?;
+            let ceiling = match chat.map(|c| c.config) {
+                Some(Some(config)) => (config.sandbox, config.access),
+                Some(None) => (SandboxLevel::WorkspaceWrite, AccessMode::FullAccess),
+                None => (SandboxLevel::ReadOnly, AccessMode::Supervised),
+            };
+            let (sandbox, access, _) = cap_access(most, ceiling);
+            most = (sandbox, access);
+        }
+        Ok(most)
     }
 
     async fn read(&self, args: &Json) -> Result<Json, String> {

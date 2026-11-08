@@ -2355,10 +2355,11 @@ impl Plugins {
         // Its service answers it, window or not; a tool it doesn't serve
         // goes to the window.
         if let Some(plan) = self.entry(&plugin).as_ref().and_then(service_plan) {
+            let chat = agents_own_chat_or(p.chat_id.clone());
             let call = serde_json::json!({
                 "kind": "tool",
                 "from": self.here(),
-                "chat": p.chat_id,
+                "chat": chat,
             });
             match self
                 .inner
@@ -2539,6 +2540,13 @@ impl Plugins {
 
 /// What `entry`'s service runs as, while it may run here: on, allowed
 /// `service`, with a service and a snapshot.
+fn agents_own_chat_or(named: Option<String>) -> Option<String> {
+    match zeron_rpc::caller() {
+        zeron_rpc::Caller::Agent { chat } => chat,
+        _ => named,
+    }
+}
+
 fn service_plan(entry: &Entry) -> Option<Plan> {
     let item = &entry.item;
     let file = item.service.clone()?;

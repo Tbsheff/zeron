@@ -10,8 +10,8 @@ use serde_json::{Value as Json, json};
 use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionCommandPayload};
 use zeron_harness::{Harness, HarnessError, RunControls};
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    SteeringMode,
+    AccessMode, AgentEvent, ChatConfig, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest,
+    SandboxLevel, SteeringMode,
 };
 use zeron_rpc::{RpcReply, methods};
 
@@ -19,7 +19,12 @@ use super::{Actions, MAX_READ_BYTES};
 use crate::plugins::{MANIFEST_FILE, Plugins, authority_tests, scaffold};
 use crate::{EngineCore, HarnessRegistry};
 
-struct Agent;
+type Seen = Arc<std::sync::Mutex<Vec<(String, SandboxLevel, AccessMode)>>>;
+
+#[derive(Default)]
+struct Agent {
+    seen: Seen,
+}
 
 #[async_trait]
 impl Harness for Agent {
@@ -46,6 +51,10 @@ impl Harness for Agent {
         request: RunRequest,
         _controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((request.prompt.clone(), request.sandbox, request.access));
         let fails = request.prompt == "fail";
         let events: Vec<Result<AgentEvent, HarnessError>> = vec![
             Ok(AgentEvent::SessionStarted {
@@ -77,6 +86,7 @@ impl Harness for Agent {
 struct Rig {
     _dir: tempfile::TempDir,
     core: EngineCore,
+    seen: Seen,
 }
 
 impl Rig {
@@ -86,6 +96,7 @@ impl Rig {
             workspace: self.core.workspace.clone(),
             doc_host: self.core.doc_host.clone(),
             files: self.core.workspace_files.clone(),
+            default_harness: HarnessId::Mock,
         }
     }
 
@@ -174,7 +185,9 @@ impl Rig {
 fn rig() -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let registry = HarnessRegistry::new();
-    registry.register(Arc::new(Agent));
+    let agent = Agent::default();
+    let seen = agent.seen.clone();
+    registry.register(Arc::new(agent));
     let core = EngineCore::assemble(
         &dir.path().join("data"),
         Arc::new(registry),
@@ -182,7 +195,11 @@ fn rig() -> Rig {
         None,
     )
     .unwrap();
-    Rig { _dir: dir, core }
+    Rig {
+        _dir: dir,
+        core,
+        seen,
+    }
 }
 
 async fn until(what: &str, check: impl Fn() -> bool) {
@@ -372,6 +389,139 @@ async fn create_returns_an_id_and_a_send_reaches_the_agent() {
         (config.harness, config.model.as_deref()),
         (HarnessId::Mock, Some("mock-1"))
     );
+    r.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plugins_chat_is_supervised_and_never_above_its_calling_chat() {
+    let r = rig();
+    let config = |id: &Json| {
+        let config = r
+            .core
+            .workspace
+            .chat(id.as_str().unwrap())
+            .unwrap()
+            .unwrap()
+            .config;
+        let config = config.expect("a plugin's chat has a config");
+        (config.harness, config.sandbox, config.access)
+    };
+    let plain = r
+        .act("chats.create", json!({ "prompt": "hello" }))
+        .await
+        .unwrap();
+    assert_eq!(
+        config(&plain),
+        (
+            HarnessId::Mock,
+            SandboxLevel::WorkspaceWrite,
+            AccessMode::Supervised
+        )
+    );
+    until("the prompt ran", || !r.seen.lock().unwrap().is_empty()).await;
+    assert_eq!(
+        r.seen.lock().unwrap()[0],
+        (
+            "hello".to_owned(),
+            SandboxLevel::WorkspaceWrite,
+            AccessMode::Supervised
+        ),
+        "the agent runs it supervised"
+    );
+    let named = r
+        .act("chats.create", json!({ "harness": "mock" }))
+        .await
+        .unwrap();
+    assert_eq!(config(&named).2, AccessMode::Supervised);
+
+    let set = |id: &str, sandbox, access| {
+        let config = ChatConfig {
+            harness: HarnessId::Mock,
+            model: None,
+            reasoning: None,
+            model_options: Default::default(),
+            sandbox,
+            access,
+            plan: false,
+        };
+        r.core
+            .workspace
+            .create_chat_hosted(
+                id,
+                None,
+                Some(&r.core.device_id),
+                None,
+                Some(config),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+    };
+    set("careful", SandboxLevel::ReadOnly, AccessMode::Supervised);
+    set(
+        "bold",
+        SandboxLevel::DangerFullAccess,
+        AccessMode::FullAccess,
+    );
+    let from = |calling: Json| r.act("chats.create", json!({ "calling": calling }));
+    let capped = from(json!(["careful"])).await.unwrap();
+    assert_eq!(config(&capped).1, SandboxLevel::ReadOnly);
+    let unknown = from(json!(["nowhere"])).await.unwrap();
+    assert_eq!(
+        (config(&unknown).1, config(&unknown).2),
+        (SandboxLevel::ReadOnly, AccessMode::Supervised)
+    );
+    let raised = from(json!(["bold"])).await.unwrap();
+    assert_eq!(
+        (config(&raised).1, config(&raised).2),
+        (SandboxLevel::WorkspaceWrite, AccessMode::Supervised),
+        "a full-access caller doesn't raise it"
+    );
+    let both = from(json!(["bold", "careful"])).await.unwrap();
+    assert_eq!(config(&both).1, SandboxLevel::ReadOnly, "the least of them");
+
+    let plugins = &r.core.plugins;
+    let dir = plugins.plugins_dir().join("spawner");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(MANIFEST_FILE),
+        json!({ "id": "spawner", "name": "Spawner", "version": "1.0.0", "entry": "init.luau",
+            "service": "service.luau", "permissions": ["service", "tools", "chats.create"],
+            "tools": [{ "name": "spawn", "description": "Starts a chat.", "input": { "type": "object" } }] })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(dir.join("init.luau"), "").unwrap();
+    std::fs::write(dir.join("zeron.luau"), scaffold::SDK).unwrap();
+    std::fs::write(
+        dir.join("service.luau"),
+        "local zeron = require(\"./zeron\")(\"spawner\")\nzeron.tool { name = \"spawn\", run = function() return zeron.chats.create({}):await() end }\n",
+    )
+    .unwrap();
+    let signed = call(plugins, methods::SIGN_PLUGIN, json!({ "id": "spawner" })).await;
+    let decided = call(
+        plugins,
+        methods::DECIDE_PLUGIN,
+        json!({ "id": "spawner", "allow": true, "hash": signed["hash"] }),
+    )
+    .await;
+    assert_eq!(decided["status"], "on", "{decided}");
+    let agent = zeron_rpc::Caller::Agent {
+        chat: Some("careful".into()),
+    };
+    let reply = zeron_rpc::with_caller(
+        agent,
+        plugins.dispatch(
+            methods::CALL_PLUGIN_TOOL,
+            json!({ "mcp_name": "spawner__spawn", "args": {}, "chatId": "bold" }),
+        ),
+    )
+    .await;
+    let Ok(RpcReply::Value(reply)) = reply else {
+        panic!("the tool call failed")
+    };
+    assert_eq!(config(&reply["value"]).1, SandboxLevel::ReadOnly, "{reply}");
     r.core.shutdown().await;
 }
 

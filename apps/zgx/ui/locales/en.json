@@ -3172,7 +3172,7 @@
         },
         "chats_create": {
           "title": "Start new chats",
-          "detail": "Its chats run your agents with their usual access, and can start with a message of its own."
+          "detail": "Its chats start supervised: your agents ask before commands and file changes. A chat can start with a message of its own."
         },
         "panel_tabs": {
           "title": "Open tabs in your chats' panels"
