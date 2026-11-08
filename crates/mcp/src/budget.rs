@@ -99,10 +99,8 @@ fn grew(path: &str, now: &Value, budget: &Value, out: &mut Vec<String>) {
                 }
             }
         }
-        (Value::Number(now), Value::Number(limit)) => {
-            if now.as_u64() > limit.as_u64() {
-                out.push(format!("{path}: {now} > budget {limit}"));
-            }
+        (Value::Number(now), Value::Number(limit)) if now.as_u64() > limit.as_u64() => {
+            out.push(format!("{path}: {now} > budget {limit}"));
         }
         _ => {}
     }
