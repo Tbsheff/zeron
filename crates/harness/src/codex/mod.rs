@@ -163,6 +163,15 @@ fn codex_mcp_overrides(mcp: &zeron_proto::McpServer) -> Vec<(String, Value)> {
     ]
 }
 
+fn additional_context(mcp: &zeron_proto::McpServer) -> Value {
+    Value::Object(
+        mcp.codex_guidance()
+            .into_iter()
+            .map(|(key, value)| (key, json!({ "kind": "application", "value": value })))
+            .collect(),
+    )
+}
+
 /// Dotted `thread/start` config overrides for the plugins' native MCP
 /// servers ([`RunRequest::extra_mcp`]). Unlike Zeron's own server they get no
 /// `default_tools_approval_mode`: their tools are a plugin's, so Codex asks
@@ -1415,7 +1424,7 @@ async fn run_session(session: Session) {
                 .or_insert_with(|| json!({}))
                 .as_object_mut()
                 .expect("thread/start config overrides are an object");
-            overrides.extend(codex_mcp_overrides(mcp));
+            overrides.extend(codex_mcp_overrides(&mcp.with_guidance_in_prompt()));
             // Delegation goes through that server's side chats only. The
             // engine doesn't ask this of Codex yet: see
             // `crate::switches_native_subagents`.
@@ -1677,10 +1686,18 @@ async fn run_session(session: Session) {
     // every turn names its mode so that leaving plan is explicit; a thread
     // that never planned is sent none, as before modes.
     let mut names_mode = thread_mode.plan;
+    let guidance = request
+        .mcp
+        .as_ref()
+        .filter(|_| !title_only)
+        .map(additional_context);
     let mut turn_params = |live: &RunRequest, text: &str| -> Value {
         let mut p = serde_json::Map::new();
         p.insert("threadId".into(), Value::String(thread_id.clone()));
         p.insert("input".into(), prompt_input(text));
+        if let Some(guidance) = &guidance {
+            p.insert("additionalContext".into(), guidance.clone());
+        }
         let (approval_policy, sandbox) = permissions(run_access(live), title_only);
         p.insert("approvalPolicy".into(), approval_policy.into());
         p.insert("sandboxPolicy".into(), sandbox_policy_value(sandbox));
@@ -3403,6 +3420,43 @@ mod tests {
 #[cfg(test)]
 mod mcp_injection_tests {
     use super::*;
+
+    #[test]
+    fn additional_context_carries_the_zeron_guidance_in_ordered_entries_under_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugins = dir.path().join("chat.md");
+        std::fs::write(&plugins, format!("## Plugins\n\n{}", "word ".repeat(1_500))).unwrap();
+        let mcp = zeron_proto::McpServer {
+            name: "zeron".into(),
+            command: "zeron".into(),
+            args: vec!["mcp".into()],
+            env: [
+                (zeron_proto::McpServer::CHAT_ID_ENV.to_owned(), "c1".to_owned()),
+                (
+                    zeron_proto::McpServer::PLUGIN_INSTRUCTIONS_ENV.to_owned(),
+                    plugins.display().to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let context = additional_context(&mcp);
+        let entries = context.as_object().unwrap();
+        let keys: Vec<&String> = entries.keys().collect();
+        assert_eq!(keys[0], "zeron_01");
+        assert!(keys.windows(2).all(|w| w[0] < w[1]), "{keys:?}");
+        for (key, entry) in entries {
+            assert_eq!(entry["kind"], "application", "{key}");
+            assert!(entry["value"].as_str().unwrap().len() < 4_000, "{key}");
+        }
+        let all: String = entries.values().map(|e| e["value"].as_str().unwrap()).collect();
+        assert!(all.contains("Ordinary coding tasks need no Zeron tools."));
+        assert!(all.contains("`show_visual`") && all.contains("## Plugins"));
+        assert!(!all.contains("wait_on_background"));
+        let overrides = codex_mcp_overrides(&mcp.with_guidance_in_prompt());
+        let env = overrides.iter().find(|(k, _)| k.ends_with(".env")).unwrap();
+        assert_eq!(env.1[zeron_proto::McpServer::GUIDANCE_ENV], "prompt");
+    }
 
     #[test]
     fn codex_mcp_overrides_use_the_dotted_mcp_servers_keys() {

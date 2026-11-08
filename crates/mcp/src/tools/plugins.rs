@@ -169,7 +169,16 @@ pub(super) const PLUGINS: &str = "plugins";
 pub(super) const TEMPLATES: &str = "templates";
 pub(super) const NAMES: [&str; 2] = [PLUGINS, TEMPLATES];
 const PLUGIN_ACTIONS: [&str; 6] = ["list", "status", "elements", "updates", "create", "install"];
-const TEMPLATE_ACTIONS: [&str; 8] = ["list", "status", "app", "create", "use", "delete", "export", "import"];
+const TEMPLATE_ACTIONS: [&str; 8] = [
+    LIST_TEMPLATES,
+    TEMPLATE_STATUS,
+    DESCRIBE_APP,
+    CREATE_TEMPLATE,
+    USE_TEMPLATE,
+    DELETE_TEMPLATE,
+    EXPORT_TEMPLATE,
+    "import",
+];
 
 const PLUGINS_DESCRIPTION: &str = "\
 Zeron plugins on this device. action list. status {id, snapshot?}: where its UI landed (places, \

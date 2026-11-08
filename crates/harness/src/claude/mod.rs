@@ -86,17 +86,6 @@ use wire::{
     deny_response,
 };
 
-/// Appended to a chat's system prompt (where Zeron's server offers
-/// `wait_on_background`: [`McpServer::waits_on_background`]): the text Sonnet and Opus were live-probed acting
-/// on. The CLI starts a turn of its own when a background task ends, so a
-/// turn that ends on one isn't the agent's last.
-const WAIT_ON_BACKGROUND_NOTE: &str = "\
-When you start background work you will come back to once it finishes (a test run, a build, a \
-long check) and you end your turn before it finishes, call the Zeron tool wait_on_background \
-with its task id first, so the person sees this chat waiting rather than finished. Never for work \
-you leave running on purpose (a dev server, a watcher). Zeron tools may be deferred: load it \
-with tool search first.";
-
 /// Locate the device's installed Claude Code CLI: our own PATH, then the
 /// login-shell PATH snapshot (the user's shell init shapes PATH in ways a
 /// GUI/service launch never sees — see [`crate::shell_env`]), then known
@@ -527,19 +516,17 @@ impl ClaudeHarness {
             // Zeron's own server (and the plugins' native ones) ride beside
             // the user's configured servers (no `--strict-mcp-config`): the
             // CLI merges an inline JSON config with settings-sourced ones.
-            let zeron = request.mcp.as_ref().map(McpServer::without_plugin_context);
+            let zeron = request
+                .mcp
+                .as_ref()
+                .map(|mcp| mcp.without_plugin_context().with_guidance_in_prompt());
             if let Some(config) = mcp_servers_config_arg(zeron.as_ref(), &request.extra_mcp) {
                 cmd.args(["--mcp-config", &config]);
             }
             cmd.args(plugin_context_args(request.mcp.as_ref()));
-            // When to say it waits on background work (the Zeron tool
-            // `wait_on_background`), where that tool is offered. Its own
-            // description and the server's instructions say so too, but
-            // neither reaches the model before it decides to end a turn:
-            // live-probed on 2.1.319, Sonnet never called it with those
-            // alone, and Sonnet and Opus both did with this note.
-            if request.mcp.as_ref().is_some_and(McpServer::waits_on_background) {
-                cmd.args(["--append-system-prompt", WAIT_ON_BACKGROUND_NOTE]);
+            if let Some(mcp) = request.mcp.as_ref() {
+                let guidance = zeron_proto::agent_guidance::text(mcp.guidance_features());
+                cmd.args(["--append-system-prompt", &guidance]);
             }
             // Delegation goes through that server's side chats only. A bare
             // tool name "removes the matching tools from Claude's context"
@@ -2321,7 +2308,7 @@ mod tests {
     }
 
     #[test]
-    fn a_chats_run_is_told_when_to_say_it_waits_and_nothing_else_is() {
+    fn a_run_gets_the_zeron_guidance_its_features_need_in_the_system_prompt() {
         let appended = |mcp: Option<McpServer>| {
             let request = RunRequest {
                 mcp,
@@ -2358,15 +2345,15 @@ mod tests {
             env: env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
         };
         let waits = (McpServer::WAITS_ON_BACKGROUND_ENV, "1");
-        assert_eq!(
-            appended(Some(server(&[(McpServer::CHAT_ID_ENV, "c1"), waits]))).as_deref(),
-            Some(WAIT_ON_BACKGROUND_NOTE)
-        );
-        // The tool not offered (no chat's server, or not one that waits):
-        // nothing is said of it.
-        assert_eq!(appended(Some(server(&[(McpServer::CHAT_ID_ENV, "c1")]))), None);
-        assert_eq!(appended(Some(server(&[waits]))), None);
-        assert_eq!(appended(Some(server(&[]))), None);
+        let chat = (McpServer::CHAT_ID_ENV, "c1");
+        let full = appended(Some(server(&[chat, waits]))).unwrap();
+        assert!(full.contains("Ordinary coding tasks need no Zeron tools."), "{full}");
+        assert!(full.contains("call the Zeron tool `wait_on_background`"), "{full}");
+        assert!(full.contains("`show_visual`"), "{full}");
+        let in_chat = appended(Some(server(&[chat]))).unwrap();
+        assert!(!in_chat.contains("wait_on_background") && in_chat.contains("`show_visual`"));
+        let bare = appended(Some(server(&[waits]))).unwrap();
+        assert!(!bare.contains("wait_on_background") && !bare.contains("show_visual"));
         assert_eq!(appended(None), None);
     }
 }
@@ -2712,6 +2699,7 @@ mod mcp_injection_tests {
         let config: Value = serde_json::from_str(after("--mcp-config")[0]).unwrap();
         let env = &config["mcpServers"]["zeron"]["env"];
         assert_eq!(env[McpServer::CHAT_ID_ENV], "c1");
+        assert_eq!(env[McpServer::GUIDANCE_ENV], "prompt", "{env}");
         assert!(
             env.get(McpServer::PLUGIN_INSTRUCTIONS_ENV).is_none(),
             "{env}"

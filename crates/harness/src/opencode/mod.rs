@@ -2265,6 +2265,10 @@ async fn run_session(session: Session) {
     // The live prompt's delivery: a stop or interrupt cancels it, so a
     // retry can never post the stopped prompt again.
     let mut delivery = tokio_util::sync::CancellationToken::new();
+    let system_guidance = request
+        .mcp
+        .as_ref()
+        .map(zeron_proto::McpServer::system_guidance);
     let first_post = post_prompt(
         &server,
         &session_id,
@@ -2279,6 +2283,7 @@ async fn run_session(session: Session) {
             model: model.as_ref(),
             variant: variant.as_deref(),
             plan,
+            system: system_guidance.as_deref(),
             attachments: &request.attachments,
         },
     )
@@ -2428,6 +2433,7 @@ async fn run_session(session: Session) {
                             model: model.as_ref(),
                             variant: variant.as_deref(),
                             plan,
+                            system: system_guidance.as_deref(),
                             attachments: &attachments,
                         },
                     )
@@ -2837,6 +2843,7 @@ async fn run_session(session: Session) {
                                         model: model.as_ref(),
                                         variant: variant.as_deref(),
                                         plan,
+                                        system: system_guidance.as_deref(),
                                         attachments: &steer.attachments,
                                     },
                                 )
@@ -3352,6 +3359,7 @@ struct TurnSpec<'a> {
     /// Plan mode: 1.x names the plan agent on the prompt or command (2.x
     /// set it on the session).
     plan: bool,
+    system: Option<&'a str>,
     attachments: &'a [String],
 }
 
@@ -3403,6 +3411,7 @@ async fn post_prompt(
         model,
         variant,
         plan,
+        system,
         attachments,
     } = spec;
     let protocol = server.protocol().await;
@@ -3481,6 +3490,9 @@ async fn post_prompt(
     };
     if let Some(agent) = agent {
         body["agent"] = json!(agent);
+    }
+    if let Some(system) = system.filter(|_| protocol == Protocol::V1) {
+        body["system"] = json!(system);
     }
     let server = server.handle();
     let session_id = session_id.to_owned();
@@ -5810,7 +5822,11 @@ fn mcp_configs(
     protocol: Protocol,
 ) -> Result<Option<String>, HarnessError> {
     let mut inline = inherited;
-    for server in mcp.into_iter().chain(extras) {
+    let zeron = mcp.map(|mcp| match protocol {
+        Protocol::V1 => mcp.with_guidance_in_prompt(),
+        Protocol::V2 => mcp.clone(),
+    });
+    for server in zeron.iter().chain(extras) {
         inline = Some(mcp_config(inline.as_deref(), server, protocol)?);
     }
     Ok(inline)
