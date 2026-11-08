@@ -23,8 +23,10 @@ fn sections() -> impl Iterator<Item = (&'static str, &'static str)> {
 
 pub fn check_error_with_hint(message: &str) -> String {
     let topic = topic_for_error(message);
+    let message = message.trim_end();
+    let stop = if message.ends_with(['.', '!', '?']) { "" } else { "." };
     format!(
-        "{message} Fix the line and call show_visual again. Props for this: visual_reference {{\"topic\":\"{topic}\"}} (or the zeron:visuals skill)."
+        "{message}{stop} Fix the line and call show_visual again. Props for this: visual_reference {{\"topic\":\"{topic}\"}} (or the zeron:visuals skill)."
     )
 }
 
@@ -128,7 +130,7 @@ mod tests {
     #[test]
     fn errors_map_to_the_topic_that_documents_the_prop_or_node() {
         let cases = [
-            ("ui.text 'grow' must be true or false, not a number", "layout"),
+            ("ui.text 'grow' must be true or false (got integer)", "layout"),
             ("after switching 'Runs': ui.text has no 'grow'", "layout"),
             ("ui.row has no 'padding': visuals have no containers", "style"),
             ("ui.chart needs series = { { name = ..., values = { ... } } }", "data"),
@@ -141,6 +143,13 @@ mod tests {
         for (message, topic) in cases {
             assert_eq!(topic_for_error(message), topic, "{message}");
         }
+    }
+
+    #[test]
+    fn the_hint_ends_the_error_sentence_and_names_the_topic() {
+        let hint = check_error_with_hint("ui.text 'grow' must be true or false (got integer)");
+        assert!(hint.starts_with("ui.text 'grow' must be true or false (got integer). Fix the line"), "{hint}");
+        assert!(hint.contains(r#"visual_reference {"topic":"layout"}"#), "{hint}");
     }
 
     #[test]

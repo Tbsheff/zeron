@@ -963,7 +963,7 @@ impl Props<'_> {
             Value::Nil => Ok(None),
             Value::Boolean(b) => Ok(Some(b)),
             other => Err(self.error(&format!(
-                "'{name}' must be true or false, not a {}",
+                "'{name}' must be true or false (got {})",
                 other.type_name()
             ))),
         }
