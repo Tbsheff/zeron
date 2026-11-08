@@ -35,7 +35,7 @@ pub const CORE: Section = Section {
 Ordinary coding tasks need no Zeron tools. Zeron runs agent chats on the person's devices; its tools (server `zeron`) load on demand, so search for them by name.
 
 - Parallel work: `create_chats` (1-32 chats, a prompt each, all start at once).
-- Message chats that exist: `send_messages`. Collect a reply: `wait_for_turn`.
+- Message other Zeron chats that exist: `message_chats`. Collect a reply: `wait_for_turn`.
 - Status or transcript: `read_chat`. Find chats: `list_chats`. Devices, projects, harnesses, models: `catalog`.
 - Chat asks a question: `respond_to_input`. Stop it: `interrupt_chat`. Tidy up: `archive_chat`.
 - Zeron plugins, templates, themes: `plugins`, `templates`, `themes`.

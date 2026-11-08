@@ -5,10 +5,10 @@
     "create_chats": 383,
     "interrupt_chat": 80,
     "list_chats": 217,
+    "message_chats": 373,
     "plugins": 476,
     "read_chat": 237,
     "respond_to_input": 180,
-    "send_messages": 361,
     "show_image": 274,
     "show_visual": 2443,
     "templates": 441,
@@ -18,25 +18,25 @@
     "wait_on_background": 393
   },
   "instructions": {
-    "claudeSystemPrompt": 1809,
-    "codexLargestEntry": 1041,
-    "codexTotal": 1441,
-    "core": 1041,
-    "mcpFallback": 2011,
+    "claudeSystemPrompt": 1821,
+    "codexLargestEntry": 1053,
+    "codexTotal": 1453,
+    "core": 1053,
+    "mcpFallback": 2023,
     "mcpInstructionsChars": 200,
-    "opencodeSystem": 1445
+    "opencodeSystem": 1457
   },
-  "opencodeUpfront": 12618,
+  "opencodeUpfront": 12642,
   "tools": {
     "archive_chat": 286,
     "catalog": 470,
     "create_chats": 1421,
     "interrupt_chat": 232,
     "list_chats": 430,
+    "message_chats": 849,
     "plugins": 1004,
     "read_chat": 522,
     "respond_to_input": 555,
-    "send_messages": 837,
     "show_image": 371,
     "show_visual": 2747,
     "templates": 741,
@@ -46,10 +46,10 @@
     "wait_on_background": 587
   },
   "totals": {
-    "descriptions": 6726,
+    "descriptions": 6738,
     "inputSchemas": 4828,
     "outputSchemas": 1428,
     "toolCount": 16,
-    "tools": 11949
+    "tools": 11961
   }
 }

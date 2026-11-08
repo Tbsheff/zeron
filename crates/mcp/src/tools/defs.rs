@@ -6,7 +6,7 @@ pub(super) const CATALOG: &str = "catalog";
 pub(super) const LIST_CHATS: &str = "list_chats";
 pub(super) const READ_CHAT: &str = "read_chat";
 pub(super) const CREATE_CHATS: &str = "create_chats";
-pub(super) const SEND_MESSAGES: &str = "send_messages";
+pub(super) const MESSAGE_CHATS: &str = "message_chats";
 pub(super) const WAIT_FOR_TURN: &str = "wait_for_turn";
 pub(super) const INTERRUPT_CHAT: &str = "interrupt_chat";
 pub(super) const ARCHIVE_CHAT: &str = "archive_chat";
@@ -71,13 +71,13 @@ const LIST_CHATS_DESCRIPTION: &str = "List chats, newest activity first: id, tit
 
 const READ_CHAT_DESCRIPTION: &str = "A chat's status and newest messages (tool calls one line each), plus pendingInput when it asks a question. Read-only. Default 20 messages; limit 0: status only; offset pages back. To wait for a reply, use wait_for_turn; do not poll this.";
 
-const CREATE_CHATS_DESCRIPTION: &str = "Start 1-32 chats at once, a prompt each; they run in parallel. No kind: a subagent of your chat. No harness: a connected one, claude-code first. No wait: returns at once; collect replies with wait_for_turn. Results keep request order; one failure undoes nothing. Subagents cannot create chats. A repeated clientRequestId returns the first result. For chats that exist: send_messages.";
+const CREATE_CHATS_DESCRIPTION: &str = "Start 1-32 chats at once, a prompt each; they run in parallel. No kind: a subagent of your chat. No harness: a connected one, claude-code first. No wait: returns at once; collect replies with wait_for_turn. Results keep request order; one failure undoes nothing. Subagents cannot create chats. A repeated clientRequestId returns the first result. For chats that exist: message_chats.";
 
-const SEND_MESSAGES_DESCRIPTION: &str = "Send 1-32 messages to chats that exist, at once, from your chat. No mode: auto (starts an idle chat, steers a busy one); queue holds it. No wait: returns at once; collect with wait_for_turn. Results keep request order. A repeated clientRequestId returns the first result. Not for a chat awaiting input (respond_to_input), nor two dependent messages to one chat.";
+const MESSAGE_CHATS_DESCRIPTION: &str = "Message other Zeron chats that exist: 1-32 messages at once, from your chat. No mode: auto (starts an idle chat, steers a busy one); queue holds it. No wait: returns at once; collect with wait_for_turn. Results keep request order. A repeated clientRequestId returns the first result. Not for a chat awaiting input (respond_to_input), nor two dependent messages to one chat.";
 
-const WAIT_FOR_TURN_DESCRIPTION: &str = "Block until a chat's turn ends (completed, awaitingInput, interrupted, errored, timedOut) and return its new replies. After create_chats or send_messages it waits for that turn. Read-only. Default 600 s, max 3600. On awaitingInput, use respond_to_input. Stale or offline is not done.";
+const WAIT_FOR_TURN_DESCRIPTION: &str = "Block until a chat's turn ends (completed, awaitingInput, interrupted, errored, timedOut) and return its new replies. After create_chats or message_chats it waits for that turn. Read-only. Default 600 s, max 3600. On awaitingInput, use respond_to_input. Stale or offline is not done.";
 
-const INTERRUPT_CHAT_DESCRIPTION: &str = "Stop a chat's running turn. The chat stays; message it later with send_messages.";
+const INTERRUPT_CHAT_DESCRIPTION: &str = "Stop a chat's running turn. The chat stays; message it later with message_chats.";
 
 const ARCHIVE_CHAT_DESCRIPTION: &str = "Hide a chat from the sidebar; archived false restores it. Use it to tidy chats you created. Deletes nothing.";
 
@@ -186,9 +186,9 @@ pub(super) fn catalog() -> Vec<ToolDef> {
             example: r#"{"requests":[{"title":"Docs","prompt":"Update docs/api.md for the new flag."},{"title":"Tests","prompt":"Add tests for the new flag."}]}"#,
         },
         ToolDef {
-            name: SEND_MESSAGES,
-            title: "Send messages",
-            description: SEND_MESSAGES_DESCRIPTION,
+            name: MESSAGE_CHATS,
+            title: "Message chats",
+            description: MESSAGE_CHATS_DESCRIPTION,
             input_schema: batch(json!({
                 "type": "object",
                 "properties": {

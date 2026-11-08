@@ -57,7 +57,7 @@ its command line (`--mcp-config <inline json>`), which other local users can
 read with `ps`. A client run against a different data dir (e.g. a viewport on
 a daemon's port) sets `ZERON_IPC_TOKEN_FILE` to the daemon's file.
 
-When `ZERON_CHAT_ID` is set, every message `send_messages` sends is prefixed with a
+When `ZERON_CHAT_ID` is set, every message `message_chats` sends is prefixed with a
 `[Message from Zeron chat <title> (<id8>) …]` line so the receiving agent and the
 human reading that transcript can tell an agent-to-agent message from a typed
 one, and the server refuses to message its own chat. The transcript renders
@@ -193,7 +193,7 @@ name (default: the local engine's device).
 | `list_chats` | `WatchChats` + `WatchSessions` snapshots (status merged) |
 | `read_chat` | above + `WatchDocMessages` opening frame: chat summary, `pendingInput`, newest messages (`limit: 0` is status only) |
 | `create_chats` | 1–32 × `Mutate createChat` (+ `renameChat`; optional first send), concurrent |
-| `send_messages` | 1–32 × `QueueCommand` Run / Steer, or `QueueMessage`, concurrent |
+| `message_chats` | 1–32 × `QueueCommand` Run / Steer, or `QueueMessage`, concurrent |
 | `wait_for_turn` | `WatchSessions` until the chat settles |
 | `interrupt_chat` | `QueueCommand` Interrupt |
 | `respond_to_input` | `QueueCommand` RespondInput |
@@ -212,11 +212,13 @@ Every tool has a `title` and the four annotations (`readOnlyHint`,
 requires it at turn end, and Claude Code defers every other tool. Input
 schemas are compacted when listed (no `additionalProperties: true`,
 `$schema`, null type branches; const-tagged unions flattened). A call to a
-removed name (`create_chat`, `list_devices`, `create_theme`, …) fails with a
-message naming its replacement.
+removed name (`create_chat`, `send_messages`, `list_devices`, `create_theme`,
+…) fails with a message naming its replacement. `message_chats` is not called
+`send_messages` because Claude Code has a built-in `SendMessage` tool for its
+own teammates, and Sonnet picked it over the Zeron tool in evals.
 
 Results are `structuredContent` with a compact JSON text copy. `catalog`,
-`list_chats`, `read_chat`, `create_chats`, `send_messages` and `wait_for_turn`
+`list_chats`, `read_chat`, `create_chats`, `message_chats` and `wait_for_turn`
 declare an `outputSchema`. Where agents tend to poll, a result carries `next`
 (after an async create or send: collect with `wait_for_turn`, do not poll
 `read_chat`). Errors are `isError: true` with `{code, message}` in both
@@ -231,7 +233,7 @@ Watch streams are the engine's only read surface (there is no one-shot "get
 transcript" RPC); a snapshot is "subscribe, take the first item, drop" — drop
 cancels server-side, exactly what the sidebar does on attach.
 
-`send_messages` mode `auto` starts idle chats and steers working chats through
+`message_chats` mode `auto` starts idle chats and steers working chats through
 their live mailbox without interrupting tools or child processes. Providers
 consume it at their next supported input boundary. Only explicit `queue` mode
 creates a held queue row. `awaitingInput` refuses and points at
@@ -470,7 +472,7 @@ one tool call, including when the harness executes its tool calls sequentially:
 }
 ```
 
-Use `send_messages` with the same envelope for existing chats (`chat`, `text`,
+Use `message_chats` with the same envelope for existing chats (`chat`, `text`,
 `mode?`, `wait?`). Both accept 1–32 requests, run them concurrently, and
 return `results` in input order, each `{index, ok: true, chatId, …}` or
 `{index, ok: false, error: {code, message}}`. A failed request does not cancel
@@ -497,7 +499,7 @@ An isolated stdio instance is available with
 `cargo run -p zeron-engine --example mcp_standalone_smoke`. It provides a temporary
 project, an origin coordinator and a scripted `codex` adapter (`smoke-1`) returning
 `pong`. Discover its ids with the list tools, create `kind: "chat"` with a prompt
-and `wait: true`, then check `read_chat`, `send_messages` and a mixed batch. The
+and `wait: true`, then check `read_chat`, `message_chats` and a mixed batch. The
 profile is removed on exit. This checks MCP dispatch and engine execution without
 changing your running app's sessions or requiring provider credentials.
 

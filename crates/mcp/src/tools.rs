@@ -119,7 +119,7 @@ pub struct Tools {
 pub fn renamed(old: &str) -> Option<&'static str> {
     Some(match old {
         "create_chat" => defs::CREATE_CHATS,
-        "send_message" => defs::SEND_MESSAGES,
+        "send_message" | "send_messages" => defs::MESSAGE_CHATS,
         "get_chat" => defs::READ_CHAT,
         "whoami" | "list_devices" | "list_projects" | "list_harnesses" | "list_models" => defs::CATALOG,
         "list_plugins" | "plugin_status" | "describe_elements" | "update_plugin" | "create_plugin"
@@ -469,7 +469,7 @@ impl Tools {
             defs::LIST_CHATS => self.list_chats(parse(args)?).await,
             defs::READ_CHAT => self.read_chat(parse(args)?).await,
             defs::CREATE_CHATS => self.batch(parse(args)?, true).await,
-            defs::SEND_MESSAGES => self.batch(parse(args)?, false).await,
+            defs::MESSAGE_CHATS => self.batch(parse(args)?, false).await,
             defs::WAIT_FOR_TURN => self.wait_for_turn(parse(args)?).await,
             defs::INTERRUPT_CHAT => self.interrupt_chat(parse(args)?).await,
             defs::RESPOND_TO_INPUT => self.respond_to_input(parse(args)?).await,
@@ -514,7 +514,7 @@ impl Tools {
         if started {
             out["next"] = json!(COLLECT_NEXT);
         } else if create && out["results"].as_array().is_some_and(|r| r.iter().any(|i| i["ok"] == true && i.get("turn").is_none())) {
-            out["next"] = json!("Give the new chats work with send_messages.");
+            out["next"] = json!("Give the new chats work with message_chats.");
         }
         Ok(out)
     }
@@ -1492,7 +1492,7 @@ mod tests {
             let one = |tool: &'static str| (tool, json!({ "requests": [args.clone()] }));
             let (tool, call) = match name {
                 "create_chat" => one(defs::CREATE_CHATS),
-                "send_message" => one(defs::SEND_MESSAGES),
+                "send_message" => one(defs::MESSAGE_CHATS),
                 _ => {
                     let kind = match name {
                         "whoami" => "self",
@@ -1826,7 +1826,7 @@ mod tests {
             .call(defs::CREATE_CHATS, json!({ "requests": [{ "project": "space-1" }] }))
             .await
             .unwrap();
-        assert!(idle["next"].as_str().unwrap().contains("send_messages"));
+        assert!(idle["next"].as_str().unwrap().contains("message_chats"));
     }
 
     #[test]
@@ -2271,7 +2271,7 @@ mod tests {
                 ]),
             ),
             (
-                "send_messages",
+                "message_chats",
                 json!([
                     {"chat": "alpha", "text": "first", "wait": true, "timeout_secs": 1},
                     {"chat": "missing", "text": "invalid"},
@@ -2319,7 +2319,7 @@ mod tests {
     async fn invalid_batch_sizes_have_no_side_effects() {
         let world = Arc::new(World::default());
         let tools = tools(world.clone(), Origin::default());
-        for name in ["create_chats", "send_messages"] {
+        for name in ["create_chats", "message_chats"] {
             for requests in [vec![], vec![json!({"prompt": "hello"}); MAX_BATCH + 1]] {
                 assert!(
                     tools

@@ -2236,7 +2236,7 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
     );
     let sent = tools
         .call(
-            "send_messages",
+            "message_chats",
             json!({"requests": [{
                 "chat":chat_id, "text":"a second remote turn", "wait":true, "timeout_secs":30
             }]}),
