@@ -6041,6 +6041,12 @@ mod mcp_injection_tests {
             );
             assert_eq!(plugin["environment"], json!({ "FOCUS": "1" }));
             assert_eq!(plugin["type"], "local");
+            let guidance = &servers["zeron"]["environment"][zeron_proto::McpServer::GUIDANCE_ENV];
+            match protocol {
+                Protocol::V1 => assert_eq!(guidance, "prompt", "{servers}"),
+                Protocol::V2 => assert!(guidance.is_null(), "{servers}"),
+            }
+            assert!(plugin["environment"][zeron_proto::McpServer::GUIDANCE_ENV].is_null());
         }
     }
 

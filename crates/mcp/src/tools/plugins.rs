@@ -218,7 +218,7 @@ pub(super) fn catalog() -> Vec<ToolDef> {
                 "required": ["action"]
             }),
             output_schema: None,
-            hints: Hints::WRITE.open_world(),
+            hints: Hints::WRITE.destructive().open_world(),
             always_load: false,
             example: r#"{"action":"status","id":"focus","snapshot":true}"#,
         },
