@@ -186,11 +186,7 @@ fn visual_hint(error: ToolError) -> ToolError {
     if !error.message.contains("visual script failed") {
         return error;
     }
-    let topic = visual_reference::topic_for_error(&error.message);
-    let message = format!(
-        "{} Fix the line and call show_visual again. Props for this: visual_reference {{\"topic\":\"{topic}\"}} (or the zeron:visuals skill).",
-        error.message
-    );
+    let message = visual_reference::check_error_with_hint(&error.message);
     ToolError::new(error.code, message)
 }
 

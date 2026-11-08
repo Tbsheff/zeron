@@ -21,16 +21,70 @@ fn sections() -> impl Iterator<Item = (&'static str, &'static str)> {
     })
 }
 
+pub fn check_error_with_hint(message: &str) -> String {
+    let topic = topic_for_error(message);
+    format!(
+        "{message} Fix the line and call show_visual again. Props for this: visual_reference {{\"topic\":\"{topic}\"}} (or the zeron:visuals skill)."
+    )
+}
+
 pub fn topic_for_error(message: &str) -> &'static str {
     let lower = message.to_ascii_lowercase();
+    prop_topic(&lower)
+        .or_else(|| node_topic(&lower))
+        .unwrap_or_else(|| keyword_topic(&lower))
+}
+
+fn prop_topic(lower: &str) -> Option<&'static str> {
+    lower
+        .split('\'')
+        .filter_map(|quoted| match quoted {
+            "width" | "grow" | "key" | "gap" | "align" | "justify" | "wrap" => Some("layout"),
+            "fill" | "bg" | "background" | "border" | "shadow" | "padding" | "radius" | "blur"
+            | "opacity" | "font" | "family" | "font_family" | "fontfamily" | "font_size"
+            | "fontsize" => Some("style"),
+            "color" => Some("colors"),
+            _ => None,
+        })
+        .last()
+}
+
+fn node_topic(lower: &str) -> Option<&'static str> {
+    let at = lower.rfind("ui.")? + 3;
+    let kind: String = lower[at..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    Some(match kind.as_str() {
+        "column" | "row" | "grid" | "rule" | "space" | "link" => "layout",
+        "text" | "span" => "text",
+        "stat" | "table" | "chart" => "data",
+        "tabs" | "toggle" | "slider" | "button" | "answer" => "controls",
+        "canvas" => "canvas",
+        "scene" => "scene",
+        "shader" => "shader",
+        _ => return None,
+    })
+}
+
+fn has_method(lower: &str, receiver: &str) -> bool {
+    lower.match_indices(receiver).any(|(at, _)| {
+        lower[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+    })
+}
+
+fn keyword_topic(lower: &str) -> &'static str {
     let has = |words: &[&str]| words.iter().any(|word| lower.contains(word));
     if has(&["glsl", "shader", "ichannel", "mainimage"]) {
         "shader"
     } else if has(&["asset", ".glb", ".hdr", "texture", "environment", "sprite", "model"]) {
         "assets"
-    } else if has(&["scene", "s:"]) {
+    } else if has(&["scene"]) || has_method(lower, "s:") {
         "scene"
-    } else if has(&["canvas", "g:"]) {
+    } else if has(&["canvas"]) || has_method(lower, "g:") {
         "canvas"
     } else if has(&["color", "token", "hex"]) {
         "colors"
@@ -68,6 +122,24 @@ mod tests {
         }
         for message in ["GLSL error in pass 1", "unknown prop fill", "s:box needs at", "bad color 'red'", "x"] {
             assert!(topics.contains(&topic_for_error(message)), "{message}");
+        }
+    }
+
+    #[test]
+    fn errors_map_to_the_topic_that_documents_the_prop_or_node() {
+        let cases = [
+            ("ui.text 'grow' must be true or false, not a number", "layout"),
+            ("after switching 'Runs': ui.text has no 'grow'", "layout"),
+            ("ui.row has no 'padding': visuals have no containers", "style"),
+            ("ui.chart needs series = { { name = ..., values = { ... } } }", "data"),
+            ("ui.table has no 'width_px' (it takes columns, rows, hover)", "data"),
+            ("ui.answer takes a string, not a nil", "controls"),
+            ("ui.text 'weight' must be a number or a name", "text"),
+            ("in a scene draw: s:box needs at", "scene"),
+            ("options: bad value", "basics"),
+        ];
+        for (message, topic) in cases {
+            assert_eq!(topic_for_error(message), topic, "{message}");
         }
     }
 

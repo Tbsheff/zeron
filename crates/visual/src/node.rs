@@ -962,7 +962,10 @@ impl Props<'_> {
         match self.table.raw_get::<Value>(name)? {
             Value::Nil => Ok(None),
             Value::Boolean(b) => Ok(Some(b)),
-            _ => Err(self.error(&format!("'{name}' must be true or false"))),
+            other => Err(self.error(&format!(
+                "'{name}' must be true or false, not a {}",
+                other.type_name()
+            ))),
         }
     }
 
