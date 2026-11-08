@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
+use futures::future::BoxFuture;
 use serde_json::{Value as Json, json};
 use zeron_plugin_guard::net;
 
@@ -127,6 +128,10 @@ pub trait Hooks: Send + Sync + 'static {
     fn folders(&self) -> Vec<String> {
         Vec::new()
     }
+    fn act(&self, _plugin: &str, action: &str, _args: Json) -> Acting {
+        let refused = format!("zeron.{action} isn't available on this device");
+        Box::pin(async move { Err(refused) })
+    }
     /// Whether `plan`'s snapshot is still what was allowed, checked before
     /// each load (a changed one is never run).
     fn verify(&self, _plan: &Plan) -> Result<(), String> {
@@ -162,6 +167,9 @@ pub const MAX_TIMEOUT: Duration = Duration::from_secs(300);
 /// What `zeron.emit` sends at once, at most (its JSON).
 pub const MAX_EMIT_BYTES: usize = 64 * 1024;
 pub const MAX_QUEUED_EVENTS: usize = 256;
+pub const MAX_ACTS_PER_MINUTE: usize = 20;
+pub type Acting = BoxFuture<'static, Result<Json, String>>;
+const ACT_WINDOW: Duration = Duration::from_secs(60);
 /// A service's log lines kept for `PluginStatus`.
 const LOG_LINES: usize = 50;
 /// What a fetch answers with, at most.
@@ -193,6 +201,7 @@ struct Slot {
     start: tokio::sync::Mutex<()>,
     log: Mutex<VecDeque<String>>,
     inbox: Mutex<Inbox>,
+    acted: Mutex<VecDeque<Instant>>,
 }
 
 #[derive(Default)]
@@ -239,6 +248,19 @@ impl Slot {
         }
         log.push_back(line);
     }
+
+    fn take_act_turn(&self) -> bool {
+        let mut acted = lock(&self.acted);
+        let now = Instant::now();
+        while acted.front().is_some_and(|at| now.duration_since(*at) >= ACT_WINDOW) {
+            acted.pop_front();
+        }
+        if acted.len() >= MAX_ACTS_PER_MINUTE {
+            return false;
+        }
+        acted.push_back(now);
+        true
+    }
 }
 
 impl Services {
@@ -278,6 +300,7 @@ impl Services {
                     start: tokio::sync::Mutex::new(()),
                     log: Mutex::new(VecDeque::new()),
                     inbox: Mutex::new(Inbox::default()),
+                    acted: Mutex::new(VecDeque::new()),
                 })
             })
             .clone()
@@ -827,6 +850,7 @@ impl Ops for PluginOps {
                     done(Ok(json!(hooks.notify(&plugin, &title, body, session))))
                 });
             }
+            "chats.send" | "chats.create" | "chats.stop" | "files.read" => self.act(kind, args, done),
             other => done(Err(format!("zeron.{other} isn't something a service can do"))),
         }
     }
@@ -886,14 +910,53 @@ impl Ops for PluginOps {
     }
 
     fn log(&self, line: &str) {
-        tracing::info!(plugin = %self.plan.plugin, "plugins: service: {line}");
-        if let Some(slot) = self.slot.upgrade() {
-            slot.note(line.to_owned());
-        }
+        note(&self.slot, &self.plan.plugin, line);
+    }
+}
+
+fn note(slot: &Weak<Slot>, plugin: &str, line: &str) {
+    tracing::info!(plugin = %plugin, "plugins: service: {line}");
+    if let Some(slot) = slot.upgrade() {
+        slot.note(line.to_owned());
     }
 }
 
 impl PluginOps {
+    fn act(&self, kind: &str, args: Json, done: Done) {
+        let name = &self.plan.name;
+        let needs: &[(&str, &str)] = match kind {
+            "chats.create" => &[("chats.create", "start chats")],
+            "files.read" => &[("files.read", "read files"), ("files.contents", "read files' contents")],
+            _ => &[("messages.send", "send messages in your chats")],
+        };
+        if let Some((permission, what)) = needs.iter().find(|(p, _)| !self.plan.allows(p)) {
+            return done(Err(format!("{name} wasn't allowed to {what} (\"{permission}\")")));
+        }
+        let Some(slot) = self.slot.upgrade() else {
+            return done(Err(format!("{name} was turned off here")));
+        };
+        if matches!(kind, "chats.send" | "chats.create") && !slot.take_act_turn() {
+            return done(Err(format!(
+                "rate limited: {name} sent messages or started chats {MAX_ACTS_PER_MINUTE} times in the last minute"
+            )));
+        }
+        let (hooks, plugin, kind, slot) = (self.hooks.clone(), self.plan.plugin.clone(), kind.to_owned(), self.slot.clone());
+        self.runtime.spawn(async move {
+            let session = args["session"].as_str().unwrap_or_default().to_owned();
+            let outcome = hooks.act(&plugin, &kind, args).await;
+            let did = match (&outcome, kind.as_str()) {
+                (Ok(_), "chats.send") => Some(format!("sent a message to chat {session}")),
+                (Ok(_), "chats.stop") => Some(format!("stopped chat {session}'s turn")),
+                (Ok(created), "chats.create") => Some(format!("started chat {}", created.as_str().unwrap_or_default())),
+                _ => None,
+            };
+            if let Some(did) = did {
+                note(&slot, &plugin, &did);
+            }
+            done(outcome)
+        });
+    }
+
     fn policy(&self) -> net::Policy {
         // (Checked when the manifest was: a bad list never gets here.)
         net::Policy::new(&self.plan.hosts).unwrap_or_default()

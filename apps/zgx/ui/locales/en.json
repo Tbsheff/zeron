@@ -3163,6 +3163,17 @@
         "files_read": {
           "title": "See file names and paths in your projects"
         },
+        "files_contents": {
+          "title": "Read files in your chats' folders on this device"
+        },
+        "messages_send": {
+          "title": "Send messages to your agents and stop their turns",
+          "detail": "Your agents act on what it sends, with the access each chat has. At most 20 sends and new chats a minute."
+        },
+        "chats_create": {
+          "title": "Start new chats",
+          "detail": "Its chats run your agents with their usual access, and can start with a message of its own."
+        },
         "panel_tabs": {
           "title": "Open tabs in your chats' panels"
         },

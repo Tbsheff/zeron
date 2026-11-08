@@ -42,6 +42,9 @@ pub const KNOWN_PERMISSIONS: &[&str] = &[
     // each device that allowed it, called by its windows and agents from
     // this device or another (plugins/service).
     "service",
+    "messages.send",
+    "chats.create",
+    "files.contents",
 ];
 
 pub const KNOWN_EVENTS: &[&str] = &[
@@ -451,6 +454,9 @@ impl Manifest {
             ));
         }
         let asks = |p: &str| self.permissions.iter().any(|have| have == p);
+        if asks("files.contents") && !asks("files.read") {
+            return Some("It asks for \"files.contents\" but not \"files.read\"".into());
+        }
         if !self.network_hosts.is_empty() && !asks("network") {
             return Some("It names hosts to reach but doesn't ask for \"network\"".into());
         }
@@ -687,6 +693,28 @@ mod tests {
         assert!(problem(tools.clone()).is_some(), "bad tool name");
         tools["tools"] = serde_json::json!([{ "name": "count_words" }]);
         assert_eq!(problem(tools), None);
+    }
+
+    #[test]
+    fn acting_permissions_are_known_and_file_contents_need_files_read() {
+        let with = |permissions: serde_json::Value| {
+            let mut m = base();
+            m["permissions"] = permissions;
+            m
+        };
+        assert_eq!(
+            problem(with(serde_json::json!([
+                "messages.send",
+                "chats.create",
+                "files.read",
+                "files.contents"
+            ]))),
+            None
+        );
+        let contents_alone = problem(with(serde_json::json!(["files.contents"])));
+        assert!(contents_alone.unwrap().contains("not \"files.read\""));
+        let unknown = problem(with(serde_json::json!(["messages.write"])));
+        assert!(unknown.unwrap().contains("isn't a permission Zeron knows"));
     }
 
     #[test]

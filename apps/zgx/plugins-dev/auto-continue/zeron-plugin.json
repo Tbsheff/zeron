@@ -1,0 +1,10 @@
+{
+  "id": "auto-continue",
+  "name": "Auto continue",
+  "version": "1.0.0",
+  "description": "Sends \"continue\" once to a chat on this device whose turn failed, with no window open.",
+  "entry": "init.luau",
+  "service": "service.luau",
+  "permissions": ["service", "sessions.read", "messages.send"],
+  "events": ["turn.done"]
+}

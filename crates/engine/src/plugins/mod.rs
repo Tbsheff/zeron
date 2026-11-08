@@ -14,6 +14,7 @@
 //! [`snapshot`], [`broker`], [`scaffold`]; [`templates`] stores whole-app
 //! templates for agents. This file does the IO around them.
 
+pub mod actions;
 pub mod broker;
 pub mod capability;
 pub mod events;
@@ -160,6 +161,7 @@ type AccountFn = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 type NotifyFn = Arc<dyn Fn(&str, &str, &str, Option<&str>) -> String + Send + Sync>;
 /// This device's chats' and projects' folders (a service's `zeron.folders`).
 type FoldersFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+type ActFn = Arc<dyn Fn(&str, &str, serde_json::Value) -> service::Acting + Send + Sync>;
 
 enum Kick {
     Rescan,
@@ -230,6 +232,7 @@ struct Inner {
     notifier: Mutex<Option<NotifyFn>>,
     /// Where this device's chats and projects are (`zeron.folders`).
     folders: Mutex<Option<FoldersFn>>,
+    actor: Mutex<Option<ActFn>>,
     /// One-time capabilities for Zeron's consent window (`ReviewPlugin`,
     /// `ReviewTemplate`): what allowing and signing need.
     reviews: Mutex<reviews::Reviews>,
@@ -503,6 +506,7 @@ impl Plugins {
                 watching: Mutex::new(HashSet::new()),
                 notifier: Mutex::new(None),
                 folders: Mutex::new(None),
+                actor: Mutex::new(None),
                 step_up: Mutex::new(None),
                 new_keys: Mutex::new(Vec::new()),
                 key_notices: Mutex::new(Vec::new()),
@@ -530,6 +534,13 @@ impl Plugins {
     /// `zeron.folders()` (the engine's workspace; a test's own).
     pub fn set_folders(&self, folders: impl Fn() -> Vec<String> + Send + Sync + 'static) {
         *lock(&self.inner.folders) = Some(Arc::new(folders));
+    }
+
+    pub fn set_actor(
+        &self,
+        act: impl Fn(&str, &str, serde_json::Value) -> service::Acting + Send + Sync + 'static,
+    ) {
+        *lock(&self.inner.actor) = Some(Arc::new(act));
     }
 
     pub fn plugins_dir(&self) -> &Path {
@@ -2578,6 +2589,20 @@ impl service::Hooks for ServiceHooks {
     fn folders(&self) -> Vec<String> {
         let folders = self.inner.upgrade().and_then(|inner| lock(&inner.folders).clone());
         folders.map(|f| f()).unwrap_or_default()
+    }
+
+    fn act(&self, plugin: &str, action: &str, args: serde_json::Value) -> service::Acting {
+        match self
+            .inner
+            .upgrade()
+            .and_then(|inner| lock(&inner.actor).clone())
+        {
+            Some(act) => act(plugin, action, args),
+            None => {
+                let refused = format!("zeron.{action} isn't available on this device");
+                Box::pin(async move { Err(refused) })
+            }
+        }
     }
 
     /// R11: the snapshot a service loads from is the version allowed, or it

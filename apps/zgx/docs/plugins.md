@@ -56,6 +56,9 @@ Your own plugins are signed as yours, and re-signed and reloaded each time you s
 | `native` | run a program of its own (the manifest's `mcp`) |
 | `commands` | run the programs its manifest's `commands` names, as you, on this Mac (`zeron.run`) |
 | `service` | run its service (the manifest's `service`) on this device, with no window open, for its windows and agents here and on your other devices |
+| `messages.send` | send messages to your chats, and stop their turns, from its service (`zeron.chats.send`, `zeron.chats.stop`). See [Actions](#actions) |
+| `chats.create` | start chats from its service (`zeron.chats.create`) |
+| `files.contents` | read a file's contents in a session's folder from its service (`zeron.files.read`). Needs `files.read` |
 
 ## Reaching the network
 
@@ -346,6 +349,7 @@ end)
 | `zeron.fetch(url, { method, headers, body, timeout })` | a promise of `{ status, headers, body }` (http and https; public addresses, or the manifest's `network.hosts`) | `network` |
 | `zeron.folders()` | a promise of this device's chats' and projects' folders (whole paths) | `sessions.read` |
 | `zeron.notify { title, body?, session? }` | as the window's | `notifications` |
+| `zeron.chats.send(session, text)`, `zeron.chats.stop(session)`, `zeron.chats.create { … }`, `zeron.files.read(session, path)` | act in your chats. See [Actions](#actions) | `messages.send`, `chats.create`, `files.contents` |
 | `zeron.store(key, default)` | `:get()`, `:set(v)`: kept on this device between runs (1 MB), the service's own (not the window's store) | |
 | `zeron.sleep(seconds)`, `zeron.task(fn)` | a promise done later; run `fn` as a task of its own | |
 | `zeron.json.encode(v)`, `zeron.json.decode(text)`, `zeron.device` | JSON; this device's `{ id, name }` | |
@@ -423,6 +427,39 @@ end)
 ```
 
 `plugins-dev/turn-notify` is this, whole: a notification when a chat finishes or fails.
+
+### Actions
+
+A service can act in your chats: send a message, stop a turn, start a chat, read a file. Each call is a promise; `:await()` it, and a refusal is raised as an error that says why (no such session, a permission it wasn't allowed, the chat on another device, rate limited).
+
+| call | what | needs |
+|---|---|---|
+| `zeron.chats.send(session, text)` | a promise of `true` once the message is in that chat's queue. It goes to the agent as the next turn: at once when the chat is idle, after the running turn otherwise | `messages.send` |
+| `zeron.chats.stop(session)` | a promise of `true` once the stop is sent: the running turn ends, as with Stop | `messages.send` |
+| `zeron.chats.create { project?, device?, harness?, model?, title?, prompt? }` | a promise of the new chat's session id. `project` is a project's id (it fixes the device); without it, a chat with no project on `device` (this device unless said). Without `harness`, the device's default agent; `model` needs a `harness`. `prompt` is sent as its first message. Not on Cloud | `chats.create` |
+| `zeron.files.read(session, path)` | a promise of a text file's contents, from that session's folder on this device (a project chat's: its checkout). `path` is relative to the folder: no `..`, no absolute path, no symlink, no `.git`. 2 MB at most; a binary file is an error | `files.read`, `files.contents` |
+
+- **Any of your devices.** A send, stop or new chat for a chat hosted on another device goes through that chat's synced queue, as your own sends do. `zeron.files.read` reads this device's folders only.
+- **The person's Stop wins.** A Stop holds the chat's queue until the person sends next, so a plugin's send after a Stop waits there, a plugin's own `zeron.chats.stop` included.
+- **Rate limit.** Sends and new chats together: 20 a minute per plugin on each device; the 21st is an error that starts with `rate limited`. Stops and reads aren't counted.
+- **Loops.** A plugin's send is a turn like any other: it produces `message.user`, `turn.started`, `turn.done` and the rest, its own listeners included. A listener that sends on every `turn.done` triggers itself; the rate limit stops it, but keep track of what you sent (`zeron.store`) and send once.
+- **Who sent it.** The message reads as yours in the chat; the service's log (`plugin_status`) names each chat it sent to, stopped or started. A message that copies the header of a message from another chat is marked as quoted, as for agents.
+
+```lua
+-- service.luau: "continue" once to a chat whose turn failed
+local sent = zeron.store("continued", {})
+zeron.on("turn.done", function(turn)
+	if turn.status ~= "errored" or sent:get()[turn.session] then
+		return
+	end
+	local all = sent:get()
+	all[turn.session] = true
+	sent:set(all)
+	zeron.chats.send(turn.session, "continue"):await()
+end)
+```
+
+`plugins-dev/auto-continue` is this, whole, with `"permissions": ["service", "sessions.read", "messages.send"]` and `"events": ["turn.done"]`. A window reaches these through its service: serve a method that acts, and call it with `zeron.service():call`.
 
 ## Settings
 

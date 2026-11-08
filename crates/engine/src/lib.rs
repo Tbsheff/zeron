@@ -361,6 +361,15 @@ impl EngineCore {
                 .and_then(|session| session.path.clone())
                 .map(std::path::PathBuf::from),
         );
+        {
+            let actions = plugins::actions::Actions {
+                device_id: device_id.clone(),
+                workspace: workspace.clone(),
+                doc_host: doc_host.clone(),
+                files: workspace_files.clone(),
+            };
+            plugins.set_actor(move |_plugin, action, args| actions.act(action, args));
+        }
         let terminals = Terminals::new();
         sessions.track_terminal_activity(terminals.clone(), workspace.clone());
         let project_actions = ProjectActionsStore::open(profile.store_root())?;

@@ -317,6 +317,27 @@ local function service(id: string): any
 		return op("notify", { title = n.title, body = n.body, session = n.session })
 	end
 
+	M.chats = {}
+
+	function M.chats.send(session: string, text: string): any
+		return op("chats.send", { session = session, text = text })
+	end
+
+	function M.chats.create(opts: { project: string?, device: string?, harness: string?, model: string?, title: string?, prompt: string? }?): any
+		local o = opts or {}
+		return op("chats.create", { project = o.project, device = o.device, harness = o.harness, model = o.model, title = o.title, prompt = o.prompt })
+	end
+
+	function M.chats.stop(session: string): any
+		return op("chats.stop", { session = session })
+	end
+
+	M.files = {}
+
+	function M.files.read(session: string, path: string): any
+		return op("files.read", { session = session, path = path })
+	end
+
 	-- A promise done after `seconds`.
 	function M.sleep(seconds: number): any
 		return op("sleep", { seconds = seconds })

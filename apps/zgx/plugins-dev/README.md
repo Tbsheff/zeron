@@ -1,6 +1,6 @@
 # Example plugins
 
-Eight plugins, each proving one thing Zeron's plugins can do. They are **not built in**: install one by copying its folder into a Zeron data dir's `plugins/`, then sign it or allow it (`install.sh` does both for a scratch engine).
+Nine plugins, each proving one thing Zeron's plugins can do. They are **not built in**: install one by copying its folder into a Zeron data dir's `plugins/`, then sign it or allow it (`install.sh` does both for a scratch engine).
 
 | Folder | Proves | Asks for | Who signs it |
 |---|---|---|---|
@@ -10,6 +10,7 @@ Eight plugins, each proving one thing Zeron's plugins can do. They are **not bui
 | `notes-tool` | Luau tools agents call through Zeron's MCP server (`count_words`, `open_chat`) | `tools`, `sessions.read` | you |
 | `ping` | A message between two of your devices, and back | `ui.add`, `devices` | you, installed on both devices |
 | `session-status` | A node placed in each chat's header that reads its session (`zeron.need("session")`); placed where there's none, Settings says why | `ui.add`, `sessions.read` | you |
+| `auto-continue` | Events and actions together (`zeron.on("turn.done")`, `zeron.chats.send`): when a chat's turn on this device fails, its service sends "continue" once to that chat, kept in `zeron.store` so it never sends twice | `service`, `sessions.read`, `messages.send` | you |
 | `turn-notify` | App events in a service (`zeron.on("turn.done")`): a notification when a chat on this device finishes or fails, with no window open, and a toast in open windows through `emit` | `service`, `sessions.read`, `notifications` | you |
 | `settings-demo` | Settings declared in its manifest, drawn by Zeron as its own page (Settings → Greeter), read with `zeron.setting(id)` and heard with `zeron.on_setting` | `ui.add` | you |
 

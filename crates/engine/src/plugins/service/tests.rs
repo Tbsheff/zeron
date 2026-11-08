@@ -7,6 +7,7 @@ use serde_json::json;
 struct Recorder {
     emitted: Mutex<Vec<(String, String, Json)>>,
     notified: Mutex<Vec<String>>,
+    acted: Mutex<Vec<(String, Json)>>,
 }
 
 impl Hooks for Recorder {
@@ -19,6 +20,11 @@ impl Hooks for Recorder {
     }
     fn device(&self) -> Json {
         json!({ "id": "dev-1", "name": "Laptop" })
+    }
+    fn act(&self, _plugin: &str, action: &str, args: Json) -> Acting {
+        lock(&self.acted).push((action.into(), args));
+        let answer = if action == "chats.create" { json!("chat-new") } else { json!(true) };
+        Box::pin(async move { Ok(answer) })
     }
 }
 
@@ -546,4 +552,67 @@ async fn an_event_starts_the_service_and_a_full_queue_says_how_many_it_dropped()
         "in order"
     );
     assert_eq!(r.starts(), 1);
+}
+
+const ACTS: &str = r#"
+local zeron = require("./zeron")("svc")
+zeron.serve("send", function(a) return zeron.chats.send(a.session, a.text):await() end)
+zeron.serve("create", function(a) return zeron.chats.create(a):await() end)
+zeron.serve("stop", function(a) return zeron.chats.stop(a.session):await() end)
+zeron.serve("read", function(a) return zeron.files.read(a.session, a.path):await() end)
+"#;
+
+#[tokio::test]
+async fn each_action_needs_its_permission() {
+    let r = rig(Config::default());
+    let none = r.plan("1.0.0", ACTS, &["service"]);
+    for (method, args, permission) in [
+        ("send", json!({ "session": "c1", "text": "hi" }), "messages.send"),
+        ("stop", json!({ "session": "c1" }), "messages.send"),
+        ("create", json!({ "title": "t" }), "chats.create"),
+        ("read", json!({ "session": "c1", "path": "a.txt" }), "files.read"),
+    ] {
+        let refused = r.ask(&none, method, args).await.unwrap_err();
+        assert!(refused.message.contains(&format!("(\"{permission}\")")), "{method}: {refused:?}");
+    }
+    assert!(lock(&r.hooks.acted).is_empty(), "nothing refused reached the host");
+
+    let r = rig(Config::default());
+    let names_only = r.plan("1.0.0", ACTS, &["service", "files.read"]);
+    let refused = r.ask(&names_only, "read", json!({ "session": "c1", "path": "a.txt" })).await.unwrap_err();
+    assert!(refused.message.contains("\"files.contents\""), "{refused:?}");
+
+    let r = rig(Config::default());
+    let all = r.plan("1.0.0", ACTS, &["service", "messages.send", "chats.create", "files.read", "files.contents"]);
+    assert_eq!(r.ask(&all, "send", json!({ "session": "c1", "text": "hi" })).await.unwrap(), json!(true));
+    assert_eq!(r.ask(&all, "stop", json!({ "session": "c1" })).await.unwrap(), json!(true));
+    assert_eq!(r.ask(&all, "create", json!({ "prompt": "go" })).await.unwrap(), json!("chat-new"));
+    assert_eq!(r.ask(&all, "read", json!({ "session": "c1", "path": "a.txt" })).await.unwrap(), json!(true));
+    let acted: Vec<String> = lock(&r.hooks.acted).iter().map(|(a, _)| a.clone()).collect();
+    assert_eq!(acted, ["chats.send", "chats.stop", "chats.create", "files.read"]);
+    assert_eq!(lock(&r.hooks.acted)[0].1, json!({ "session": "c1", "text": "hi" }));
+    let log = r.services.status("svc")["log"].to_string();
+    assert!(log.contains("sent a message to chat c1") && log.contains("started chat chat-new"), "{log}");
+}
+
+#[tokio::test]
+async fn sends_and_creates_are_rate_limited_per_plugin() {
+    let r = rig(quick());
+    let plan = r.plan("1.0.0", ACTS, &["service", "messages.send", "chats.create"]);
+    for n in 0..MAX_ACTS_PER_MINUTE {
+        let (method, args) = if n % 2 == 0 {
+            ("send", json!({ "session": "c1", "text": "again" }))
+        } else {
+            ("create", json!({}))
+        };
+        r.ask(&plan, method, args).await.unwrap();
+    }
+    let refused = r.ask(&plan, "send", json!({ "session": "c1", "text": "again" })).await.unwrap_err();
+    assert!(refused.message.starts_with("rate limited"), "{refused:?}");
+    assert!(r.ask(&plan, "create", json!({})).await.unwrap_err().message.starts_with("rate limited"));
+    assert_eq!(r.ask(&plan, "stop", json!({ "session": "c1" })).await.unwrap(), json!(true), "a stop isn't counted");
+    until("idle stop", || !r.running()).await;
+    let after_restart = r.ask(&plan, "send", json!({ "session": "c1", "text": "again" })).await.unwrap_err();
+    assert!(after_restart.message.starts_with("rate limited"), "a new VM doesn't reset it: {after_restart:?}");
+    assert_eq!(lock(&r.hooks.acted).len(), MAX_ACTS_PER_MINUTE + 1);
 }

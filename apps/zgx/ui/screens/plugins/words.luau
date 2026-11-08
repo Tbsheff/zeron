@@ -269,6 +269,12 @@ function M.permission(item: any, permission: string): Line
 		return line(false, "eye", "plugins.words.permission.account_email.title")
 	elseif permission == "files.read" then
 		return line(false, "folder", "plugins.words.permission.files_read.title")
+	elseif permission == "files.contents" then
+		return line(false, "document", "plugins.words.permission.files_contents.title")
+	elseif permission == "messages.send" then
+		return line(true, "chat-round-line", "plugins.words.permission.messages_send.title", "plugins.words.permission.messages_send.detail")
+	elseif permission == "chats.create" then
+		return line(true, "chat-add", "plugins.words.permission.chats_create.title", "plugins.words.permission.chats_create.detail")
 	elseif permission == "panel.tabs" then
 		return line(false, "split-columns", "plugins.words.permission.panel_tabs.title")
 	elseif permission == "pages.add" then
