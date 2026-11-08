@@ -30,8 +30,7 @@ return function()\n\
   }\n\
 end\n\
 \n\
-Zeron runs the script first (setup, render, each control once) and returns the first error with its \
-line: fix it and call again.\n\
+Zeron runs the script first and returns the first error with its line: fix it and call again.\n\
 \n\
 Nodes: ui.column, row, grid, text, stat, table, chart, rule, tabs, toggle, slider, button, canvas \
 (2D), scene (3D), shader (GLSL). Unknown props are errors. Props: visual_reference.\n\

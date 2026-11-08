@@ -188,11 +188,11 @@ create {id, name, permissions?}: a signed folder that reloads as you save; read 
 first. install {path | url, ref?, folder?}: the person must allow it in Zeron, not you.";
 
 const TEMPLATES_DESCRIPTION: &str = "\
-Zeron templates: whole copies of Zeron's Luau interface to rewrite. action list: ids, status, in use. \
-status {id}: errors and out-of-date files. app: screens and the #ids and .classes plugins place by. \
-create {id, name, from?}: copy to a folder; read the reply's `guide` first. use {id}: switch the window \
-live (zeron: Zeron's own); a preview until the person keeps it. delete {id}. export {id}: a signed \
-.zeron-template file. import {path | url}: someone else's waits for the person to allow it.";
+Zeron templates: whole copies of Zeron's Luau interface to rewrite. action list. status {id}: errors \
+and out-of-date files. app: screens and the #ids and .classes plugins place by. create {id, name, \
+from?}: read the reply's `guide` first. use {id}: switch the window live (zeron: Zeron's own), a \
+preview until the person keeps it. delete {id}. export {id}: a signed file. import {path | url}: \
+someone else's waits for the person to allow it.";
 
 pub(super) fn catalog() -> Vec<ToolDef> {
     let text = || json!({ "type": "string" });

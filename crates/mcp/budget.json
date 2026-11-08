@@ -1,0 +1,55 @@
+{
+  "descriptions": {
+    "archive_chat": 108,
+    "catalog": 260,
+    "create_chats": 383,
+    "interrupt_chat": 80,
+    "list_chats": 217,
+    "plugins": 476,
+    "read_chat": 237,
+    "respond_to_input": 180,
+    "send_messages": 361,
+    "show_image": 274,
+    "show_visual": 1785,
+    "templates": 441,
+    "themes": 444,
+    "visual_reference": 146,
+    "wait_for_turn": 283,
+    "wait_on_background": 393
+  },
+  "instructions": {
+    "claudeSystemPrompt": 1809,
+    "codexLargestEntry": 1041,
+    "codexTotal": 1441,
+    "core": 1041,
+    "mcpFallback": 2011,
+    "mcpInstructionsChars": 200,
+    "opencodeSystem": 1445
+  },
+  "opencodeUpfront": 11960,
+  "tools": {
+    "archive_chat": 286,
+    "catalog": 470,
+    "create_chats": 1421,
+    "interrupt_chat": 232,
+    "list_chats": 430,
+    "plugins": 1004,
+    "read_chat": 522,
+    "respond_to_input": 555,
+    "send_messages": 837,
+    "show_image": 371,
+    "show_visual": 2089,
+    "templates": 741,
+    "themes": 914,
+    "visual_reference": 350,
+    "wait_for_turn": 482,
+    "wait_on_background": 587
+  },
+  "totals": {
+    "descriptions": 6068,
+    "inputSchemas": 4828,
+    "outputSchemas": 1428,
+    "toolCount": 16,
+    "tools": 11291
+  }
+}
