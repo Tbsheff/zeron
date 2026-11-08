@@ -823,6 +823,29 @@ TRANSCRIPTS.s6 = {
 META.s6 = { title = "Switched agents", project = "atlas", model = "sonnet", effort = "medium", access = "full", plan = false }
 seed()
 ui.command {
+	id = "visual_answers",
+	title = "The agent shows a visual whose buttons answer",
+	run = function()
+		store.messages:push(line("fv", "assistant", 6, "", {
+			blocks = {
+				{
+					id = "v:pick",
+					kind = "visual",
+					title = "Pick one",
+					source = [[
+return function()
+  return ui.row { gap = 8,
+    ui.button { label = "Option B", on_click = function() ui.answer("B", { label = "Pick" }) end },
+    ui.button { label = "Approve", on_click = function() ui.answer("Approved") end },
+  }
+end
+]],
+				},
+			},
+		}))
+	end,
+}
+ui.command {
 	id = "group_grows",
 	title = "A third tool joins the open group",
 	run = function()

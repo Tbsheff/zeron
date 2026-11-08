@@ -569,3 +569,31 @@ fn a_show_visual_call_leaves_no_tool_row_and_its_visual_sits_in_place() {
     assert!(!tree.contains("attempt to index"), "the script's error in the reply:\n{tree}");
     assert_eq!(tree.matches("Ran 1 command").count(), 2, "each command its own group, split by the visual:\n{tree}");
 }
+
+#[test]
+fn a_visuals_buttons_answer_into_its_chats_draft_and_nothing_sends() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui/chat_fixture.luau");
+    let mut app = TestApp::new(|runtime| {
+        let host = ScriptHost::new(runtime, path);
+        crate::visuals::register(&host);
+        host
+    });
+    app.ui.scene.borrow_mut().resize(960., 900.);
+    app.frames(2);
+    assert!(app.host.run_command("go_s6"));
+    app.frames(30);
+    let draft = app.host.shared("chat.composer.text", zgx_script::Value::Nil);
+    draft.set(zgx_script::Value::from("Thoughts so far"));
+    assert!(app.host.run_command("visual_answers"));
+    app.wait_until(|app| app.find("role:button \"Option B\"").is_some());
+    app.click("role:button \"Option B\"");
+    app.frames(5);
+    assert_eq!(crate::auth::text(&draft.get()), "Thoughts so far\nPick: B");
+    app.click("role:button \"Approve\"");
+    app.frames(5);
+    assert_eq!(crate::auth::text(&draft.get()), "Thoughts so far\nPick: B\nApproved");
+    let calls = app.host.states().into_iter().find(|(name, _)| name == "calls" || name.ends_with("::calls"));
+    let calls = calls.map(|(_, v)| crate::auth::text(&v)).expect("the fixture notes its calls");
+    assert!(!calls.contains("send:"), "an answer never sends: {calls}");
+    assert_eq!(app.error(), None);
+}

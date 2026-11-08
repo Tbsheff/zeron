@@ -3641,7 +3641,7 @@ async fn publish_visual_lands_in_the_live_turn() {
         }),
     );
     let client = zeron_rpc::memory_client(core.rpc_service());
-    const SCRIPT: &str = r#"return ui.text { "chart", size = "lg" }"#;
+    const SCRIPT: &str = r#"return ui.button { label = "B", on_click = function() ui.answer("B", { label = "Pick" }) end }"#;
     let publish = |chat: &str, script: &str| {
         client.call(
             zeron_rpc::methods::PUBLISH_VISUAL,
@@ -3671,6 +3671,8 @@ async fn publish_visual_lands_in_the_live_turn() {
     assert!(broken.contains("theme tokens"), "{broken}");
     let shown = publish(CHAT, SCRIPT).await.expect("PublishVisual");
     assert_eq!(shown["title"], "Latency");
+    assert_eq!(shown["checkedInteractions"], 1);
+    assert_eq!(shown["answers"], serde_json::json!(["Pick: B"]));
     tx.send(AgentEvent::TextDelta {
         text: "Uploads dominate.".into(),
     })

@@ -288,6 +288,9 @@ local function Session(id: Id?): Node
 								end
 							end,
 							on_attach = shared.attach_quote,
+							on_visual_answer = function(answers: { string })
+								shared.append_draft_of(id, answers)
+							end,
 							pictures = pictures,
 							sent_pictures = sent_pictures,
 							-- A subagent's spawn opens its lane, a panel tab

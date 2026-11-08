@@ -13,7 +13,7 @@ const CORE_MAX: usize = 2_048;
 const CODEX_ENTRY_MAX: usize = 4_000;
 const SHOW_VISUAL_MAX: usize = 3_072;
 const DESCRIPTION_MAX: usize = 1_024;
-const OPENCODE_UPFRONT_MAX: usize = 12_000;
+const OPENCODE_UPFRONT_MAX: usize = 12_700;
 
 fn bytes(value: &Value) -> usize {
     match value {

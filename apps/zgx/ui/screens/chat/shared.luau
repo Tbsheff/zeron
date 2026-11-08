@@ -736,6 +736,19 @@ function M.set_draft_of(key: string, field: string, value: any)
 	kept:set(all)
 end
 
+function M.append_draft_of(key: string, lines: { string })
+	local d = kept:peek()[key]
+	local text = if here:peek() == key then M.text:peek() elseif d and type(d.text) == "string" then d.text else ""
+	for _, line in lines do
+		local sep = if text == "" or string.sub(text, -1) == "\n" then "" else "\n"
+		text = text .. sep .. line
+	end
+	M.set_draft_of(key, "text", text)
+	if here:peek() == key then
+		M.focus:add(1)
+	end
+end
+
 -- A chip taken off chat `key`'s draft, wherever the draft is.
 function M.remove_cargo_of(key: string, id: string)
 	if here:peek() == key then

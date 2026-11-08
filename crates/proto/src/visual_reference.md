@@ -46,6 +46,7 @@ end
 - ui.toggle { label, value = bool, on_change = function(on) end }
 - ui.slider { label, value, min, max, step, unit, on_change = function(n) end }
 - ui.button { label, on_click = function() end, primary = bool }
+- ui.answer(choice, { label = "Pick" }), in any handler, puts "Pick: <choice>" on its own line in the reader's draft. For questions to the person (choices, forms, plan approvals), use ui.answer; nothing sends until they send. Prefer a label. The check's presses fill no draft; show_visual's result lists the answers each would add.
 
 ## canvas
 

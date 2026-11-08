@@ -32,16 +32,26 @@ end\n\
 \n\
 Zeron runs the script first and returns the first error with its line: fix it and call again.\n\
 \n\
-Nodes: ui.column, row, grid, text, stat, table, chart, rule, tabs, toggle, slider, button, canvas \
-(2D), scene (3D), shader (GLSL). Unknown props are errors. Props: visual_reference.\n\
+Props per node (common ones; unknown props are errors):\n\
+- any node: width = px, grow = true (in a row; a boolean, not a number), key\n\
+- column, row: gap, align; row also justify, wrap. grid: columns, gap. rule {}\n\
+- text { \"str\", size = xs|sm|body|lg|xl|2xl, weight = 400-700, color, mono, italic, align, truncate }\n\
+- stat { value, label, delta, tone }. table { columns, rows }\n\
+- chart { type = bar|line|area|scatter, height, x, series = { { name, values, color } }, stacked, \
+min, max, unit, prefix, decimals }\n\
+- tabs { options, value, on_change }, toggle { label, value, on_change }, slider { label, value, \
+min, max, step, unit, on_change }, button { label, on_click, primary }\n\
+- canvas (2D), scene (3D), shader (GLSL): read visual_reference first.\n\
+For questions to the person, use ui.answer(choice, { label = \"Pick\" }) in a handler: it puts \
+\"Pick: <choice>\" in their draft; nothing sends until they send.\n\
 \n\
 Colors are theme tokens, never hex (except 3D materials): text, muted, faint, accent, on-accent, \
 success, warning, danger, border, chart1, chart2, chart3, chart4, chart5, chart6.\n\
 \n\
-Style, enforced: layout takes no fill, border, shadow, padding, or font props. No cards, boxed panels, \
-banners, or backgrounds: content sits on the chat. Stats: a row of plain ui.stat. A chart: a plain \
-heading, then the chart. Split sections with gap or one ui.rule. The column is about 720px (down to \
-360px): use grow, wrap, grid; charts and scenes take 160-420px of height.";
+Style, enforced: no fill, border, shadow, padding, or font props; no cards, boxes, banners, or \
+backgrounds. Stats: a row of plain ui.stat. A chart: a plain heading, then the chart. Split sections \
+with gap or one ui.rule. The column is 360-720px wide: use grow, wrap, grid; charts and scenes are \
+160-420px tall.";
 
 const SHOW_IMAGE_DESCRIPTION: &str = "\
 Show an image file (screenshot, photo, rendered chart) above your final reply. Call it before the \

@@ -10,7 +10,7 @@
     "respond_to_input": 180,
     "send_messages": 361,
     "show_image": 274,
-    "show_visual": 1785,
+    "show_visual": 2443,
     "templates": 441,
     "themes": 444,
     "visual_reference": 146,
@@ -26,7 +26,7 @@
     "mcpInstructionsChars": 200,
     "opencodeSystem": 1445
   },
-  "opencodeUpfront": 11960,
+  "opencodeUpfront": 12618,
   "tools": {
     "archive_chat": 286,
     "catalog": 470,
@@ -38,7 +38,7 @@
     "respond_to_input": 555,
     "send_messages": 837,
     "show_image": 371,
-    "show_visual": 2089,
+    "show_visual": 2747,
     "templates": 741,
     "themes": 914,
     "visual_reference": 350,
@@ -46,10 +46,10 @@
     "wait_on_background": 587
   },
   "totals": {
-    "descriptions": 6068,
+    "descriptions": 6726,
     "inputSchemas": 4828,
     "outputSchemas": 1428,
     "toolCount": 16,
-    "tools": 11291
+    "tools": 11949
   }
 }

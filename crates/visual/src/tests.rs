@@ -464,3 +464,122 @@ fn missing_and_broken_assets_fail_the_check_with_their_names() {
         error.message
     );
 }
+
+fn button_of(tree: &Node) -> HandlerId {
+    let button = find(tree, &|n| matches!(n.kind, NodeKind::Button { .. })).unwrap();
+    let NodeKind::Button { on_click, .. } = button.kind else {
+        unreachable!()
+    };
+    on_click
+}
+
+fn answer_script(call: &str) -> String {
+    format!(
+        r#"
+        return function()
+          return ui.button {{ label = "B", on_click = function() {call} end }}
+        end
+        "#
+    )
+}
+
+#[test]
+fn a_handler_queues_its_answers_until_the_host_takes_them() {
+    let mut visual = Visual::load(
+        &answer_script(r#"ui.answer("B", { label = "Pick" }) ui.answer("why: speed")"#),
+        1,
+    )
+    .unwrap();
+    let click = button_of(&visual.render().unwrap());
+    assert!(visual.take_answers().is_empty());
+    visual.call(click, HandlerArg::None).unwrap();
+    assert_eq!(visual.take_answers(), ["Pick: B", "why: speed"]);
+    assert!(visual.take_answers().is_empty());
+}
+
+#[test]
+fn an_answer_outside_a_handler_is_an_error() {
+    let at_top = Visual::load(r#"ui.answer("B") return ui.text "x""#, 1)
+        .err()
+        .unwrap();
+    assert!(
+        at_top.message.contains("only in a handler"),
+        "{}",
+        at_top.message
+    );
+
+    let mut visual = Visual::load(
+        r#"return function() ui.answer("B") return ui.text "x" end"#,
+        1,
+    )
+    .unwrap();
+    let in_view = visual.render().unwrap_err();
+    assert!(
+        in_view.message.contains("only in a handler"),
+        "{}",
+        in_view.message
+    );
+
+    let mut visual = Visual::load(
+        r#"return ui.canvas { height = 10, draw = function(g) ui.answer("B") end }"#,
+        1,
+    )
+    .unwrap();
+    let NodeKind::Canvas(canvas) = visual.render().unwrap().kind else {
+        unreachable!()
+    };
+    let in_draw = visual
+        .draw_canvas(canvas.draw, 10.0, 10.0, 0.0, None)
+        .unwrap_err();
+    assert!(
+        in_draw.message.contains("only in a handler"),
+        "{}",
+        in_draw.message
+    );
+    assert!(visual.take_answers().is_empty());
+}
+
+#[test]
+fn answers_are_strings_capped_and_dropped_when_their_handler_fails() {
+    for (call, needle) in [
+        ("ui.answer(42)", "takes a string, not a"),
+        (r#"ui.answer("B", { label = 1 })"#, "label is a string"),
+        (r#"ui.answer("B", { lable = "Pick" })"#, "no option 'lable'"),
+    ] {
+        let mut visual = Visual::load(&answer_script(call), 1).unwrap();
+        let click = button_of(&visual.render().unwrap());
+        let error = visual.call(click, HandlerArg::None).unwrap_err();
+        assert!(error.message.contains(needle), "{call}: {}", error.message);
+    }
+
+    let mut visual =
+        Visual::load(&answer_script(r#"ui.answer(string.rep("é", 30000))"#), 1).unwrap();
+    let click = button_of(&visual.render().unwrap());
+    visual.call(click, HandlerArg::None).unwrap();
+    let answers = visual.take_answers();
+    assert_eq!(answers[0].chars().count(), MAX_ANSWER_CHARS);
+
+    let mut visual = Visual::load(&answer_script(r#"ui.answer("B") error("boom")"#), 1).unwrap();
+    let click = button_of(&visual.render().unwrap());
+    assert!(visual.call(click, HandlerArg::None).is_err());
+    assert!(visual.take_answers().is_empty());
+}
+
+#[test]
+fn check_reports_what_each_control_would_answer() {
+    let report = check(
+        r#"
+        local s = ui.state { tab = "A" }
+        return function()
+          return ui.column {
+            ui.tabs { options = { "A", "B" }, value = s.tab, on_change = function(v) s.tab = v end },
+            ui.button { label = "Send pick", on_click = function() ui.answer(s.tab, { label = "Pick" }) end },
+          }
+        end
+        "#,
+        1,
+    )
+    .unwrap();
+    assert_eq!(report.interactions, 3);
+    assert_eq!(report.answers, ["Pick: A"]);
+}

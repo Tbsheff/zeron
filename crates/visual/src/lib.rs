@@ -53,6 +53,8 @@ const MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 const CALL_BUDGET: Duration = Duration::from_millis(250);
 /// A canvas or scene draw runs per frame while animating.
 const DRAW_BUDGET: Duration = Duration::from_millis(60);
+pub const MAX_ANSWER_CHARS: usize = 20_000;
+const MAX_QUEUED_ANSWERS: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{message}")]
@@ -128,6 +130,8 @@ pub struct Visual {
     seed: i64,
     deadline: Rc<Cell<Option<Instant>>>,
     logs: Rc<RefCell<Vec<String>>>,
+    answers: Rc<RefCell<Vec<String>>>,
+    in_handler: Rc<Cell<bool>>,
     assets: Assets,
 }
 
@@ -209,6 +213,57 @@ impl Visual {
                 Ok(nice_ticks(lo, hi, count.unwrap_or(5)))
             })?,
         )?;
+        let answers: Rc<RefCell<Vec<String>>> = Rc::default();
+        let in_handler: Rc<Cell<bool>> = Rc::default();
+        let (queue, answering) = (answers.clone(), in_handler.clone());
+        ui.set(
+            "answer",
+            lua.create_function(move |_, (text, options): (Value, Option<Table>)| {
+                if !answering.get() {
+                    return Err(mlua::Error::RuntimeError(
+                        "ui.answer works only in a handler (on_click, on_change), as the reader \
+                         acts"
+                            .into(),
+                    ));
+                }
+                let Value::String(text) = text else {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "ui.answer takes a string, not a {}",
+                        text.type_name()
+                    )));
+                };
+                let mut label = None;
+                if let Some(options) = options {
+                    for pair in options.pairs::<Value, Value>() {
+                        let (key, value) = pair?;
+                        match (key.to_string()?.as_str(), value) {
+                            ("label", Value::String(l)) => label = Some(l.to_string_lossy()),
+                            ("label", other) => {
+                                return Err(mlua::Error::RuntimeError(format!(
+                                    "ui.answer's label is a string, not a {}",
+                                    other.type_name()
+                                )));
+                            }
+                            (other, _) => {
+                                return Err(mlua::Error::RuntimeError(format!(
+                                    "ui.answer has no option '{other}' (only label)"
+                                )));
+                            }
+                        }
+                    }
+                }
+                let text = text.to_string_lossy();
+                let answer = match label.filter(|l| !l.is_empty()) {
+                    Some(label) => format!("{label}: {text}"),
+                    None => text,
+                };
+                let mut queue = queue.borrow_mut();
+                if queue.len() < MAX_QUEUED_ANSWERS {
+                    queue.push(answer.chars().take(MAX_ANSWER_CHARS).collect());
+                }
+                Ok(())
+            })?,
+        )?;
         globals.set("ui", ui)?;
         let math: Table = globals.get("math")?;
         let randomseed: Function = math.get("randomseed")?;
@@ -248,6 +303,8 @@ impl Visual {
             seed,
             deadline,
             logs,
+            answers,
+            in_handler,
             assets: Assets::default(),
         })
     }
@@ -297,13 +354,24 @@ impl Visual {
     /// Call an event handler. The caller renders again afterwards.
     pub fn call(&mut self, id: HandlerId, arg: HandlerArg) -> Result<(), VisualError> {
         let handler = self.handler(id)?.clone();
-        self.budgeted(CALL_BUDGET, || match arg {
+        let answered = self.answers.borrow().len();
+        self.in_handler.set(true);
+        let result = self.budgeted(CALL_BUDGET, || match arg {
             HandlerArg::None => handler.call::<()>(()),
             HandlerArg::Text(text) => handler.call::<()>(text),
             HandlerArg::Bool(b) => handler.call::<()>(b),
             HandlerArg::Number(n) => handler.call::<()>(n),
             HandlerArg::Point(x, y) => handler.call::<()>((x, y)),
-        })
+        });
+        self.in_handler.set(false);
+        if result.is_err() {
+            self.answers.borrow_mut().truncate(answered);
+        }
+        result
+    }
+
+    pub fn take_answers(&self) -> Vec<String> {
+        std::mem::take(&mut *self.answers.borrow_mut())
     }
 
     /// Run a canvas's draw function at a size, in design pixels.
@@ -399,6 +467,7 @@ pub struct Report {
     pub nodes: usize,
     pub interactions: usize,
     pub logs: Vec<String>,
+    pub answers: Vec<String>,
 }
 
 /// Run a script the way the desktop will: setup, the first render, every
@@ -434,6 +503,7 @@ pub fn check_with_assets(source: &str, seed: u64, assets: Assets) -> Result<Repo
         report.interactions += 1;
     }
     report.logs = visual.logs();
+    report.answers = visual.take_answers();
     Ok(report)
 }
 

@@ -54,6 +54,7 @@ export type Props = {
 	title: string?,
 	device: string?,
 	source: string?,
+	on_answer: ((answers: { string }) -> ())?,
 }
 
 -- What the host says of every visual: `{ [id] = { rev, gen } }`.
@@ -1042,6 +1043,10 @@ return ui.component(function(props: Props): Node
 		event = function(handler: number?, arg: any?)
 			if type(handler) == "number" then
 				pcall(ui.invoke, "visuals.event", { id = id, h = handler, arg = arg })
+				local ok, answers = pcall(ui.call_sync, "visuals.answers", id)
+				if ok and type(answers) == "table" and #answers > 0 and props.on_answer then
+					props.on_answer(answers)
+				end
 			end
 		end,
 		drew = function(error: string?)
