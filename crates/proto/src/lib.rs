@@ -25,6 +25,7 @@ pub mod providers;
 pub mod run_errors;
 pub mod sidebar_pins;
 pub mod view;
+pub mod visual_reference;
 pub mod voice;
 pub mod workspace;
 
