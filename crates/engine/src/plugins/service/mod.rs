@@ -31,6 +31,8 @@ use futures::future::BoxFuture;
 use serde_json::{Value as Json, json};
 use zeron_plugin_guard::net;
 
+use crate::plugins::hooks::INSTRUCT;
+
 pub use vm::{DROPPED_EVENT, Described, Failure, Kind, Limits, Settings};
 use vm::{Done, Ops, Spec, Vm};
 
@@ -699,7 +701,13 @@ impl Services {
                 )),
             };
             if let Err(why) = &answer {
-                self.note(&plan.plugin, &format!("zeron.hook(\"{hook}\") failed, so Zeron went on as if it said nothing: {why}"));
+                let line = match hook {
+                    INSTRUCT => format!("zeron.instruct failed, so Zeron left its text out: {why}"),
+                    _ => format!(
+                        "zeron.hook(\"{hook}\") failed, so Zeron went on as if it said nothing: {why}"
+                    ),
+                };
+                self.note(&plan.plugin, &line);
             }
             let done = answer.as_ref().is_ok_and(settled);
             answers.push(answer);
@@ -1050,7 +1058,7 @@ impl PluginOps {
 
     fn recheck(&self, args: &Json) -> Result<Json, String> {
         let hook = args["hook"].as_str().unwrap_or_default();
-        if !self.plan.hooks.iter().any(|h| h == hook) {
+        if hook == INSTRUCT || !self.plan.hooks.iter().any(|h| h == hook) {
             return Err(format!(
                 "zeron.hooks.recheck: \"{hook}\" isn't in the manifest's \"hooks\""
             ));

@@ -47,7 +47,10 @@ pub const KNOWN_PERMISSIONS: &[&str] = &[
     "files.contents",
     "hooks.dispatch",
     "hooks.approve",
+    "agents.instruct",
 ];
+
+pub const MAX_SKILLS: usize = 10;
 
 pub const KNOWN_HOOKS: &[(&str, &str)] = &[
     ("message.dispatch", "hooks.dispatch"),
@@ -107,6 +110,25 @@ pub fn valid_service_path(path: &str) -> bool {
         && path
             .split('/')
             .all(|part| !part.is_empty() && !part.starts_with('.'))
+}
+
+pub fn valid_instructions_path(path: &str) -> bool {
+    path.ends_with(".md")
+        && !path.contains('\\')
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && !part.starts_with('.'))
+}
+
+pub fn skill_name(path: &str) -> Option<&str> {
+    let name = path.strip_prefix("skills/")?.strip_suffix("/SKILL.md")?;
+    let bytes = name.as_bytes();
+    let valid = (1..=64).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'));
+    valid.then_some(name)
 }
 
 /// What's wrong with a `ui.change` entry, if anything. An entry names an
@@ -229,6 +251,8 @@ pub struct Manifest {
     pub network_hosts: Vec<String>,
     pub events: Vec<String>,
     pub hooks: Vec<String>,
+    pub instructions: Option<String>,
+    pub skills: Vec<String>,
     /// `None` when absent; `Some(Err)` when present but malformed.
     pub signature: Option<Result<SignatureSpec, ()>>,
     /// The first thing wrong with it, in plain words.
@@ -430,6 +454,18 @@ impl Manifest {
             problems.push(e);
             Vec::new()
         });
+        let instructions = match object.get("instructions") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(path)) => Some(path.clone()),
+            Some(_) => {
+                problems.push("Its \"instructions\" must be the path of a .md file in it".into());
+                None
+            }
+        };
+        let skills = string_list(object.get("skills"), "\"skills\"").unwrap_or_else(|e| {
+            problems.push(e);
+            Vec::new()
+        });
         let signature = object.get("signature").map(parse_signature);
         let mut manifest = Manifest {
             raw: raw.clone(),
@@ -448,6 +484,8 @@ impl Manifest {
             network_hosts,
             events,
             hooks,
+            instructions,
+            skills,
             signature,
             problem: None,
         };
@@ -507,7 +545,11 @@ impl Manifest {
             }
             _ => {}
         }
-        if let Some(problem) = self.events_problem().or_else(|| self.hooks_problem()) {
+        if let Some(problem) = self
+            .events_problem()
+            .or_else(|| self.hooks_problem())
+            .or_else(|| self.agents_problem())
+        {
             return Some(problem);
         }
         if !self.ui.change.is_empty() && !asks("ui.change") {
@@ -556,6 +598,40 @@ impl Manifest {
                 return Some(format!(
                     "It hooks \"{hook}\" but doesn't ask for \"{permission}\""
                 ));
+            }
+        }
+        None
+    }
+
+    fn agents_problem(&self) -> Option<String> {
+        if (self.instructions.is_some() || !self.skills.is_empty()) && !self.asks("agents.instruct")
+        {
+            return Some(
+                "It gives agents instructions or skills but doesn't ask for \"agents.instruct\""
+                    .into(),
+            );
+        }
+        if let Some(path) = self
+            .instructions
+            .as_ref()
+            .filter(|p| !valid_instructions_path(p))
+        {
+            return Some(format!(
+                "Its instructions \"{path}\" must be a .md file inside it, by a relative path"
+            ));
+        }
+        if self.skills.len() > MAX_SKILLS {
+            return Some(format!("It has more than {MAX_SKILLS} skills"));
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for path in &self.skills {
+            let Some(name) = skill_name(path) else {
+                return Some(format!(
+                    "Its skill \"{path}\" must be skills/<name>/SKILL.md, the name in lowercase letters, digits and dashes"
+                ));
+            };
+            if !names.insert(name) {
+                return Some(format!("It lists the skill \"{name}\" twice"));
             }
         }
         None
@@ -850,6 +926,113 @@ mod tests {
                 true
             ))
             .is_some()
+        );
+    }
+
+    #[test]
+    fn agent_instructions_and_skills_need_the_permission_and_a_plain_shape() {
+        let with = |instructions: serde_json::Value,
+                    skills: serde_json::Value,
+                    permissions: serde_json::Value| {
+            let mut m = base();
+            m["instructions"] = instructions;
+            m["skills"] = skills;
+            m["permissions"] = permissions;
+            m
+        };
+        let asks = serde_json::json!(["agents.instruct"]);
+        let ok = Manifest::from_value(with(
+            serde_json::json!("agents.md"),
+            serde_json::json!(["skills/review-pr/SKILL.md"]),
+            asks.clone(),
+        ))
+        .unwrap();
+        assert_eq!(ok.problem(), None);
+        assert_eq!(
+            (ok.instructions.as_deref(), ok.skills.clone()),
+            (
+                Some("agents.md"),
+                vec!["skills/review-pr/SKILL.md".to_string()]
+            )
+        );
+        let unasked = problem(with(
+            serde_json::json!("agents.md"),
+            serde_json::Value::Null,
+            serde_json::json!([]),
+        ));
+        assert!(
+            unasked
+                .unwrap()
+                .contains("doesn't ask for \"agents.instruct\"")
+        );
+        let skills_unasked = problem(with(
+            serde_json::Value::Null,
+            serde_json::json!(["skills/a/SKILL.md"]),
+            serde_json::json!([]),
+        ));
+        assert!(skills_unasked.unwrap().contains("agents.instruct"));
+        for bad in [
+            "../agents.md",
+            "/agents.md",
+            ".hidden/agents.md",
+            "agents.txt",
+            "a\\b.md",
+        ] {
+            assert!(
+                problem(with(
+                    serde_json::json!(bad),
+                    serde_json::Value::Null,
+                    asks.clone()
+                ))
+                .is_some(),
+                "{bad}"
+            );
+        }
+        assert!(
+            problem(with(
+                serde_json::json!(7),
+                serde_json::Value::Null,
+                asks.clone()
+            ))
+            .is_some()
+        );
+        for bad in [
+            "skills/Review/SKILL.md",
+            "skills/a/b/SKILL.md",
+            "skills/a/skill.md",
+            "other/a/SKILL.md",
+            "skills//SKILL.md",
+            "skills/-a/SKILL.md",
+        ] {
+            let found = problem(with(
+                serde_json::Value::Null,
+                serde_json::json!([bad]),
+                asks.clone(),
+            ));
+            assert!(
+                found.is_some_and(|p| p.contains("skills/<name>/SKILL.md")),
+                "{bad}"
+            );
+        }
+        let twice = problem(with(
+            serde_json::Value::Null,
+            serde_json::json!(["skills/a/SKILL.md", "skills/a/SKILL.md"]),
+            asks.clone(),
+        ));
+        assert!(twice.unwrap().contains("twice"));
+        let eleven: Vec<String> = (0..=MAX_SKILLS)
+            .map(|i| format!("skills/s{i}/SKILL.md"))
+            .collect();
+        let many = problem(with(
+            serde_json::Value::Null,
+            serde_json::json!(eleven),
+            asks.clone(),
+        ));
+        assert!(many.unwrap().contains("more than 10 skills"));
+        let ten = &eleven[..MAX_SKILLS];
+        assert_eq!(
+            problem(with(serde_json::Value::Null, serde_json::json!(ten), asks)),
+            None
         );
     }
 

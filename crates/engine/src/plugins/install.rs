@@ -136,6 +136,11 @@ pub fn parse(raw: Vec<u8>) -> Result<Package, String> {
     if !verified.files.contains_key(&manifest.entry) {
         return Err(format!("Its entry file {} is missing", manifest.entry));
     }
+    if let Some(problem) =
+        super::agents::files_problem(&manifest, |path| verified.files.get(path).cloned())
+    {
+        return Err(problem);
+    }
     // What `scan::inspect` checks of a folder: the signature as a plugin's.
     let hashes = package::hashes(&verified.files);
     if signing::check(&manifest, &hashes) != SigCheck::Valid(verified.key.clone()) {

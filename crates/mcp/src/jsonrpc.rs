@@ -81,13 +81,20 @@ subagent, delegate through Zeron chats instead, with `create_chats` (or `create_
 /// What `initialize` tells the agent: with when to say it waits where it's
 /// offered `wait_on_background`, and the side-chat rule when its host turned
 /// the agent's own subagents off.
-fn instructions(waits: bool, side_chats_only: bool) -> std::borrow::Cow<'static, str> {
-    if !waits && !side_chats_only {
+fn instructions(
+    waits: bool,
+    side_chats_only: bool,
+    plugins: Option<&str>,
+) -> std::borrow::Cow<'static, str> {
+    if !waits && !side_chats_only && plugins.is_none() {
         return INSTRUCTIONS.into();
     }
     let waits = if waits { WAITS_ON_BACKGROUND } else { "" };
     let side_chats = if side_chats_only { SIDE_CHATS_ONLY } else { "" };
-    format!("{INSTRUCTIONS}{waits}{side_chats}").into()
+    let plugins = plugins
+        .map(|text| format!("\n\n{text}"))
+        .unwrap_or_default();
+    format!("{INSTRUCTIONS}{waits}{side_chats}{plugins}").into()
 }
 
 const PARSE_ERROR: i64 = -32700;
@@ -234,7 +241,11 @@ pub async fn handle_request(tools: &Tools, id: Value, method: &str, params: Valu
                         "name": "zeron",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
-                    "instructions": instructions(tools.waits_on_background(), tools.side_chats_only()),
+                    "instructions": instructions(
+                        tools.waits_on_background(),
+                        tools.side_chats_only(),
+                        tools.plugin_instructions().as_deref(),
+                    ),
                 }),
             )
         }
@@ -390,8 +401,8 @@ mod tests {
 
     #[test]
     fn side_chats_only_instructions_add_the_delegation_rule() {
-        assert_eq!(instructions(false, false), INSTRUCTIONS);
-        let side_chats = instructions(false, true);
+        assert_eq!(instructions(false, false, None), INSTRUCTIONS);
+        let side_chats = instructions(false, true, None);
         assert!(side_chats.starts_with(INSTRUCTIONS));
         assert!(side_chats.ends_with("with `create_chats` (or `create_chat`)."));
     }
@@ -399,10 +410,10 @@ mod tests {
     #[test]
     fn only_an_agent_offered_wait_on_background_is_told_when_to_use_it() {
         assert!(!INSTRUCTIONS.contains("wait_on_background"));
-        let waits = instructions(true, false);
+        let waits = instructions(true, false, None);
         assert!(waits.starts_with(INSTRUCTIONS));
         assert!(waits.contains("call `wait_on_background`"));
-        let both = instructions(true, true);
+        let both = instructions(true, true, None);
         assert!(both.contains("call `wait_on_background`"));
         assert!(both.ends_with("with `create_chats` (or `create_chat`)."));
     }

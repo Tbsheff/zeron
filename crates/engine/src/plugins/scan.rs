@@ -128,6 +128,17 @@ pub fn inspect(dir: &Path, under_plugins: bool) -> Inspected {
         let entry = manifest.entry.clone();
         return fail(inspected, format!("Its entry file {entry} is missing"));
     }
+    let read = |path: &str| {
+        inspected
+            .files
+            .contains_key(path)
+            .then(|| std::fs::read(dir.join(path)).ok())
+            .flatten()
+    };
+    let agents_problem = super::agents::files_problem(manifest, read);
+    if let Some(problem) = agents_problem {
+        return fail(inspected, problem);
+    }
     inspected
 }
 

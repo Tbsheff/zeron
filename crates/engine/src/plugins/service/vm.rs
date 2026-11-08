@@ -26,6 +26,7 @@ use mlua::{Function, Lua, LuaOptions, StdLib, Table, Value, VmState};
 use serde_json::Value as Json;
 use tokio::sync::oneshot;
 
+use crate::plugins::hooks::INSTRUCT;
 use crate::plugins::manifest::{KNOWN_EVENTS, KNOWN_HOOKS};
 
 const PRELUDE: &str = include_str!("prelude.luau");
@@ -738,6 +739,7 @@ fn natives(
         hooks.raw_set(*name, spec.hooks.iter().any(|h| h == name))?;
     }
     host.set("hooks", hooks)?;
+    host.set("instruct", spec.hooks.iter().any(|h| h == INSTRUCT))?;
     let settings = spec.settings.clone();
     host.set(
         "setting",

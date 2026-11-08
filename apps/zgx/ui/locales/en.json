@@ -3182,6 +3182,10 @@
           "title": "Answer your agents' approval requests for you",
           "detail": "It can allow or refuse a command, a file change or a tool use that would ask you. If it doesn't answer, you're asked as usual."
         },
+        "agents_instruct": {
+          "title": "Adds instructions to every agent's context",
+          "detail": "Its words and skills reach each agent you start, so it can steer what they do."
+        },
         "panel_tabs": {
           "title": "Open tabs in your chats' panels"
         },

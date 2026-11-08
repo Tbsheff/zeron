@@ -214,6 +214,20 @@ fn mcp_servers_config_arg(
     Some(serde_json::json!({ "mcpServers": servers }).to_string())
 }
 
+fn plugin_context_args(mcp: Option<&McpServer>) -> Vec<std::ffi::OsString> {
+    let Some(mcp) = mcp else {
+        return Vec::new();
+    };
+    let mut args = Vec::new();
+    if let Some(path) = mcp.plugin_instructions() {
+        args.extend(["--append-system-prompt-file".into(), path.into()]);
+    }
+    for dir in mcp.plugin_skills() {
+        args.extend(["--plugin-dir".into(), dir.into_os_string()]);
+    }
+    args
+}
+
 /// The `--model` value: the 1M context window is selected via a model-id
 /// suffix (`sonnet[1m]`), exactly how the CLI itself does it.
 fn model_arg(request: &RunRequest) -> Option<String> {
@@ -513,9 +527,11 @@ impl ClaudeHarness {
             // Zeron's own server (and the plugins' native ones) ride beside
             // the user's configured servers (no `--strict-mcp-config`): the
             // CLI merges an inline JSON config with settings-sourced ones.
-            if let Some(config) = mcp_servers_config_arg(request.mcp.as_ref(), &request.extra_mcp) {
+            let zeron = request.mcp.as_ref().map(McpServer::without_plugin_context);
+            if let Some(config) = mcp_servers_config_arg(zeron.as_ref(), &request.extra_mcp) {
                 cmd.args(["--mcp-config", &config]);
             }
+            cmd.args(plugin_context_args(request.mcp.as_ref()));
             // When to say it waits on background work (the Zeron tool
             // `wait_on_background`), where that tool is offered. Its own
             // description and the server's instructions say so too, but
@@ -2625,5 +2641,81 @@ mod mcp_injection_tests {
             serde_json::from_str(&mcp_servers_config_arg(None, &[extra]).unwrap()).unwrap();
         assert!(only["mcpServers"].get("zeron").is_none());
         assert!(only["mcpServers"].get("plugin-focus").is_some());
+    }
+
+    #[test]
+    fn plugin_instructions_join_the_system_prompt_and_skills_load_as_plugin_folders() {
+        let skills = std::env::join_paths([
+            "/data/plugins/.agents/skills/a-1",
+            "/data/plugins/.agents/skills/b-2",
+        ])
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+        let zeron = McpServer {
+            name: "zeron".into(),
+            command: "zeron-engine".into(),
+            args: vec!["mcp".into()],
+            env: [
+                (McpServer::CHAT_ID_ENV, "c1"),
+                (
+                    McpServer::PLUGIN_INSTRUCTIONS_ENV,
+                    "/data/plugins/.agents/chats/c1.md",
+                ),
+                (McpServer::PLUGIN_SKILLS_ENV, skills.as_str()),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect(),
+        };
+        let request = RunRequest {
+            mcp: Some(zeron),
+            prompt: "hi".into(),
+            harness: None,
+            model: None,
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            cwd: String::new(),
+            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            auto_approve: false,
+            access: Default::default(),
+            plan: false,
+            attachments: Vec::new(),
+            worktree: None,
+            resume: None,
+            env: Default::default(),
+            extra_mcp: Vec::new(),
+        };
+        let cmd = ClaudeHarness::build_command(std::path::Path::new("claude"), &request, false);
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let after = |flag: &str| -> Vec<&str> {
+            args.windows(2)
+                .filter(|w| w[0] == flag)
+                .map(|w| w[1].as_str())
+                .collect()
+        };
+        assert_eq!(
+            after("--append-system-prompt-file"),
+            ["/data/plugins/.agents/chats/c1.md"]
+        );
+        assert_eq!(
+            after("--plugin-dir"),
+            [
+                "/data/plugins/.agents/skills/a-1",
+                "/data/plugins/.agents/skills/b-2"
+            ]
+        );
+        let config: Value = serde_json::from_str(after("--mcp-config")[0]).unwrap();
+        let env = &config["mcpServers"]["zeron"]["env"];
+        assert_eq!(env[McpServer::CHAT_ID_ENV], "c1");
+        assert!(
+            env.get(McpServer::PLUGIN_INSTRUCTIONS_ENV).is_none(),
+            "{env}"
+        );
+        assert!(env.get(McpServer::PLUGIN_SKILLS_ENV).is_none(), "{env}");
     }
 }

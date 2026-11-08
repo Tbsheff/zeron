@@ -689,6 +689,35 @@ impl McpServer {
                 .get(Self::WAITS_ON_BACKGROUND_ENV)
                 .is_some_and(|value| value == "1")
     }
+
+    pub const PLUGIN_INSTRUCTIONS_ENV: &'static str = "ZERON_PLUGIN_INSTRUCTIONS";
+
+    pub const PLUGIN_SKILLS_ENV: &'static str = "ZERON_PLUGIN_SKILLS";
+
+    pub fn plugin_instructions(&self) -> Option<&str> {
+        self.env
+            .get(Self::PLUGIN_INSTRUCTIONS_ENV)
+            .map(String::as_str)
+            .filter(|path| !path.is_empty())
+    }
+
+    pub fn plugin_skills(&self) -> Vec<std::path::PathBuf> {
+        self.env
+            .get(Self::PLUGIN_SKILLS_ENV)
+            .map(|joined| {
+                std::env::split_paths(joined)
+                    .filter(|dir| !dir.as_os_str().is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn without_plugin_context(&self) -> Self {
+        let mut server = self.clone();
+        server.env.remove(Self::PLUGIN_INSTRUCTIONS_ENV);
+        server.env.remove(Self::PLUGIN_SKILLS_ENV);
+        server
+    }
 }
 
 /// Isolated-worktree directive riding [`RunRequest`]. The worktree is created

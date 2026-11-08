@@ -370,6 +370,8 @@ impl EngineCore {
                 default_harness,
             };
             plugins.set_actor(move |plugin, action, args| actions.act(plugin, action, args));
+            let chats = workspace.clone();
+            plugins.set_project_of(move |chat| chats.chat(chat).ok().flatten()?.space_id);
             let drains = doc_host.clone();
             plugins.set_rechecker(move || drains.kick_drains());
         }

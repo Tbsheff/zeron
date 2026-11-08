@@ -29,6 +29,8 @@ A plugin is a folder: `zeron-plugin.json` (its manifest), `init.luau` (its code)
 - `service`: its headless half (`"service.luau"`), which Zeron's engine runs on each device that allowed the plugin. Needs `"service"` (see [Services](#services)).
 - `events`: the app events its service hears (`["turn.done"]`, see [Events](#events)). Needs a `service` and `"sessions.read"`.
 - `hooks`: the decisions its service makes before Zeron goes on (`["message.dispatch", "tool.approve"]`, see [Hooks](#hooks)). Needs a `service`, and `"hooks.dispatch"` or `"hooks.approve"` for each.
+- `instructions`: a markdown file in your plugin (`"agents.md"`, 8 KB at most) that reaches every agent you start (see [Agent instructions](#agent-instructions)). Needs `"agents.instruct"`.
+- `skills`: up to 10 skill files (`["skills/review-pr/SKILL.md"]`, 32 KB each), each with front matter giving its `name` (its folder's) and a `description`. Needs `"agents.instruct"`.
 - `network`: `{ "hosts": ["api.example.com", "*.example.org", "localhost:8080"] }`, the hosts its requests may reach, from its window and its service alike (see [Reaching the network](#reaching-the-network)). Without it, `network` reaches any public address and never this device, your network or a cloud's metadata address. With it, only those hosts; a private one (`localhost`, `10.…`, `nas.local`) is reachable only when it's named exactly, and the consent sheet says so. `Authorization` and `Cookie` headers go only to hosts named here. Needs `"network"`.
 
 Your own plugins are signed as yours, and re-signed and reloaded each time you save.
@@ -62,6 +64,7 @@ Your own plugins are signed as yours, and re-signed and reloaded each time you s
 | `files.contents` | read a file's contents in a session's folder from its service (`zeron.files.read`). Needs `files.read` |
 | `hooks.dispatch` | hold or refuse a message before it reaches an agent (`zeron.hook("message.dispatch")`). See [Hooks](#hooks) |
 | `hooks.approve` | answer an agent's approval request for you (`zeron.hook("tool.approve")`). See [Hooks](#hooks) |
+| `agents.instruct` | add its `instructions`, `skills` and `zeron.instruct` text to every agent's context. See [Agent instructions](#agent-instructions) |
 
 ## Reaching the network
 
@@ -541,6 +544,57 @@ end)
 ```
 
 `plugins-dev/quiet-hours` and `plugins-dev/safe-commands` are these, whole: quiet hours you set on its settings page, and an allowlist of read-only commands that refuses `rm -rf /`.
+
+### Agent instructions
+
+An agent finds your plugin's tools only in their descriptions, and some agents (Claude Code) load those late or not at all. Instructions tell every agent, from its first turn, when to use them.
+
+```json
+"permissions": ["tools", "agents.instruct"],
+"instructions": "agents.md",
+"skills": ["skills/count-words/SKILL.md"]
+```
+
+- `instructions`: markdown, 8 KB at most. More is an error when Zeron checks the plugin.
+- `skills`: up to 10, each `skills/<name>/SKILL.md` (lowercase letters, digits and dashes), 32 KB at most, starting with front matter:
+
+```markdown
+---
+name: count-words
+description: Use when the person asks how long a text is.
+---
+Call notes_tool__count_words with the text, then ...
+```
+
+The consent sheet marks `agents.instruct` as risky: it steers what agents do.
+
+**What an agent gets.** Each run Zeron starts on this device gets a "Plugins" section: each plugin that is on and allowed `agents.instruct`, in install order, with its name, its instructions, then its `zeron.instruct` text. All plugins together have 24 KB; a plugin that would go past that is left out whole, and its log (`plugin_status`) says so. Turning a plugin on or off reaches the next run of a chat's agent, with no restart. An agent already running keeps what it started with.
+
+| agent | instructions | skills |
+|---|---|---|
+| Claude Code | added to its system prompt (`--append-system-prompt-file`) | real skills, `<plugin id>:<name>`, loaded from a folder Zeron makes with only your `SKILL.md` files (`--plugin-dir`). Nothing is written to `~/.claude` or the project |
+| others (Codex, OpenCode, ACP agents, ...) | the end of Zeron's MCP server instructions, for agents that read them | listed in that section with their description and the path of the copied `SKILL.md` to read |
+
+Claude Code cuts an MCP server's instructions at about 4,000 characters, which Zeron's own nearly fill: that's why it gets yours in its system prompt.
+
+**Per chat: `zeron.instruct`.** A service may add text for each run, under your static text:
+
+```lua
+zeron.instruct(function(ctx)
+	if ctx.project == "proj-api" then
+		return "This project's migrations live in db/migrations. Never edit one that has shipped."
+	end
+	return nil
+end)
+```
+
+| ctx field | what |
+|---|---|
+| `session` | the chat |
+| `project?` | its project's id |
+| `harness` | `"claude-code"`, `"codex"`, ... |
+
+Return text or `nil`. It needs a `service` and `"agents.instruct"`; without the permission, `zeron.instruct` is an error. A function has 2 seconds, and each plugin is asked at once, beside the others. One that fails, takes longer, or returns something that isn't text is left out, and your service's log says why. Its text counts toward the 24 KB, and more than 8 KB from one plugin is left out. A service allowed `agents.instruct` starts when Zeron does and stays running, as a service with hooks does: a run never waits for a cold start, and a service that isn't running adds nothing.
 
 ## Settings
 

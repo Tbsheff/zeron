@@ -4,7 +4,9 @@
   "version": "1.0.0",
   "description": "Gives your agents two small tools: counting words, and the chat you have open.",
   "entry": "init.luau",
-  "permissions": ["tools", "sessions.read"],
+  "permissions": ["tools", "sessions.read", "agents.instruct"],
+  "instructions": "agents.md",
+  "skills": ["skills/word-count/SKILL.md"],
   "tools": [
     {
       "name": "count_words",

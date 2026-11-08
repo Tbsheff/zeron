@@ -319,6 +319,23 @@ local function service(id: string): any
 		end
 	end
 
+	function M.instruct(fn: (any) -> string?): () -> ()
+		assert(type(fn) == "function", "zeron.instruct(fn)")
+		if not host.instruct then
+			error(`zeron.instruct: the manifest doesn't ask for "agents.instruct"`, 2)
+		end
+		local entry = { fn = fn }
+		local list = deciders["agent.instruct"] or {}
+		deciders["agent.instruct"] = list
+		table.insert(list, entry)
+		return function()
+			local at = table.find(list, entry)
+			if at then
+				table.remove(list, at)
+			end
+		end
+	end
+
 	M.hooks = {}
 
 	-- Ask Zeron to run a hook again for what it holds (a "wait" on

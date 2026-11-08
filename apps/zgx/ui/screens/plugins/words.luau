@@ -279,6 +279,8 @@ function M.permission(item: any, permission: string): Line
 		return line(true, "clock-circle", "plugins.words.permission.hooks_dispatch.title", "plugins.words.permission.hooks_dispatch.detail")
 	elseif permission == "hooks.approve" then
 		return line(true, "shield-check", "plugins.words.permission.hooks_approve.title", "plugins.words.permission.hooks_approve.detail")
+	elseif permission == "agents.instruct" then
+		return line(true, "chat-round-line", "plugins.words.permission.agents_instruct.title", "plugins.words.permission.agents_instruct.detail")
 	elseif permission == "panel.tabs" then
 		return line(false, "split-columns", "plugins.words.permission.panel_tabs.title")
 	elseif permission == "pages.add" then

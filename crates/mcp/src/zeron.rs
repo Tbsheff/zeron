@@ -41,6 +41,7 @@ pub struct Origin {
     /// ends, so it may say it waits on that work
     /// ([`zeron_proto::McpServer::WAITS_ON_BACKGROUND_ENV`]).
     pub waits_on_background: bool,
+    pub plugin_instructions: Option<std::path::PathBuf>,
 }
 
 impl Origin {
@@ -59,6 +60,8 @@ impl Origin {
             waits_on_background: read(zeron_proto::McpServer::WAITS_ON_BACKGROUND_ENV)
                 .as_deref()
                 == Some("1"),
+            plugin_instructions: read(zeron_proto::McpServer::PLUGIN_INSTRUCTIONS_ENV)
+                .map(std::path::PathBuf::from),
         }
     }
 }

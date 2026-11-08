@@ -15,6 +15,7 @@
 //! templates for agents. This file does the IO around them.
 
 pub mod actions;
+pub mod agents;
 pub mod broker;
 pub mod capability;
 pub mod events;
@@ -234,6 +235,7 @@ struct Inner {
     /// Where this device's chats and projects are (`zeron.folders`).
     folders: Mutex<Option<FoldersFn>>,
     actor: Mutex<Option<ActFn>>,
+    project_of: Mutex<Option<agents::ProjectOfFn>>,
     /// One-time capabilities for Zeron's consent window (`ReviewPlugin`,
     /// `ReviewTemplate`): what allowing and signing need.
     reviews: Mutex<reviews::Reviews>,
@@ -510,6 +512,7 @@ impl Plugins {
                 notifier: Mutex::new(None),
                 folders: Mutex::new(None),
                 actor: Mutex::new(None),
+                project_of: Mutex::new(None),
                 step_up: Mutex::new(None),
                 new_keys: Mutex::new(Vec::new()),
                 key_notices: Mutex::new(Vec::new()),
@@ -2569,9 +2572,17 @@ fn service_plan(entry: &Entry) -> Option<Plan> {
         commands: item.commands.clone(),
         hosts: item.network_hosts.clone(),
         events: item.events.clone(),
-        hooks: item.hooks.clone(),
+        hooks: plan_hooks(entry),
         settings: setting_defaults(entry),
     })
+}
+
+fn plan_hooks(entry: &Entry) -> Vec<String> {
+    let mut hooks = entry.item.hooks.clone();
+    if entry.allows(agents::PERMISSION) {
+        hooks.push(hooks::INSTRUCT.into());
+    }
+    hooks
 }
 
 fn setting_defaults(entry: &Entry) -> serde_json::Map<String, serde_json::Value> {

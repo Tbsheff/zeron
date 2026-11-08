@@ -10,6 +10,7 @@ use super::{Plugins, install, lock};
 
 pub const DISPATCH: &str = "message.dispatch";
 pub const APPROVE: &str = "tool.approve";
+pub const INSTRUCT: &str = "agent.instruct";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Dispatch {
@@ -46,7 +47,7 @@ pub fn in_install_order(plugins_dir: &Path, plans: &[Plan]) -> Vec<Plan> {
     hooked.into_iter().map(|(_, plan)| plan).collect()
 }
 
-fn deciding(plans: &[Plan], hook: &str) -> Vec<Plan> {
+pub(super) fn deciding(plans: &[Plan], hook: &str) -> Vec<Plan> {
     plans
         .iter()
         .filter(|p| p.hooks.iter().any(|h| h == hook) && p.allows(permission(hook)))
@@ -55,6 +56,9 @@ fn deciding(plans: &[Plan], hook: &str) -> Vec<Plan> {
 }
 
 fn permission(hook: &str) -> &'static str {
+    if hook == INSTRUCT {
+        return super::agents::PERMISSION;
+    }
     super::manifest::KNOWN_HOOKS
         .iter()
         .find(|(name, _)| *name == hook)
@@ -114,7 +118,7 @@ impl Plugins {
         !self.hooked(hook).is_empty()
     }
 
-    fn hooked(&self, hook: &str) -> Vec<Plan> {
+    pub(super) fn hooked(&self, hook: &str) -> Vec<Plan> {
         deciding(&lock(&self.inner.hooked), hook)
     }
 

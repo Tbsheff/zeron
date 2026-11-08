@@ -3887,6 +3887,13 @@ async fn drive_run(
         .get()
         .map(crate::plugins::Plugins::native_mcp_servers)
         .unwrap_or_default();
+    if let Some(mcp) = request.mcp.as_mut() {
+        let delivery = match inner.plugins.get() {
+            Some(plugins) => plugins.agent_context(&chat_id, harness_id).await,
+            None => Default::default(),
+        };
+        delivery.stamp(mcp);
+    }
     // A revived turn the resumed session already holds: the provider gets
     // the continuation, while the transcript, preview and title keep the
     // user's own message (and the retries carry the revival on).

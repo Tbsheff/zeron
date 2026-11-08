@@ -799,6 +799,14 @@ impl Tools {
         origin.chat_id.is_some() && origin.waits_on_background
     }
 
+    pub fn plugin_instructions(&self) -> Option<String> {
+        let path = self.zeron.origin().plugin_instructions.as_ref()?;
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|text| text.trim().to_owned())
+            .filter(|text| !text.is_empty())
+    }
+
     pub fn list(&self) -> Vec<ToolDef> {
         let in_chat = self.zeron.origin().chat_id.is_some();
         let waits = self.waits_on_background();
@@ -3397,6 +3405,48 @@ mod tests {
                 assert_eq!(result["turn"]["replies"][0]["id"], "new-reply");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn initialize_ends_with_the_run_plugin_instructions_when_the_host_wrote_them() {
+        let world = Arc::new(World::default());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("chat.md");
+        std::fs::write(
+            &file,
+            "## Plugins\n\n### Notes tool\n\nCall notes_tool__count_words.\n",
+        )
+        .unwrap();
+        let said = |origin: Origin| {
+            let tools = tools(world.clone(), origin);
+            async move {
+                let init =
+                    crate::jsonrpc::handle_request(&tools, json!(1), "initialize", json!({})).await;
+                init["result"]["instructions"].as_str().unwrap().to_owned()
+            }
+        };
+        let with = said(Origin {
+            chat_id: Some("chat-alpha-1".into()),
+            plugin_instructions: Some(file.clone()),
+            ..Default::default()
+        })
+        .await;
+        assert!(
+            with.ends_with("### Notes tool\n\nCall notes_tool__count_words."),
+            "{with}"
+        );
+        let without = said(Origin {
+            chat_id: Some("chat-alpha-1".into()),
+            ..Default::default()
+        })
+        .await;
+        assert!(!without.contains("## Plugins"));
+        let gone = said(Origin {
+            plugin_instructions: Some(dir.path().join("missing.md")),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(gone, without);
     }
 
     #[tokio::test]
