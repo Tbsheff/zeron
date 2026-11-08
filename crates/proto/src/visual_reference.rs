@@ -40,7 +40,8 @@ pub fn topic_for_error(message: &str) -> &'static str {
 fn prop_topic(lower: &str) -> Option<&'static str> {
     lower
         .split('\'')
-        .filter_map(|quoted| match quoted {
+        .rev()
+        .find_map(|quoted| match quoted {
             "width" | "grow" | "key" | "gap" | "align" | "justify" | "wrap" => Some("layout"),
             "fill" | "bg" | "background" | "border" | "shadow" | "padding" | "radius" | "blur"
             | "opacity" | "font" | "family" | "font_family" | "fontfamily" | "font_size"
@@ -48,7 +49,6 @@ fn prop_topic(lower: &str) -> Option<&'static str> {
             "color" => Some("colors"),
             _ => None,
         })
-        .last()
 }
 
 fn node_topic(lower: &str) -> Option<&'static str> {
