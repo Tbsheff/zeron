@@ -73,6 +73,7 @@ pub struct Driver {
     store: Arc<DocsStore>,
     device: String,
     faults: Faults,
+    changed: tokio::sync::watch::Sender<u64>,
 }
 
 impl Driver {
@@ -85,7 +86,16 @@ impl Driver {
             store,
             device,
             faults: Faults::default(),
+            changed: tokio::sync::watch::Sender::new(0),
         })
+    }
+
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    fn changed(&self) {
+        self.changed.send_modify(|n| *n = n.wrapping_add(1));
     }
 
     pub fn device(&self) -> &str {
@@ -116,6 +126,7 @@ impl Driver {
             }
             self.apply_tx(tx, key, None, &event).map(Some)
         })?;
+        self.changed();
         if out.as_ref().is_some_and(|o| !o.duplicate) {
             self.faults.hit(FaultPoint::Fp1StepCommittedEffectNotRun)?;
         }
@@ -127,7 +138,9 @@ impl Driver {
     }
 
     pub fn put_meta(&self, key: &str, value: &str) -> Result<(), DriverError> {
-        self.store.transact(|tx| store::put_meta(tx, key, value))
+        self.store.transact(|tx| store::put_meta(tx, key, value))?;
+        self.changed();
+        Ok(())
     }
 
     pub fn delete_meta(&self, key: &str) -> Result<(), DriverError> {
@@ -164,6 +177,7 @@ impl Driver {
     pub fn complete(&self, effect_id: &str) -> Result<(), DriverError> {
         self.faults.hit(FaultPoint::Fp2EffectRunNotMarked)?;
         self.store.transact(|tx| store::mark_done(tx, effect_id))?;
+        self.changed();
         Ok(())
     }
 
@@ -176,6 +190,7 @@ impl Driver {
         let out = self
             .store
             .transact(|tx| self.apply_tx(tx, key, cmd, &event))?;
+        self.changed();
         if !out.duplicate {
             self.faults.hit(FaultPoint::Fp1StepCommittedEffectNotRun)?;
         }
@@ -268,6 +283,7 @@ impl Driver {
     pub fn mark_command(&self, cmd: &str) -> Result<(), DriverError> {
         self.faults.hit(FaultPoint::Fp4ReceiptNotMarked)?;
         self.store.mark_processed(cmd)?;
+        self.changed();
         Ok(())
     }
 
@@ -287,6 +303,7 @@ impl Driver {
             self.faults.hit(FaultPoint::Fp2EffectRunNotMarked)?;
             self.store
                 .transact(|tx| store::mark_done(tx, &row.effect_id))?;
+            self.changed();
         }
         Ok(rows.len())
     }

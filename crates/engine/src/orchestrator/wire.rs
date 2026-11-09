@@ -186,6 +186,7 @@ pub struct OrchWire {
     redeliver: Mutex<HashSet<(String, String)>>,
     quiet: Mutex<HashMap<String, u32>>,
     suspect: Mutex<HashMap<String, AttemptId>>,
+    boot_live: HashSet<AttemptId>,
     lose: Mutex<HashSet<String>>,
     dead: std::sync::atomic::AtomicBool,
     wake: tokio::sync::Notify,
@@ -198,6 +199,7 @@ impl OrchWire {
         opts: OrchOptions,
     ) -> Result<Arc<Self>, DriverError> {
         let driver = Driver::open(store, device, opts.config)?;
+        let boot_live = live_attempts(&driver.state()?);
         Ok(Arc::new_cyclic(|me| Self {
             me: me.clone(),
             driver,
@@ -210,6 +212,7 @@ impl OrchWire {
             redeliver: Mutex::new(HashSet::new()),
             quiet: Mutex::new(HashMap::new()),
             suspect: Mutex::new(HashMap::new()),
+            boot_live,
             lose: Mutex::new(HashSet::new()),
             dead: std::sync::atomic::AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
@@ -790,11 +793,17 @@ impl OrchWire {
             Err(err) => return vec![Err(self.to_engine(err))],
         };
         let mut out = Vec::new();
+        let mut busy = HashSet::new();
         for row in rows {
             if only.is_some_and(|ids| !ids.contains(&row.effect_id)) {
                 continue;
             }
+            let t = order_key(&row.effect);
+            if t.is_some_and(|t| busy.contains(&t)) {
+                continue;
+            }
             if self.is_dead() || !lock(&self.claimed).insert(row.effect_id.clone()) {
+                busy.extend(t);
                 continue;
             }
             let res = self.execute(engine, &row, false).await;
@@ -1090,7 +1099,11 @@ impl OrchWire {
     fn reconcile(&self, engine: &dyn RunEngine) -> Result<(), DriverError> {
         let s = self.driver.state()?;
         let pending = self.driver.pending()?;
-        for th in s.threads.values().filter(|th| th.is_live()) {
+        let left = s
+            .threads
+            .values()
+            .filter(|th| th.is_live() && self.boot_live.contains(&th.attempt_id()));
+        for th in left {
             let chat = self.chat_of(th.id)?;
             if self.may_be_stuck(engine, th, &chat, &pending) {
                 self.end_stuck(engine, &chat, th.attempt_id())?;
@@ -1108,6 +1121,27 @@ impl OrchWire {
         }
         Ok(())
     }
+}
+
+fn order_key(effect: &Effect) -> Option<ThreadId> {
+    match effect {
+        Effect::CreateChild { child, .. } => Some(*child),
+        Effect::StartRun { run, .. }
+        | Effect::InterruptRun { run }
+        | Effect::ArmTimer { run } => Some(run.thread),
+        Effect::StartAttempt { attempt, .. }
+        | Effect::SteerRun { attempt, .. }
+        | Effect::InterruptAttempt { attempt } => Some(attempt.run.thread),
+        Effect::CompleteWait { .. } | Effect::Reconfigure { .. } | Effect::Send(_) => None,
+    }
+}
+
+fn live_attempts(s: &OrchState) -> HashSet<AttemptId> {
+    s.threads
+        .values()
+        .filter(|th| th.is_live())
+        .map(Thread::attempt_id)
+        .collect()
 }
 
 fn starts(effect: &Effect, t: ThreadId) -> bool {
