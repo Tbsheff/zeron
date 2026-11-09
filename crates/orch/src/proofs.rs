@@ -1,4 +1,6 @@
-use crate::event::{DelEvent, DelegateMode, Event, How, Mode, OutboxEvent, RunEvent};
+use crate::event::{
+    DelEvent, DelegateMode, Effect, Event, How, Mode, OutboxEvent, Reject, RunEvent,
+};
 use crate::ids::ThreadId;
 use crate::invariants::{check_invariants, s1, s3, s5a, s6, well_formed};
 use crate::state::{
@@ -6,6 +8,7 @@ use crate::state::{
     Run, RunStatus, Start, Task, TaskSt, Thread, WakeRule,
 };
 use crate::step::apply_event;
+use crate::{delegation, outbox, run};
 
 const R: ThreadId = ThreadId(0);
 const A: ThreadId = ThreadId(1);
@@ -29,9 +32,7 @@ fn pick<T: Copy, const K: usize>(items: [T; K]) -> T {
     items[i]
 }
 
-fn tid() -> ThreadId {
-    pick([R, A, B])
-}
+const IDS: [ThreadId; 3] = [R, A, B];
 
 fn outcome() -> Outcome {
     pick([
@@ -99,8 +100,37 @@ fn assume_good(s: &OrchState) {
 }
 
 fn preserved(mut s: OrchState, e: Event, holds: fn(&OrchState) -> bool) {
-    if apply_event(&mut s, e).is_ok() {
+    let ok = apply_event(&mut s, e).is_ok();
+    kani::cover!(ok);
+    if ok {
         assert!(holds(&s));
+    }
+}
+
+fn holds_after(
+    s: &mut OrchState,
+    act: impl FnOnce(&mut OrchState, &mut Vec<Effect>) -> Result<(), Reject>,
+    holds: fn(&OrchState) -> bool,
+) {
+    let mut fx = Vec::new();
+    let ok = act(s, &mut fx).is_ok();
+    kani::cover!(ok);
+    if ok {
+        assert!(holds(s));
+    }
+}
+
+fn cases(n: u8, mut f: impl FnMut(u8)) {
+    let k: u8 = kani::any();
+    kani::assume(k < n);
+    if k == 0 {
+        f(0);
+    } else if k == 1 {
+        f(1);
+    } else if k == 2 {
+        f(2);
+    } else {
+        f(3);
     }
 }
 
@@ -122,7 +152,29 @@ fn s6_holds(s: &OrchState) -> bool {
     s.threads.values().all(|th| s6(s, th).is_ok())
 }
 
-fn lineage() -> OrchState {
+fn kin(id: ThreadId, parent: Option<ThreadId>, depth: u8) -> Thread {
+    let mut th = Thread::new(id, parent, depth, level(), false);
+    th.runs.push(Run {
+        start: Start::Queued(Msg::Task),
+        status: RunStatus::Live,
+        cohort: Default::default(),
+    });
+    th.attempt.n = 1;
+    th.attempt.emitted = true;
+    if parent.is_some() {
+        th.task = Some(Task {
+            st: pick([TaskSt::Running, TaskSt::Settled]),
+            wake: WakeRule::Always,
+            delivery: Delivery::Pending,
+            cohort: 1,
+            run: 1,
+            pushes: 0,
+        });
+    }
+    th
+}
+
+fn lineage(shape: u8) -> OrchState {
     let mut s = OrchState::new(Config {
         max_depth: 2,
         max_fanout: 1,
@@ -130,54 +182,53 @@ fn lineage() -> OrchState {
         max_retry: 1,
         run_window: 8,
     });
-    let mut root = Thread::new(R, None, 0, level(), kani::any());
-    one_run(&mut root, Start::Queued(Msg::Person(1)));
-    s.threads.insert(R, root);
-    if kani::any() {
-        s.threads.insert(A, child(A, R, 1));
-        if kani::any() {
-            let deep: bool = kani::any();
-            let (p, d) = if deep { (A, 2) } else { (R, 1) };
-            s.threads.insert(B, child(B, p, d));
-        }
+    s.threads.insert(R, kin(R, None, 0));
+    if shape >= 1 {
+        s.threads.insert(A, kin(A, Some(R), 1));
     }
+    if shape == 2 {
+        s.threads.insert(B, kin(B, Some(R), 1));
+    }
+    if shape == 3 {
+        s.threads.insert(B, kin(B, Some(A), 2));
+    }
+    s.outbox.insert(Message::Notice { child: A, run: 1 });
+    s.outbox.insert(Message::Notice { child: B, run: 1 });
     s
 }
 
-fn delegate_event() -> Event {
-    Event::Del(DelEvent::Delegate {
-        t: tid(),
-        child: pick([A, B, ThreadId(3)]),
-        mode: pick([DelegateMode::Async, DelegateMode::Wait]),
-        access: level(),
-        reconfigure: kani::any(),
-    })
+fn on_lineage(
+    act: impl Fn(&mut OrchState, ThreadId, &mut Vec<Effect>) -> Result<(), Reject>,
+    holds: fn(&OrchState) -> bool,
+) {
+    cases(4, |shape| {
+        let mut s = lineage(shape);
+        kani::assume(holds(&s));
+        cases(3, |i| {
+            let t = IDS[usize::from(i)];
+            holds_after(&mut s, |s, fx| act(s, t, fx), holds);
+        })
+    });
 }
 
-fn narrow_event() -> Event {
-    Event::Del(DelEvent::NarrowAccess {
-        t: tid(),
-        access: level(),
-    })
+fn delegate_to(s: &mut OrchState, t: ThreadId, fx: &mut Vec<Effect>) -> Result<(), Reject> {
+    delegation::kani_delegate(
+        s,
+        t,
+        pick([A, B, ThreadId(3)]),
+        pick([DelegateMode::Async, DelegateMode::Wait]),
+        level(),
+        kani::any(),
+        fx,
+    )
 }
 
-fn notice_event() -> Event {
-    Event::Outbox(OutboxEvent::DoNotice {
-        child: pick([A, B]),
-        run: 1,
-        how: how(),
-    })
+fn narrow_at(s: &mut OrchState, t: ThreadId, fx: &mut Vec<Effect>) -> Result<(), Reject> {
+    delegation::kani_narrow_access(s, t, level(), fx)
 }
 
-fn with_notice() -> OrchState {
-    let mut s = lineage();
-    if kani::any() {
-        s.outbox.insert(Message::Notice {
-            child: pick([A, B]),
-            run: 1,
-        });
-    }
-    s
+fn notice_of(s: &mut OrchState, c: ThreadId, fx: &mut Vec<Effect>) -> Result<(), Reject> {
+    outbox::kani_do_notice(s, c, 1, how(), fx)
 }
 
 macro_rules! harness {
@@ -194,43 +245,66 @@ macro_rules! harness {
     };
 }
 
-harness!(
-    s6_narrow,
-    5,
-    lineage(),
-    |_: &OrchState| narrow_event(),
-    s6_holds
-);
-harness!(
-    s6_delegate,
-    5,
-    lineage(),
-    |_: &OrchState| delegate_event(),
-    s6_holds
-);
-harness!(
-    s5a_delegate,
-    5,
-    with_notice(),
-    |_: &OrchState| delegate_event(),
-    s5a_holds
-);
-harness!(
-    s5a_narrow,
-    5,
-    with_notice(),
-    |_: &OrchState| narrow_event(),
-    s5a_holds
-);
-harness!(
-    s5a_notice,
-    5,
-    with_notice(),
-    |_: &OrchState| notice_event(),
-    s5a_holds
-);
+#[kani::proof]
+#[kani::unwind(5)]
+fn s6_narrow() {
+    on_lineage(narrow_at, s6_holds);
+}
+
+#[kani::proof]
+#[kani::unwind(5)]
+fn s6_delegate() {
+    on_lineage(delegate_to, s6_holds);
+}
+
+#[kani::proof]
+#[kani::unwind(5)]
+fn s5a_delegate() {
+    on_lineage(delegate_to, s5a_holds);
+}
+
+#[kani::proof]
+#[kani::unwind(5)]
+fn s5a_narrow() {
+    on_lineage(narrow_at, s5a_holds);
+}
+
+#[kani::proof]
+#[kani::unwind(5)]
+fn s5a_notice() {
+    on_lineage(notice_of, s5a_holds);
+}
+
+const HEADS: [Option<Msg>; 4] = [
+    None,
+    Some(Msg::Person(1)),
+    Some(Msg::Server(2)),
+    Some(Msg::Wake {
+        run: 1,
+        generation: 1,
+    }),
+];
+
+fn any_head() -> Option<Msg> {
+    if kani::any() {
+        Some(pick([
+            Msg::Person(1),
+            Msg::Server(2),
+            Msg::Wake {
+                run: 1,
+                generation: 1,
+            },
+        ]))
+    } else {
+        None
+    }
+}
 
 fn lone_thread() -> OrchState {
+    lone_runs(u8::try_from(small(2)).unwrap_or(0), any_head())
+}
+
+fn lone_runs(n: u8, head: Option<Msg>) -> OrchState {
     let mut s = OrchState::new(Config {
         max_depth: 2,
         max_fanout: 1,
@@ -239,7 +313,7 @@ fn lone_thread() -> OrchState {
         run_window: 8,
     });
     let mut th = Thread::new(R, None, 0, 1, true);
-    for _ in 0..small(2) {
+    for _ in 0..n {
         th.runs.push(Run {
             start: Start::Queued(Msg::Person(1)),
             status: status(),
@@ -253,15 +327,8 @@ fn lone_thread() -> OrchState {
     th.int_req = kani::any();
     th.ul.armed = if kani::any() { Some(small(2)) } else { None };
     th.ul.due = kani::any();
-    if kani::any() {
-        th.queue.push_back(pick([
-            Msg::Person(1),
-            Msg::Server(2),
-            Msg::Wake {
-                run: 1,
-                generation: 1,
-            },
-        ]));
+    if let Some(m) = head {
+        th.queue.push_back(m);
     }
     if let Some(co) = th.cohort_mut(1) {
         co.st = pick([CohortSt::None, CohortSt::Queued]);
@@ -279,9 +346,9 @@ fn lone_thread() -> OrchState {
     s
 }
 
-fn inbox_event(s: &OrchState) -> ProviderEvent {
+fn inbox_event(s: &OrchState, t: ThreadId) -> ProviderEvent {
     s.threads
-        .get(&R)
+        .get(&t)
         .and_then(|th| th.inbox.first().copied())
         .unwrap_or(ProviderEvent {
             node: Node::Root,
@@ -329,23 +396,23 @@ harness!(
     }),
     s1_holds
 );
-harness!(
-    s1_ingest_end,
-    4,
-    lone_thread(),
-    |s: &OrchState| Event::Run(RunEvent::IngestEnd {
-        t: T,
-        ev: inbox_event(s)
-    }),
-    s1_holds
-);
+#[kani::proof]
+#[kani::unwind(4)]
+fn s1_ingest_end() {
+    cases(3, |n| {
+        let mut s = lone_runs(n, any_head());
+        assume_good(&s);
+        let ev = inbox_event(&s, T);
+        holds_after(&mut s, |s, fx| run::kani_ingest_end(s, T, ev, fx), s1_holds);
+    });
+}
 harness!(
     s1_retry_attempt,
     4,
     lone_thread(),
     |s: &OrchState| Event::Run(RunEvent::RetryAttempt {
         t: T,
-        ev: inbox_event(s)
+        ev: inbox_event(s, T)
     }),
     s1_holds
 );
@@ -371,15 +438,49 @@ harness!(
     }),
     s1_holds
 );
-harness!(
-    s1_start_from_queue_wake,
-    4,
-    lone_thread(),
-    |_: &OrchState| Event::Del(DelEvent::StartFromQueueWake { t: T }),
-    s1_holds
-);
+#[kani::proof]
+#[kani::unwind(4)]
+fn s1_start_from_queue_wake() {
+    cases(3, |n| {
+        cases(4, |q| {
+            let mut s = lone_runs(n, HEADS[usize::from(q)]);
+            kani::assume(s1_holds(&s));
+            holds_after(
+                &mut s,
+                |s, fx| delegation::kani_start_from_queue_wake(s, T, fx),
+                s1_holds,
+            );
+        })
+    });
+}
 
-fn delivery_state() -> OrchState {
+const WAKES: [Option<Msg>; 3] = [
+    None,
+    Some(Msg::Wake {
+        run: 1,
+        generation: 0,
+    }),
+    Some(Msg::Wake {
+        run: 1,
+        generation: 1,
+    }),
+];
+
+fn any_wake() -> Option<Msg> {
+    if kani::any() {
+        Some(Msg::Wake {
+            run: 1,
+            generation: small(1),
+        })
+    } else {
+        None
+    }
+}
+
+const P: ThreadId = ThreadId(1);
+const K: ThreadId = ThreadId(0);
+
+fn delivery_state(wake: Option<Msg>) -> OrchState {
     let mut s = OrchState::new(Config {
         max_depth: 2,
         max_fanout: 2,
@@ -387,45 +488,46 @@ fn delivery_state() -> OrchState {
         max_retry: 1,
         run_window: 8,
     });
-    let mut root = Thread::new(R, None, 0, 1, true);
+    let mut root = Thread::new(P, None, 0, 1, true);
     one_run(&mut root, Start::Queued(Msg::Person(1)));
     if let Some(co) = root.cohort_mut(1) {
         co.disp = pick([Disp::Open, Disp::Stopped]);
         co.st = pick([CohortSt::None, CohortSt::Offered, CohortSt::Queued]);
         co.generation = small(1);
         if kani::any() {
-            co.del.insert(A);
+            co.del.insert(K);
         }
     }
-    if kani::any() {
-        root.queue.push_back(Msg::Wake {
-            run: 1,
-            generation: small(1),
-        });
+    if let Some(m) = wake {
+        root.queue.push_back(m);
     }
     root.held = pick([Hold::None, Hold::Fail]);
-    root.wait_on = if kani::any() { Some(A) } else { None };
-    root.late_wait = if kani::any() { Some(A) } else { None };
-    s.threads.insert(R, root);
-    s.threads.insert(A, child(A, R, 1));
+    root.wait_on = if kani::any() { Some(K) } else { None };
+    root.late_wait = if kani::any() { Some(K) } else { None };
+    s.threads.insert(P, root);
+    s.threads.insert(K, child(K, P, 1));
     if kani::any() {
         s.outbox.insert(pick([
-            Message::Notice { child: A, run: 1 },
+            Message::Notice { child: K, run: 1 },
             Message::Offer {
-                parent: R,
+                parent: P,
                 run: 1,
                 generation: small(1),
             },
-            Message::Stop { child: A, stop: 1 },
+            Message::Stop { child: K, stop: 1 },
         ]));
     }
     s
 }
 
 fn delivery_with_end() -> OrchState {
-    let mut s = delivery_state();
+    delivery_end(any_wake())
+}
+
+fn delivery_end(wake: Option<Msg>) -> OrchState {
+    let mut s = delivery_state(wake);
     if kani::any() {
-        if let Some(root) = s.threads.get_mut(&R) {
+        if let Some(root) = s.threads.get_mut(&P) {
             root.inbox.insert(ProviderEvent {
                 node: Node::Root,
                 run: 1,
@@ -446,65 +548,73 @@ harness!(
     s3_wait_return,
     5,
     delivery_with_end(),
-    del(DelEvent::WaitReturn { t: R }),
+    del(DelEvent::WaitReturn { t: P }),
     s3_holds
 );
 harness!(
     s3_wait_timeout,
     5,
     delivery_with_end(),
-    del(DelEvent::WaitTimeout { t: R }),
+    del(DelEvent::WaitTimeout { t: P }),
     s3_holds
 );
 harness!(
     s3_late_wait_ack,
     5,
     delivery_with_end(),
-    del(DelEvent::LateWaitAck { t: R }),
+    del(DelEvent::LateWaitAck { t: P }),
     s3_holds
 );
-harness!(
-    s3_stop,
-    5,
-    delivery_with_end(),
-    del(DelEvent::Stop { t: R }),
-    s3_holds
-);
-harness!(
-    s3_start_from_queue_wake,
-    5,
-    delivery_with_end(),
-    del(DelEvent::StartFromQueueWake { t: R }),
-    s3_holds
-);
+fn on_delivery(act: impl FnOnce(&mut OrchState, &mut Vec<Effect>) -> Result<(), Reject>) {
+    let mut s = delivery_with_end();
+    kani::assume(s3_holds(&s));
+    holds_after(&mut s, act, s3_holds);
+}
+
+#[kani::proof]
+#[kani::unwind(5)]
+fn s3_stop() {
+    on_delivery(|s, fx| delegation::kani_stop(s, P, fx));
+}
+
+#[kani::proof]
+#[kani::unwind(5)]
+fn s3_start_from_queue_wake() {
+    let mut s = delivery_end(None);
+    kani::assume(s3_holds(&s));
+    cases(3, |w| {
+        if let (Some(m), Ok(th)) = (WAKES[usize::from(w)], s.thread_mut(P)) {
+            th.queue.push_back(m);
+        }
+        holds_after(
+            &mut s,
+            |s, fx| delegation::kani_start_from_queue_wake(s, P, fx),
+            s3_holds,
+        );
+    });
+}
 harness!(
     s3_read_result,
     5,
     delivery_with_end(),
     |_: &OrchState| Event::Del(DelEvent::ReadResult {
-        p: R,
-        c: A,
+        p: P,
+        c: K,
         run: small(1)
     }),
     s3_holds
 );
-harness!(
-    s3_do_notice,
-    5,
-    delivery_with_end(),
-    |_: &OrchState| Event::Outbox(OutboxEvent::DoNotice {
-        child: A,
-        run: 1,
-        how: how()
-    }),
-    s3_holds
-);
+#[kani::proof]
+#[kani::unwind(5)]
+fn s3_do_notice() {
+    on_delivery(|s, fx| outbox::kani_do_notice(s, K, 1, how(), fx));
+}
 harness!(
     s3_do_offer,
     5,
     delivery_with_end(),
     |_: &OrchState| Event::Outbox(OutboxEvent::DoOffer {
-        parent: R,
+        parent: P,
         run: 1,
         generation: small(1),
         how: how(),
@@ -516,19 +626,17 @@ harness!(
     5,
     delivery_with_end(),
     |_: &OrchState| Event::Outbox(OutboxEvent::DoStop {
-        child: A,
+        child: K,
         stop: 1,
         how: how()
     }),
     s3_holds
 );
-harness!(
-    s3_ingest_end,
-    5,
-    delivery_with_end(),
-    |s: &OrchState| Event::Run(RunEvent::IngestEnd {
-        t: R,
-        ev: inbox_event(s)
-    }),
-    s3_holds
-);
+#[kani::proof]
+#[kani::unwind(5)]
+fn s3_ingest_end() {
+    let mut s = delivery_with_end();
+    kani::assume(s3_holds(&s));
+    let ev = inbox_event(&s, P);
+    holds_after(&mut s, |s, fx| run::kani_ingest_end(s, P, ev, fx), s3_holds);
+}
