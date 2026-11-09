@@ -90,6 +90,9 @@ pub mod methods {
     pub const LIST_SKILLS: &str = "ListSkills";
     pub const LIST_COMMANDS: &str = "ListCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
+    pub const ORCH_DELEGATE: &str = "OrchDelegate";
+    pub const ORCH_TASK_STATUS: &str = "OrchTaskStatus";
+    pub const ORCH_TASK_CANCEL: &str = "OrchTaskCancel";
     pub const TAKE_PROJECT_ACTION_SETUP: &str = "TakeProjectActionSetup";
     /// Peer-to-peer delivery fallback: the SENDER's engine forwards a queued
     /// command entry (client-minted id and all) straight over the device-room
@@ -712,6 +715,9 @@ pub fn agent_allowed(method: &str) -> bool {
             | methods::MUTATE
             | methods::QUEUE_MESSAGE
             | methods::QUEUE_COMMAND
+            | methods::ORCH_DELEGATE
+            | methods::ORCH_TASK_STATUS
+            | methods::ORCH_TASK_CANCEL
             // Showing the person something in the calling chat.
             | methods::PUBLISH_VISUAL
             | methods::PUBLISH_IMAGE
