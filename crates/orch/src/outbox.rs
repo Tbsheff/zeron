@@ -38,7 +38,7 @@ fn do_notice(
 ) -> Result<(), Reject> {
     take(s, Message::Notice { child: c, run }, how)?;
     let task = s.task(c)?;
-    if task.st == TaskSt::Settled {
+    if task.st == TaskSt::Settled || task.run != run {
         return Ok(());
     }
     let p = s.thread(c)?.parent.ok_or(Reject::Corrupt)?;

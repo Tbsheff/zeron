@@ -1672,6 +1672,28 @@ pub fn rows_for_entry(
                     );
                 }
                 match other {
+                    MessagePart::TaskResults { .. }
+                    | MessagePart::Handoff { .. }
+                    | MessagePart::MergeBack { .. } => {
+                        let text = other.orchestration_text().unwrap_or_default();
+                        let key = format!("{}#{}", entry.id, other.id());
+                        let tree = parse(&key, &text);
+                        for block_ix in 0..tree.blocks.len() {
+                            rows.push(Row {
+                                id: format!("{key}.{block_ix}").into(),
+                                version: fnv1a(text.as_bytes()),
+                                turn_start: false,
+                                entry_id: entry_id.clone(),
+                                timestamp: None,
+                                copy_text: Some(text.clone().into()),
+                                compact_fold: None,
+                                kind: RowKind::Markdown {
+                                    tree: tree.clone(),
+                                    block_ix,
+                                },
+                            });
+                        }
+                    }
                     MessagePart::Text { id: part_id, text } => {
                         if text.trim().is_empty() {
                             continue;

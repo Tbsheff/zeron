@@ -433,6 +433,7 @@ impl Harness for PiHarness {
             let RunControls {
                 realtime: _,
                 execution_lease: _lease,
+                strict_resume: _,
                 request_input,
                 mut steering,
                 interrupt,
@@ -466,14 +467,12 @@ impl Harness for PiHarness {
             runner.process.shutdown(kill_grace).await;
             let _ = runner.finish().await;
         });
-        Ok(
-            futures::stream::unfold(rx, |mut rx| async move {
-                rx.recv()
-                    .await
-                    .map(|v| (v.map(|ev| crate::with_failure(HarnessId::Pi, ev)), rx))
-            })
-            .boxed(),
-        )
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv()
+                .await
+                .map(|v| (v.map(|ev| crate::with_failure(HarnessId::Pi, ev)), rx))
+        })
+        .boxed())
     }
 }
 #[derive(Clone)]

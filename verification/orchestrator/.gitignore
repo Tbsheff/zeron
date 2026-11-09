@@ -1,0 +1,8 @@
+node_modules/
+tools/
+tla/*out*/
+tla/Fast_out/
+tla/states/
+tla/.tlacache/
+tla/*.tlaps/
+tla/*.log

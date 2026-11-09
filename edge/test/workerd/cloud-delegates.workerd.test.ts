@@ -148,8 +148,8 @@ describe("Cloud delegates", () => {
     expect((await call("DELETE", `/cloud/${u.orgId}`, runner)).status).toBe(403);
   });
 
-  it("starts children only for the chat it hosts, and children start none", async () => {
-    const { u, main, other, runner } = await world();
+  it("starts children only for the chat it hosts, and caps descendants at depth two", async () => {
+    const { u, user, main, other, runner } = await world();
     // For another main chat, or as if it were the user (no parent).
     expect((await startChild(u, runner, `x-${rand()}`, other.chatId)).status).toBe(403);
     const asUser = await call("POST", `/cloud/${u.orgId}/sessions`, runner, {
@@ -161,14 +161,22 @@ describe("Cloud delegates", () => {
     // Only Cloud's agents.
     expect((await startChild(u, runner, `x-${rand()}`, main.chatId, { config: { harness: "cursor" } })).status).toBe(400);
 
-    // A child's own machine can't start grandchildren.
     const child = `child-${rand()}`;
     const { deviceId } = (await (await startChild(u, runner, child, main.chatId)).json()) as { deviceId: string };
     const key = await runnerKey();
     expect((await enroll(u, deviceId, await enrollCodeFor(deviceId), key.publicKey)).status).toBe(200);
     const childRunner = `Bearer ${await runnerToken(u, deviceId, key)}`;
-    const grandchild = await startChild(u, childRunner, `g-${rand()}`, child);
-    expect(grandchild.status).toBe(403);
-    expect(await grandchild.json()).toMatchObject({ error: "too_deep" });
+    expect((await call("POST", `/cloud/${u.orgId}/sessions/${main.chatId}/sleep`, user, {})).status).toBe(200);
+    await waitForSession(u, main.chatId, "sleeping");
+    const grandchildId = `g-${rand()}`;
+    const grandchild = await startChild(u, childRunner, grandchildId, child);
+    expect(grandchild.status, await grandchild.clone().text()).toBe(200);
+    const grandchildDevice = ((await grandchild.json()) as { deviceId: string }).deviceId;
+    const grandchildKey = await runnerKey();
+    expect((await enroll(u, grandchildDevice, await enrollCodeFor(grandchildDevice), grandchildKey.publicKey)).status).toBe(200);
+    const grandchildRunner = `Bearer ${await runnerToken(u, grandchildDevice, grandchildKey)}`;
+    const tooDeep = await startChild(u, grandchildRunner, `too-deep-${rand()}`, grandchildId);
+    expect(tooDeep.status).toBe(403);
+    expect(await tooDeep.json()).toMatchObject({ error: "too_deep" });
   });
 });

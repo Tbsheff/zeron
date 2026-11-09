@@ -1,0 +1,14 @@
+{
+  "name": "zeron-orchestrator-v2-tla",
+  "private": true,
+  "type": "module",
+  "description": "TLA+ modules RunLifecycle and Delegation for Zeron Orchestrator v2, checked with tla-ts (../node_modules)",
+  "scripts": {
+    "gen": "node gen.mjs",
+    "check": "node gen.mjs && node run.mjs --kind=main",
+    "check:all": "node gen.mjs && node run.mjs",
+    "check:mutants": "node gen.mjs && node run.mjs --kind=mutant",
+    "check:witnesses": "node gen.mjs && node run.mjs --kind=witness",
+    "check:coverage": "node gen.mjs && node run.mjs --kind=coverage"
+  }
+}

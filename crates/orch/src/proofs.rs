@@ -260,7 +260,23 @@ fn s6_delegate() {
 #[kani::proof]
 #[kani::unwind(5)]
 fn s5a_delegate() {
-    on_lineage(delegate_to, s5a_holds);
+    cases(4, |shape| {
+        let mut s = lineage(shape);
+        kani::assume(s5a_holds(&s));
+        cases(3, |i| {
+            let t = IDS[usize::from(i)];
+            cases(3, |c| {
+                let child = [A, B, ThreadId(3)][usize::from(c)];
+                holds_after(
+                    &mut s,
+                    |s, fx| {
+                        delegation::kani_delegate(s, t, child, DelegateMode::Async, 0, false, fx)
+                    },
+                    s5a_holds,
+                );
+            })
+        })
+    });
 }
 
 #[kani::proof]
@@ -454,18 +470,6 @@ fn s1_start_from_queue_wake() {
     });
 }
 
-const WAKES: [Option<Msg>; 3] = [
-    None,
-    Some(Msg::Wake {
-        run: 1,
-        generation: 0,
-    }),
-    Some(Msg::Wake {
-        run: 1,
-        generation: 1,
-    }),
-];
-
 fn any_wake() -> Option<Msg> {
     if kani::any() {
         Some(Msg::Wake {
@@ -580,18 +584,19 @@ fn s3_stop() {
 #[kani::proof]
 #[kani::unwind(5)]
 fn s3_start_from_queue_wake() {
-    let mut s = delivery_end(None);
+    let mut s = lean_delivery(RunStatus::Completed, Some(CohortSt::Queued));
+    if let Ok(root) = s.thread_mut(P) {
+        root.queue.push_back(Msg::Wake {
+            run: 1,
+            generation: 1,
+        });
+    }
     kani::assume(s3_holds(&s));
-    cases(3, |w| {
-        if let (Some(m), Ok(th)) = (WAKES[usize::from(w)], s.thread_mut(P)) {
-            th.queue.push_back(m);
-        }
-        holds_after(
-            &mut s,
-            |s, fx| delegation::kani_start_from_queue_wake(s, P, fx),
-            s3_holds,
-        );
-    });
+    holds_after(
+        &mut s,
+        |s, fx| delegation::kani_start_from_queue_wake(s, P, fx),
+        s3_holds,
+    );
 }
 harness!(
     s3_read_result,
@@ -635,8 +640,158 @@ harness!(
 #[kani::proof]
 #[kani::unwind(5)]
 fn s3_ingest_end() {
-    let mut s = delivery_with_end();
+    let mut s = lean_delivery(RunStatus::Live, None);
+    let ev = ProviderEvent {
+        node: Node::Root,
+        run: 1,
+        attempt: 1,
+        outcome: Outcome::Completed,
+    };
+    if let Ok(root) = s.thread_mut(P) {
+        root.inbox.insert(ev);
+        root.attempt.emitted = true;
+    }
     kani::assume(s3_holds(&s));
-    let ev = inbox_event(&s, P);
     holds_after(&mut s, |s, fx| run::kani_ingest_end(s, P, ev, fx), s3_holds);
+}
+
+fn lean_delivery(status: RunStatus, st: Option<CohortSt>) -> OrchState {
+    let mut s = OrchState::new(Config {
+        max_depth: 2,
+        max_fanout: 2,
+        max_queue: 2,
+        max_retry: 1,
+        run_window: 8,
+    });
+    let mut root = Thread::new(P, None, 0, 1, true);
+    root.runs.push(Run {
+        start: Start::Queued(Msg::Person(1)),
+        status,
+        cohort: Default::default(),
+    });
+    root.attempt.n = 1;
+    if let Some(co) = root.cohort_mut(1) {
+        co.disp = pick([Disp::Open, Disp::Stopped]);
+        co.st = st.unwrap_or_else(|| pick([CohortSt::None, CohortSt::Offered, CohortSt::Queued]));
+        co.generation = 1;
+        if kani::any() {
+            co.del.insert(K);
+        }
+    }
+    s.threads.insert(P, root);
+    let mut c = Thread::new(K, Some(P), 1, 1, true);
+    c.task = Some(task(1));
+    s.threads.insert(K, c);
+    s
+}
+
+fn delivery_bound3(status: RunStatus) -> OrchState {
+    let mut s = lean_delivery(status, Some(CohortSt::Queued));
+    if let Ok(root) = s.thread_mut(P) {
+        root.runs.clear();
+        for _ in 0..3 {
+            root.runs.push(Run {
+                start: Start::Queued(Msg::Person(1)),
+                status: RunStatus::Completed,
+                cohort: Default::default(),
+            });
+        }
+        if let Some(last) = root.runs.get_mut(2) {
+            last.status = status;
+        }
+        if let Some(co) = root.cohort_mut(3) {
+            co.st = CohortSt::Queued;
+            co.generation = 2;
+            co.del.insert(K);
+            co.del.insert(B);
+        }
+        root.queue.push_back(Msg::Wake {
+            run: 3,
+            generation: 2,
+        });
+    }
+    for id in [K, B] {
+        let mut c = Thread::new(id, Some(P), 1, 1, true);
+        let mut k = task(3);
+        k.run = 3;
+        c.task = Some(k);
+        for _ in 0..3 {
+            c.runs.push(Run {
+                start: Start::Queued(Msg::Task),
+                status: RunStatus::Completed,
+                cohort: Default::default(),
+            });
+        }
+        c.attempt.n = 1;
+        s.threads.insert(id, c);
+    }
+    s
+}
+
+#[kani::proof]
+#[kani::unwind(6)]
+fn s3_stop_bound3() {
+    let mut s = delivery_bound3(RunStatus::Live);
+    kani::assume(s3_holds(&s));
+    holds_after(&mut s, |s, fx| delegation::kani_stop(s, P, fx), s3_holds);
+}
+
+fn wake_boundary(left: Delivery, right: Delivery) {
+    let mut s = delivery_bound3(RunStatus::Completed);
+    if let Ok(k) = s.task_mut(K) {
+        k.delivery = left;
+    }
+    if let Ok(k) = s.task_mut(B) {
+        k.delivery = right;
+    }
+    kani::assume(s3_holds(&s));
+    holds_after(
+        &mut s,
+        |s, fx| delegation::kani_start_from_queue_wake(s, P, fx),
+        s3_holds,
+    );
+}
+
+fn handled_delivery() -> Delivery {
+    pick([
+        Delivery::Delivered,
+        Delivery::Acknowledged,
+        Delivery::Disposed,
+    ])
+}
+
+macro_rules! wake_boundary_harness {
+    ($name:ident, $left:expr, $right:expr) => {
+        #[kani::proof]
+        #[kani::unwind(6)]
+        fn $name() {
+            wake_boundary($left, $right);
+        }
+    };
+}
+
+wake_boundary_harness!(s3_wake_bound3_pp, Delivery::Pending, Delivery::Pending);
+wake_boundary_harness!(s3_wake_bound3_pc, Delivery::Pending, Delivery::Claimed);
+wake_boundary_harness!(s3_wake_bound3_ph, Delivery::Pending, handled_delivery());
+wake_boundary_harness!(s3_wake_bound3_cp, Delivery::Claimed, Delivery::Pending);
+wake_boundary_harness!(s3_wake_bound3_cc, Delivery::Claimed, Delivery::Claimed);
+wake_boundary_harness!(s3_wake_bound3_ch, Delivery::Claimed, handled_delivery());
+wake_boundary_harness!(s3_wake_bound3_hp, handled_delivery(), Delivery::Pending);
+wake_boundary_harness!(s3_wake_bound3_hc, handled_delivery(), Delivery::Claimed);
+wake_boundary_harness!(s3_wake_bound3_hh, handled_delivery(), handled_delivery());
+
+#[kani::proof]
+#[kani::unwind(5)]
+fn s1_restart_bound3() {
+    let s = lone_runs(3, any_head());
+    assume_good(&s);
+    preserved(
+        s,
+        Event::Run(RunEvent::RestartActive {
+            t: R,
+            mode: Mode::Restart,
+            msg: 1,
+        }),
+        s1_holds,
+    );
 }

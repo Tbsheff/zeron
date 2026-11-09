@@ -88,6 +88,7 @@ pub(super) struct Runner {
     asking: HashMap<String, AbortHandle>,
     pub turn: TurnControl,
     lost_context: Option<String>,
+    pub strict_resume: bool,
 }
 
 impl Runner {
@@ -125,6 +126,7 @@ impl Runner {
             asking: HashMap::new(),
             turn: TurnControl::default(),
             lost_context: None,
+            strict_resume: false,
         }
     }
 
@@ -149,7 +151,7 @@ impl Runner {
 
     /// The run's last word for an unfinished turn (teardown, crash).
     pub async fn finish(&mut self) -> Result<(), HarnessError> {
-        if self.active.is_none() && !self.first {
+        if self.active.is_none() && !self.first && self.error.is_none() {
             return Ok(());
         }
         self.active = None;
@@ -236,6 +238,12 @@ impl Runner {
                     return Ok(result);
                 }
                 Err(failure) if matches!(failure.kind.as_str(), "sessionNotFound" | "notFound") => {
+                    if self.strict_resume {
+                        return Err(HarnessError::Protocol(format!(
+                            "Session not found: strict Muse resume rejected: {}",
+                            failure.message
+                        )));
+                    }
                     self.lost_context = Some(format!(
                         "Muse could not restore session {id}; starting a new session without the \
                          previous context: {}",

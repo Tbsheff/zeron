@@ -34,7 +34,24 @@ pub(crate) fn apply(s: &mut OrchState, e: DelEvent, fx: &mut Vec<Effect>) -> Res
             },
             fx,
         ),
-        DelEvent::ReadResult { p, c, run } => read_result(s, p, c, run),
+        DelEvent::Followup {
+            parent,
+            child,
+            access,
+        } => crate::followup::apply(s, parent, child, access),
+        DelEvent::ReadTaskResult {
+            p,
+            c,
+            run,
+            task_run,
+        } => {
+            ensure(s.task(c)?.run == task_run, Reject::StaleRun)?;
+            read_result(s, p, c, run)
+        }
+        DelEvent::ReadResult { p, c, run } => {
+            ensure(s.task(c)?.run == 1, Reject::StaleRun)?;
+            read_result(s, p, c, run)
+        }
         DelEvent::WaitReturn { t } => wait_return(s, t, fx),
         DelEvent::WaitTimeout { t } => wait_timeout(s, t, fx),
         DelEvent::WaitAbandon { t } => wait_abandon(s, t),
@@ -82,6 +99,7 @@ pub(crate) fn thread_stop(
     if live {
         fx.push(Effect::InterruptRun { run: th.run_id() });
     }
+    crate::questions::reroute(s, t, true, fx)?;
     for c in kids {
         s.send(Message::Stop { child: c, stop }, fx);
     }
@@ -187,7 +205,8 @@ fn delegate(s: &mut OrchState, t: ThreadId, sp: Spawn, fx: &mut Vec<Effect>) -> 
 
 fn read_result(s: &mut OrchState, p: ThreadId, c: ThreadId, run: u32) -> Result<(), Reject> {
     let pt = s.thread(p)?;
-    ensure(pt.is_live(), Reject::NotLive)?;
+    ensure(pt.is_live() && !pt.attempt.emitted, Reject::NotLive)?;
+    ensure(!crate::questions::blocked(s, p), Reject::Held)?;
     ensure(run == pt.rord(), Reject::StaleRun)?;
     ensure(s.thread(c)?.parent == Some(p), Reject::NotKid)?;
     let task = s.task(c)?;
@@ -220,10 +239,14 @@ fn waited(s: &OrchState, t: ThreadId) -> Result<(ThreadId, Task), Reject> {
     let th = s.thread(t)?;
     let c = th.wait_on.ok_or(Reject::NotWaiting)?;
     ensure(th.is_live(), Reject::NotLive)?;
+    ensure(!th.attempt.emitted, Reject::TooLate)?;
     Ok((c, s.task(c)?))
 }
 
 fn wait_return(s: &mut OrchState, t: ThreadId, fx: &mut Vec<Effect>) -> Result<(), Reject> {
+    if crate::questions::wait_return(s, t, fx)? {
+        return Ok(());
+    }
     let (c, task) = waited(s, t)?;
     ensure(task.st == TaskSt::Settled, Reject::NotSettled)?;
     if task.delivery.unhandled() {

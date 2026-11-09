@@ -105,6 +105,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         request_input: Box::new(move |_questions| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Vec::new());

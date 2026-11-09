@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use zeron_proto::{DoneStatus, FailureClass};
 
-use super::wire::{Pending, Ran, RunEngine, Via};
+use super::wire::{ChildSpec, Pending, Ran, RunEngine, Via};
 use crate::EngineError;
 use crate::sessions::{SessionsEngine, SteerOutcome};
 
@@ -21,6 +21,7 @@ impl SessionsEngine {
         p: &Pending,
         prompt: &str,
         attachments: &[String],
+        worktree: Option<zeron_proto::WorktreeSpec>,
     ) -> Result<String, EngineError> {
         let host = self.host();
         let request = self.last_request(&p.chat).or_else(|| {
@@ -30,9 +31,26 @@ impl SessionsEngine {
         let Some(mut request) = request else {
             return Err(EngineError::Other("no run config for this chat".into()));
         };
+        if let Some(th) = self
+            .orchestrator()
+            .and_then(|wire| wire.thread_state(&p.chat))
+        {
+            if super::wire::access_level(request.access) > th.access {
+                request.access = zeron_proto::AccessMode::ALL[usize::from(th.access)];
+            }
+        }
         request.prompt = prompt.to_owned();
         request.attachments = attachments.to_vec();
         request.resume = None;
+        request.worktree = None;
+        if let Some(spec) = worktree {
+            let host = host
+                .as_ref()
+                .ok_or_else(|| EngineError::Other("no host for task worktree".into()))?;
+            request.cwd = host
+                .prepare_task_worktree(&p.chat, &p.message_id, &spec)
+                .await?;
+        }
         let harness = match (&host, request.harness) {
             (Some(h), _) => h.harness_for_request(&p.chat, &request),
             (None, Some(h)) => h,
@@ -70,6 +88,11 @@ impl SessionsEngine {
 
 #[async_trait::async_trait]
 impl RunEngine for SessionsEngine {
+    fn effective_access(&self, chat: &str) -> Option<u8> {
+        self.last_request(chat)
+            .map(|request| super::wire::access_level(request.access))
+    }
+
     async fn start(&self, p: &Pending) -> Result<String, EngineError> {
         self.settle_turn(&p.chat).await;
         match &p.via {
@@ -94,9 +117,11 @@ impl RunEngine for SessionsEngine {
                 .await?
             {
                 SteerOutcome::Accepted => Ok(String::new()),
-                _ => self.fresh_start(p, prompt, attachments).await,
+                _ => self.fresh_start(p, prompt, attachments, None).await,
             },
-            Via::Resume { prompt } => self.fresh_start(p, prompt, &[]).await,
+            Via::Resume { prompt, worktree } => {
+                self.fresh_start(p, prompt, &[], worktree.clone()).await
+            }
         }
     }
 
@@ -144,6 +169,69 @@ impl RunEngine for SessionsEngine {
 
     fn journal_seq(&self, chat: &str) -> u64 {
         self.journal_seq(chat)
+    }
+
+    fn orch_route(&self, chat: &str) -> Option<super::placement::ChatRoute> {
+        self.orch_route(chat)
+    }
+
+    fn orch_supports(&self, device: &str) -> bool {
+        self.orch_supports(device)
+    }
+
+    fn orch_send(&self, message: &zeron_doc::OrchMessage) -> Result<bool, String> {
+        self.host()
+            .ok_or_else(|| "no document host".to_owned())?
+            .send_orch(message)
+    }
+
+    fn create_child(&self, parent: &str, spec: &ChildSpec) -> Result<(), EngineError> {
+        self.orch_create_child(parent, spec)
+    }
+
+    fn result_text(&self, chat: &str) -> Option<String> {
+        self.orch_result_text(chat)
+    }
+
+    fn task_results(
+        &self,
+        chat: &str,
+        message_id: &str,
+        results: Vec<zeron_doc::TaskResultPart>,
+    ) -> Result<(), EngineError> {
+        self.orch_task_results(chat, message_id, results)
+    }
+
+    fn reports_mcp_results(&self, chat: &str) -> bool {
+        self.orch_reports_mcp_results(chat)
+    }
+
+    fn respond_question(
+        &self,
+        chat: &str,
+        request: &str,
+        answers: Vec<zeron_proto::UserInputAnswer>,
+    ) -> Result<bool, EngineError> {
+        self.orch_respond_question(chat, request, answers)
+    }
+
+    fn save_native_snapshot(&self, doc: &str, snapshot: &[u8]) -> Result<(), EngineError> {
+        let host = self
+            .host()
+            .ok_or_else(|| EngineError::Other("native document host unavailable".into()))?;
+        let handle = host.open(doc)?;
+        handle
+            .doc()
+            .doc()
+            .import(snapshot)
+            .map_err(|error| EngineError::Other(error.to_string()))?;
+        host.persist_fork(&handle)
+    }
+    fn native_changed(&self, chat: &str, tool: &str, status: &str) -> Result<(), EngineError> {
+        self.orch_native_changed(chat, tool, status)
+    }
+    fn notify_question(&self, chat: &str, _request: &str) {
+        self.orch_notify_question(chat);
     }
 
     fn kick_drain(&self, _chat: &str) {

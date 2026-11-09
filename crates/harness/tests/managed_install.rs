@@ -31,6 +31,7 @@ async fn managed_install_reaches_session_started() {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
         steering,
         interrupt: interrupt.clone(),

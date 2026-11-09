@@ -1,15 +1,20 @@
 mod delegation;
 mod event;
+mod followup;
 mod ids;
 mod invariants;
+pub mod native;
 mod outbox;
 #[cfg(kani)]
 mod proofs;
+pub mod questions;
+pub mod remote;
 mod run;
 mod slots;
 mod small;
 mod state;
 mod step;
+pub mod transfer;
 
 pub use event::{
     DelEvent, DelegateMode, Effect, Event, How, Mode, OutboxEvent, Reject, RunEvent, WaitOutcome,

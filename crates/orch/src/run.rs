@@ -258,6 +258,7 @@ fn ingest_end(
     th.inbox.remove(&ev);
     let out = ev.outcome.end_status();
     finish_run(th, out, fx);
+    crate::questions::end_run(s, t, fx)?;
     delegation::end_run(s, t, fx)
 }
 

@@ -62,6 +62,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -745,6 +746,33 @@ async fn an_unknown_session_starts_fresh_with_a_notice() {
     );
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
+#[tokio::test]
+async fn strict_resume_rejects_missing_session_before_fresh_inference() {
+    let (mut controls, _steer, _token) = controls();
+    controls.strict_resume = true;
+    let mut req = request("scenario:echo-prompt");
+    req.resume = Some("load-fail".into());
+    let events = run_to_end(&harness(), req, controls).await;
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::SessionStarted { .. } | AgentEvent::TextDelta { .. }
+        )),
+        "{events:?}"
+    );
+    let done = dones(&events);
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].0, DoneStatus::Errored);
+    assert!(
+        done[0]
+            .1
+            .as_deref()
+            .unwrap_or_default()
+            .contains("strict resume rejected"),
+        "{events:?}"
+    );
+}
+
 #[test]
 fn descriptor_surface_matches_registry_expectations() {
     let harness = AcpHarness::grok();

@@ -1,4 +1,3 @@
-//! Native Appshots layout evidence with isolated data. No agent messages are sent.
 use gpui::{AppContext, AsyncApp, Bounds, WindowBounds, WindowOptions, px, size};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use zeron_ui::*;
@@ -49,6 +48,7 @@ fn port() -> u16 {
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter("warn").init();
     let output = PathBuf::from(std::env::args().nth(1).expect("output directory"));
+    let task_parts = std::env::args().nth(2).as_deref() == Some("--task-parts");
     let inputs = PathBuf::from(
         std::env::args()
             .nth(2)
@@ -67,8 +67,14 @@ fn main() -> anyhow::Result<()> {
     })?;
     core.workspace
         .create_chat("appshots-fixture", None, Some(&core.device_id), None, None)?;
-    core.workspace
-        .rename_chat("appshots-fixture", "Review the workspace design")?;
+    core.workspace.rename_chat(
+        "appshots-fixture",
+        if task_parts {
+            "Review task results"
+        } else {
+            "Review the workspace design"
+        },
+    )?;
     let ipc_port = port();
     let data = temp.path().join("ui");
     std::fs::create_dir(&data)?;
@@ -93,6 +99,9 @@ fn main() -> anyhow::Result<()> {
         ("tall", "Design review · Notes", "com.apple.Notes"),
         ("square", "Workspace ideas", "com.apple.finder"),
     ] {
+        if task_parts {
+            break;
+        }
         let bytes = std::fs::read(inputs.join(format!("{name}.png")))?;
         let (screenshot, dimensions) =
             appshots::stage_appshot_png(name, bytes).map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -120,7 +129,7 @@ fn main() -> anyhow::Result<()> {
             &device,
             &path,
             shot.screenshot.name.clone().into(),
-            shot.screenshot.image.clone(),
+            shot.screenshot.image().expect("fixture PNG image").clone(),
         );
         paths.push(path);
         shots.push(shot);
@@ -172,6 +181,38 @@ fn main() -> anyhow::Result<()> {
         cx.spawn(async move |cx| {
             let run:anyhow::Result<()>=async {
                 pause(cx,1000).await;
+                if task_parts {
+                    let coverage = serde_json::json!({
+                        "transferId":"fixture-transfer", "sourceChatId":"design-task",
+                        "pointMessageId":"point", "selectedMessageIds":["start","point"],
+                        "omittedCount":1
+                    });
+                    let parts = serde_json::json!([
+                        {"id":"task-results","kind":"taskResults","results":[
+                            {"taskId":"layout-check","chatId":"design-task","status":"completed","text":"Checked the layout. The task is complete.","truncated":false}
+                        ]},
+                        {"id":"handoff","kind":"handoff","strategy":"portable_replay","coverage":coverage.clone()},
+                        {"id":"merge-back","kind":"mergeBack","coverage":coverage}
+                    ]);
+                    state.update(cx, |s,cx| {
+                        s.receive_transcript_frame(zeron_doc::TranscriptFrame::Reset {
+                            reset:serde_json::from_value(serde_json::json!([
+                                {"id":"task-parts-message","role":"assistant","parts":parts,
+                                 "createdAt":1788900001000_i64,"deviceId":device,"status":"complete"}
+                            ])).unwrap()
+                        },cx).unwrap();
+                        cx.notify();
+                    });
+                    pause(cx,900).await;
+                    window.update(cx,|s,_,cx|s.fixture_appshots_transcript_start(cx))?;
+                    pause(cx,400).await;
+                    capture(window.into(),cx,&output,"task-parts-dark-1100")?;
+                    cx.update(|cx|appearance::set_mode(appearance::AppearanceMode::Light,cx));
+                    pause(cx,500).await;
+                    capture(window.into(),cx,&output,"task-parts-light-1100")?;
+                    std::fs::write(output.join("result.txt"),"Rendered production desktop Shell and Transcript with synthetic TaskResults, Handoff, and MergeBack parts. This tests display only, not engine task execution or mobile rendering. No real chats or installed app data used.\n")?;
+                    return Ok(());
+                }
                 state.update(cx,|s,cx| {s.receive_transcript_frame(zeron_doc::TranscriptFrame::Reset {reset:serde_json::from_value(serde_json::json!([
                     {"id":"user","role":"user","parts":[{"id":"text","kind":"text","text":message}],"createdAt":1788900000000_i64,"deviceId":device},
                     {"id":"assistant","role":"assistant","parts":[{"id":"text","kind":"text","text":"The three Appshots show a consistent visual style. I’ll compare the spacing and reading order, then check how the layout adapts to smaller screens."}],"createdAt":1788900001000_i64,"deviceId":device,"status":"complete"}

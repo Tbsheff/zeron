@@ -53,16 +53,42 @@ pub fn state_hash(s: &OrchState) -> Result<String, DriverError> {
 
 fn split_event(e: &Event) -> Result<(String, Value), DriverError> {
     let v = serde_json::to_value(e)?;
-    let act = v
-        .get("act")
-        .and_then(Value::as_str)
-        .ok_or_else(|| DriverError::Corrupt(format!("event without act: {v}")))?
-        .to_owned();
+    let act = e.name().to_owned();
     let args = v.get("args").cloned().unwrap_or(Value::Object(Map::new()));
     Ok((act, args))
 }
 
 pub fn join_event(act: &str, args: &Value) -> Result<Event, DriverError> {
+    let question_tag = match act {
+        "RaiseQuestion" => Some("Raise"),
+        "DeliverQuestion" => Some("Deliver"),
+        "StartQuestion" => Some("Start"),
+        "AgentAnswer" => Some("AgentAnswer"),
+        "PersonAnswer" => Some("PersonAnswer"),
+        "ImportQuestion" => Some("ImportUp"),
+        "ImportAnswer" => Some("ImportAnswer"),
+        "ImportClosed" => Some("ImportClosed"),
+        "ImportRelease" => Some("ImportRelease"),
+        _ => None,
+    };
+    if let Some(tag) = question_tag {
+        return Ok(Event::Question(serde_json::from_value(
+            json!({"act": tag, "args": args}),
+        )?));
+    }
+    let native_tag = match act {
+        "NativeStart" => Some("Start"),
+        "NativeEnd" => Some("End"),
+        "NativeClaim" => Some("Claim"),
+        "NativeDelivered" => Some("Delivered"),
+        "NativeRecover" => Some("Recover"),
+        _ => None,
+    };
+    if let Some(tag) = native_tag {
+        return Ok(Event::Native(serde_json::from_value(
+            json!({"act": tag, "args": args}),
+        )?));
+    }
     let empty = args.as_object().is_some_and(Map::is_empty);
     let v = if empty {
         json!({ "act": act })
@@ -97,6 +123,18 @@ pub struct Step<'a> {
 
 pub fn line(st: Step<'_>) -> Result<TraceLine, DriverError> {
     let (act, args) = split_event(st.event)?;
+    let relay = ["remote-recv:", "remote-send:"].iter().find_map(|prefix| {
+        st.key.strip_prefix(prefix).map(|id| TraceMsg {
+            id: id.to_owned(),
+            dir: if *prefix == "remote-recv:" {
+                "recv"
+            } else {
+                "send"
+            }
+            .into(),
+        })
+    });
+    let relay_key = relay.is_some().then_some(st.key);
     Ok(TraceLine {
         v: TRACE_VERSION,
         dev: st.dev.to_owned(),
@@ -104,11 +142,13 @@ pub fn line(st: Step<'_>) -> Result<TraceLine, DriverError> {
         chat: chat_of(&args),
         act,
         args,
-        msg: Some(TraceMsg {
-            id: st.key.to_owned(),
-            dir: "recv".into(),
+        msg: relay.or_else(|| {
+            Some(TraceMsg {
+                id: st.key.to_owned(),
+                dir: "recv".into(),
+            })
         }),
-        cmd: st.cmd.map(str::to_owned),
+        cmd: st.cmd.or(relay_key).map(str::to_owned),
         ok: st.reject.is_none(),
         dup: st.dup,
         reject: st.reject,
@@ -225,6 +265,8 @@ pub const ACTION_NAMES: &[&str] = &[
     "NarrowAccess",
     "InterruptChat",
     "Delegate",
+    "Followup",
+    "ReadTaskResult",
     "ReadResult",
     "WaitReturn",
     "WaitTimeout",
@@ -235,6 +277,28 @@ pub const ACTION_NAMES: &[&str] = &[
     "DoOffer",
     "DoStop",
     "CrashEngine",
+    "RaiseQuestion",
+    "DeliverQuestion",
+    "StartQuestion",
+    "AgentAnswer",
+    "PersonAnswer",
+    "ImportQuestion",
+    "ImportAnswer",
+    "ImportClosed",
+    "ImportRelease",
+    "NativeStart",
+    "NativeEnd",
+    "NativeClaim",
+    "NativeDelivered",
+    "NativeRecover",
+    "RemoteImport",
+    "RemoteNotice",
+    "RemoteSent",
+    "RemoteStop",
+    "RemoteFence",
+    "RemoteFollowup",
+    "RemoteClamp",
+    "RemoteCancel",
 ];
 
 pub fn tla_module(dev: &str, lines: &[TraceLine]) -> (String, String) {
@@ -333,6 +397,9 @@ impl Replay {
     }
 
     fn header(&self, l: &TraceLine) -> Result<String, TraceError> {
+        if !ACTION_NAMES.contains(&l.act.as_str()) {
+            return Err(bad(l.seq, format!("unknown action {}", l.act)));
+        }
         if l.v != TRACE_VERSION {
             return Err(bad(l.seq, format!("version {}", l.v)));
         }
@@ -345,7 +412,16 @@ impl Replay {
         if l.seq != self.next_seq {
             return Err(bad(l.seq, format!("expected seq {}", self.next_seq)));
         }
-        let key = l.msg.as_ref().map(|m| m.id.clone());
+        let key = l
+            .cmd
+            .as_ref()
+            .filter(|key| {
+                ["remote-recv:", "remote-send:"]
+                    .iter()
+                    .any(|p| key.starts_with(p))
+            })
+            .cloned()
+            .or_else(|| l.msg.as_ref().map(|m| m.id.clone()));
         key.ok_or_else(|| bad(l.seq, "step without msg id"))
     }
 

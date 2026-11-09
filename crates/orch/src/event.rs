@@ -28,6 +28,9 @@ pub enum Event {
     Run(RunEvent),
     Del(DelEvent),
     Outbox(OutboxEvent),
+    Question(crate::questions::QuestionEvent),
+    Native(crate::native::NativeEvent),
+    Remote(crate::remote::RemoteEvent),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -119,6 +122,17 @@ pub enum DelEvent {
         access: u8,
         reconfigure: bool,
     },
+    Followup {
+        parent: ThreadId,
+        child: ThreadId,
+        access: u8,
+    },
+    ReadTaskResult {
+        p: ThreadId,
+        c: ThreadId,
+        run: u32,
+        task_run: u32,
+    },
     ReadResult {
         p: ThreadId,
         c: ThreadId,
@@ -169,6 +183,9 @@ impl Event {
             Event::Run(e) => e.name(),
             Event::Del(e) => e.name(),
             Event::Outbox(e) => e.name(),
+            Event::Question(e) => e.name(),
+            Event::Native(e) => e.name(),
+            Event::Remote(e) => e.name(),
         }
     }
 }
@@ -204,6 +221,8 @@ impl DelEvent {
             DelEvent::InterruptChat { .. } => "InterruptChat",
             DelEvent::Delegate { .. } => "Delegate",
             DelEvent::ReadResult { .. } => "ReadResult",
+            DelEvent::ReadTaskResult { .. } => "ReadTaskResult",
+            DelEvent::Followup { .. } => "Followup",
             DelEvent::WaitReturn { .. } => "WaitReturn",
             DelEvent::WaitTimeout { .. } => "WaitTimeout",
             DelEvent::WaitAbandon { .. } => "WaitAbandon",
@@ -227,6 +246,7 @@ impl OutboxEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum WaitOutcome {
     Result,
+    Question,
     TimedOut,
 }
 
@@ -272,6 +292,33 @@ pub enum Effect {
     Reconfigure {
         t: ThreadId,
         access: u8,
+    },
+    RespondInput {
+        child: ThreadId,
+        qid: u64,
+        epoch: u32,
+        answer: u64,
+    },
+    QuestionView {
+        viewer: ThreadId,
+        child: ThreadId,
+        qid: u64,
+        epoch: u32,
+        retract: bool,
+    },
+    NotifyQuestion {
+        child: ThreadId,
+        qid: u64,
+        epoch: u32,
+    },
+    NativeChanged {
+        parent: ThreadId,
+        key: u64,
+    },
+    DeliverNative {
+        parent: ThreadId,
+        key: u64,
+        generation: u32,
     },
     Send(Message),
 }

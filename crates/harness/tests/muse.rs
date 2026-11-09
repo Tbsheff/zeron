@@ -82,6 +82,7 @@ fn controls(answers: Vec<UserInputAnswer>) -> (RunControls, Controls) {
         RunControls {
             realtime: None,
             execution_lease: None,
+            strict_resume: false,
             steering,
             interrupt: interrupt.clone(),
             request_input: Box::new(move |questions| {
@@ -713,4 +714,27 @@ async fn a_title_runs_on_a_read_only_host_and_ends_with_its_turn() {
 #[test]
 fn a_steer_does_not_stop_the_turn() {
     assert!(!MuseHarness::new().steer_stops_tool());
+}
+
+#[tokio::test]
+async fn strict_resume_never_starts_a_fresh_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(dir.path());
+    let mut request = request(dir.path(), "resume-missing", "again");
+    request.resume = Some("gone-session".into());
+    let (mut run, controls) = controls(vec![]);
+    run.strict_resume = true;
+    let mut stream = harness.run(request, run).await.unwrap();
+    let events = turn(&mut stream).await;
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::SessionStarted { .. } | AgentEvent::TextDelta { .. }
+        )),
+        "{events:?}"
+    );
+    let (status, error, _) = done(&events);
+    assert_eq!(status, DoneStatus::Errored);
+    assert!(error.unwrap_or_default().contains("Session not found"));
+    ends(stream, controls).await;
 }

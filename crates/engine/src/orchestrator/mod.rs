@@ -1,8 +1,13 @@
 pub mod driver;
 pub mod fake;
+pub mod mechanism;
+pub mod native;
+pub mod placement;
+pub mod questions;
 mod sink;
 pub mod store;
 pub mod trace;
+pub mod transfer;
 pub mod wire;
 
 #[cfg(test)]

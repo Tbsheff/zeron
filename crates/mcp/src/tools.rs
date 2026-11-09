@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeron_doc::SessionCommandPayload;
 use zeron_proto::{
-    AccessMode, Chat, ChatConfig, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, Session, SessionStatus,
-    Space, UserInputAnswer,
+    AccessMode, Chat, ChatConfig, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, Session,
+    SessionStatus, Space, UserInputAnswer,
 };
 
 use crate::error::ToolError;
@@ -27,6 +27,7 @@ mod defs;
 mod delegate;
 mod plugins;
 mod themes;
+mod transfer;
 mod visual;
 pub use plugins::ListedTool;
 pub(crate) use plugins::is_plugin_tool_name;
@@ -122,14 +123,17 @@ pub fn renamed(old: &str) -> Option<&'static str> {
         "create_chat" => defs::CREATE_CHATS,
         "send_message" | "send_messages" => defs::MESSAGE_CHATS,
         "get_chat" => defs::READ_CHAT,
-        "whoami" | "list_devices" | "list_projects" | "list_harnesses" | "list_models" => defs::CATALOG,
-        "list_plugins" | "plugin_status" | "describe_elements" | "update_plugin" | "create_plugin"
-        | "install_plugin" => plugins::PLUGINS,
-        "list_templates" | "template_status" | "describe_app" | "create_template" | "use_template"
-        | "delete_template" | "export_template" | "import_template" => plugins::TEMPLATES,
-        "list_themes" | "get_theme" | "create_theme" | "update_theme" | "delete_theme" | "use_theme" => {
-            themes::THEMES
+        "whoami" | "list_devices" | "list_projects" | "list_harnesses" | "list_models" => {
+            defs::CATALOG
         }
+        "list_plugins" | "plugin_status" | "describe_elements" | "update_plugin"
+        | "create_plugin" | "install_plugin" => plugins::PLUGINS,
+        "list_templates" | "template_status" | "describe_app" | "create_template"
+        | "use_template" | "delete_template" | "export_template" | "import_template" => {
+            plugins::TEMPLATES
+        }
+        "list_themes" | "get_theme" | "create_theme" | "update_theme" | "delete_theme"
+        | "use_theme" => themes::THEMES,
         _ => return None,
     })
 }
@@ -138,6 +142,7 @@ fn catalog() -> Vec<ToolDef> {
     let mut tools = defs::catalog();
     tools.extend(visual::catalog());
     tools.extend(delegate::catalog());
+    tools.extend(transfer::catalog());
     tools.extend(plugins::catalog());
     tools.extend(themes::catalog());
     tools
@@ -299,6 +304,7 @@ struct ArchiveArgs {
 #[serde(deny_unknown_fields)]
 struct RespondArgs {
     chat: String,
+    epoch: Option<u32>,
     request_id: Option<String>,
     #[serde(default)]
     answers: Vec<AnswerArg>,
@@ -460,6 +466,7 @@ impl Tools {
                 SHOW_VISUAL | SHOW_IMAGE | VISUAL_REFERENCE => in_chat,
                 WAIT_ON_BACKGROUND => waits,
                 name if delegate::NAMES.contains(&name) => self.delegates(),
+                transfer::NAME => self.delegates(),
                 _ => true,
             })
             .collect()
@@ -503,12 +510,15 @@ impl Tools {
             SHOW_IMAGE => self.show_image(parse(args)?).await,
             VISUAL_REFERENCE => return visual::reference(parse(args)?),
             WAIT_ON_BACKGROUND => self.wait_on_background(parse(args)?).await,
+            transfer::NAME if self.delegates() => return self.transfer_context(args).await,
             name if delegate::NAMES.contains(&name) && self.delegates() => {
                 return Box::pin(self.delegate(name, args)).await;
             }
             plugin if plugins::NAMES.contains(&plugin) => return self.plugins(plugin, args).await,
             theme if themes::NAMES.contains(&theme) => return self.themes(theme, args).await,
-            plugin if is_plugin_tool_name(plugin) => return self.call_plugin_tool(plugin, args).await,
+            plugin if is_plugin_tool_name(plugin) => {
+                return self.call_plugin_tool(plugin, args).await;
+            }
             other => {
                 return Err(ToolError::new(
                     crate::error::UNKNOWN_TOOL,
@@ -521,14 +531,15 @@ impl Tools {
 
     async fn batch(&self, args: BatchArgs, create: bool) -> anyhow::Result<Value> {
         if !(1..=MAX_BATCH).contains(&args.requests.len()) {
-            return Err(ToolError::invalid(format!(
-                "requests must hold 1 to {MAX_BATCH} items"
-            ))
-            .into());
+            return Err(
+                ToolError::invalid(format!("requests must hold 1 to {MAX_BATCH} items")).into(),
+            );
         }
         let started = args.requests.iter().any(|r| {
             let field = if create { "prompt" } else { "text" };
-            r.get(field).and_then(Value::as_str).is_some_and(|t| !t.trim().is_empty())
+            r.get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|t| !t.trim().is_empty())
                 && r.get("wait") != Some(&json!(true))
         });
         let results = futures::future::join_all(
@@ -541,7 +552,11 @@ impl Tools {
         let mut out = json!({ "results": results });
         if started {
             out["next"] = json!(COLLECT_NEXT);
-        } else if create && out["results"].as_array().is_some_and(|r| r.iter().any(|i| i["ok"] == true && i.get("turn").is_none())) {
+        } else if create
+            && out["results"]
+                .as_array()
+                .is_some_and(|r| r.iter().any(|i| i["ok"] == true && i.get("turn").is_none()))
+        {
             out["next"] = json!("Give the new chats work with message_chats.");
         }
         Ok(out)
@@ -551,11 +566,17 @@ impl Tools {
         let item = async {
             if create {
                 let args: CreateChatArgs = parse(args)?;
-                let key = args.client_request_id.clone().map(|id| format!("create:{id}"));
+                let key = args
+                    .client_request_id
+                    .clone()
+                    .map(|id| format!("create:{id}"));
                 self.once(key, || self.create_chat(args)).await
             } else {
                 let args: SendArgs = parse(args)?;
-                let key = args.client_request_id.clone().map(|id| format!("send:{id}"));
+                let key = args
+                    .client_request_id
+                    .clone()
+                    .map(|id| format!("send:{id}"));
                 self.once(key, || self.send_message(args)).await
             }
         };
@@ -715,7 +736,11 @@ impl Tools {
             .collect())
     }
 
-    async fn catalog_models(&self, harness: &str, device: Option<&str>) -> anyhow::Result<Vec<Value>> {
+    async fn catalog_models(
+        &self,
+        harness: &str,
+        device: Option<&str>,
+    ) -> anyhow::Result<Vec<Value>> {
         let harness: HarnessId = parse_enum("harness", harness)?;
         let device = match device {
             Some(key) => Some(self.zeron.resolve_device_id(Some(key)).await?),
@@ -799,9 +824,14 @@ impl Tools {
             .filter(|parent| !zeron_proto::voice::is_orchestrator_chat(parent))
         };
         anyhow::ensure!(
-            !matches!(args.kind, Some(ChatKind::Side | ChatKind::Subagent)) || parent_chat_id.is_some(),
+            !matches!(args.kind, Some(ChatKind::Side | ChatKind::Subagent))
+                || parent_chat_id.is_some(),
             "kind {} requires a parent or origin chat",
-            if args.kind == Some(ChatKind::Side) { "side" } else { "subagent" }
+            if args.kind == Some(ChatKind::Side) {
+                "side"
+            } else {
+                "subagent"
+            }
         );
         // A child is a subagent unless asked for as a side chat: delegated
         // work lists under its parent's Subagents, not its side chats.
@@ -873,7 +903,9 @@ impl Tools {
             .filter(|c| !c.is_empty())
             .map(str::to_owned);
         if cwd.is_none() && !args.cloud {
-            cwd = self.scratch_cwd(space.as_ref(), &device_id, &chat_id).await?;
+            cwd = self
+                .scratch_cwd(space.as_ref(), &device_id, &chat_id)
+                .await?;
         }
         if let Some(cwd) = &cwd {
             mutate["cwd"] = json!(cwd);
@@ -1112,7 +1144,11 @@ impl Tools {
         );
         let summary = summarize_chat(&chat, &spaces, &sessions);
         let stale = summary["statusStale"] == true;
-        let pending = if stale { None } else { last_pending_input(&rendered) };
+        let pending = if stale {
+            None
+        } else {
+            last_pending_input(&rendered)
+        };
         let total = rendered.len();
         let limit = args.limit.unwrap_or(20).min(500);
         let end = total.saturating_sub(args.offset);
@@ -1128,7 +1164,8 @@ impl Tools {
             "messages": window,
         });
         if out["pendingInput"].is_object() {
-            out["next"] = json!("It waits on a question: answer with respond_to_input {chat, answers}.");
+            out["next"] =
+                json!("It waits on a question: answer with respond_to_input {chat, answers}.");
         }
         Ok(out)
     }
@@ -1144,6 +1181,29 @@ impl Tools {
                 "refusing to send a message to your own chat ({})",
                 short(&chat.id)
             );
+        }
+        if self.zeron.origin().orchestrator
+            && chat.parent_chat_id.as_deref() == self.zeron.origin().chat_id.as_deref()
+            && chat.child_kind == Some(zeron_proto::ChildKind::Subagent)
+        {
+            let origin = self.zeron.origin().chat_id.clone().unwrap_or_default();
+            let id = args
+                .client_request_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let params = json!({"originChatId":origin,"task":text,"mode":"async","followup":true,"clientRequestId":id,
+                "child":{"chatId":chat.id,"config":chat.config,"deviceId":chat.device_id}});
+            let mut result = self
+                .orch_call(
+                    zeron_rpc::methods::ORCH_DELEGATE,
+                    params,
+                    std::time::Duration::from_secs(60),
+                )
+                .await?;
+            result["chatId"] = json!(chat.id);
+            result["title"] = json!(chat.title);
+            result["sent"] = json!({"delivery":"task","id":result["taskId"]});
+            return Ok(result);
         }
         let (spaces, sessions, harnesses) = tokio::try_join!(
             self.zeron.spaces(),
@@ -1210,7 +1270,8 @@ impl Tools {
         if out["turn"]["timedOut"] == true {
             out["next"] = json!("Still working. Call wait_for_turn again, or do other work first.");
         } else if out["turn"]["pendingInput"].is_object() {
-            out["next"] = json!("It waits on a question: answer with respond_to_input {chat, answers}.");
+            out["next"] =
+                json!("It waits on a question: answer with respond_to_input {chat, answers}.");
         }
         Ok(out)
     }
@@ -1265,16 +1326,12 @@ impl Tools {
                 labels: a.labels,
             })
             .collect();
-        let command_id = self
-            .zeron
-            .queue_command(
-                &chat.id,
-                &SessionCommandPayload::RespondInput {
-                    request_id: request_id.clone(),
-                    answers,
-                },
-            )
-            .await?;
+        let reply = self.zeron.call(zeron_rpc::methods::QUEUE_COMMAND, json!({
+            "chatId": chat.id,
+            "questionEpoch": args.epoch,
+            "command": SessionCommandPayload::RespondInput { request_id: request_id.clone(), answers },
+        })).await?;
+        let command_id = reply["commandId"].as_str().unwrap_or_default().to_owned();
         Ok(json!({ "chatId": chat.id, "requestId": request_id, "commandId": command_id }))
     }
 
@@ -1502,7 +1559,11 @@ impl Tools {
 
 /// claude-code when it is ready here, else the first ready harness — a
 /// provider that is installed but signed out only when nothing else is.
-fn pick_harness(ask: ChildAsk<'_>, harnesses: &[HarnessInfo], device_id: &str) -> anyhow::Result<HarnessId> {
+fn pick_harness(
+    ask: ChildAsk<'_>,
+    harnesses: &[HarnessInfo],
+    device_id: &str,
+) -> anyhow::Result<HarnessId> {
     let Some(raw) = ask.harness else {
         return if ask.cloud {
             Ok(CLOUD_HARNESSES[0])
@@ -1571,7 +1632,9 @@ fn default_harness(harnesses: &[HarnessInfo]) -> anyhow::Result<HarnessId> {
         })
         .map(|h| h.id)
         .ok_or_else(|| {
-            anyhow::anyhow!("no harness is available on this device (catalog {{kind: \"harnesses\"}})")
+            anyhow::anyhow!(
+                "no harness is available on this device (catalog {{kind: \"harnesses\"}})"
+            )
         })
 }
 
@@ -1615,7 +1678,10 @@ mod tests {
             } else {
                 Err(ToolError {
                     code: crate::error::REJECTED,
-                    message: row["error"]["message"].as_str().unwrap_or_default().to_owned(),
+                    message: row["error"]["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
                 })
             }
         }
@@ -1788,7 +1854,11 @@ mod tests {
                     }
                     RpcReply::Value(json!({ "commandId": "cmd-1", "id": "q-1" }))
                 }
-                methods::ORCH_DELEGATE | methods::ORCH_TASK_STATUS | methods::ORCH_TASK_CANCEL => {
+                "orch.transfer_context"
+                | methods::FORK_SIDE_CHAT
+                | methods::ORCH_DELEGATE
+                | methods::ORCH_TASK_STATUS
+                | methods::ORCH_TASK_CANCEL => {
                     self.writes
                         .lock()
                         .unwrap()
@@ -1820,15 +1890,32 @@ mod tests {
             assert!(!def.description.is_empty());
             assert!(def.name.len() <= 63, "{}", def.name);
             assert!(
-                def.name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                def.name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
                 "{}",
                 def.name
             );
             assert!(!def.title.is_empty(), "{}", def.name);
-            let cap = if def.name == SHOW_VISUAL { 3_072 } else { 1_024 };
-            assert!(def.description.len() <= cap, "{}: {}", def.name, def.description.len());
-            assert_eq!(def.always_load, def.name == WAIT_ON_BACKGROUND, "{}", def.name);
-            let example: Value = serde_json::from_str(def.example).unwrap_or_else(|e| panic!("{}: {e}", def.name));
+            let cap = if def.name == SHOW_VISUAL {
+                3_072
+            } else {
+                1_024
+            };
+            assert!(
+                def.description.len() <= cap,
+                "{}: {}",
+                def.name,
+                def.description.len()
+            );
+            assert_eq!(
+                def.always_load,
+                def.name == WAIT_ON_BACKGROUND,
+                "{}",
+                def.name
+            );
+            let example: Value =
+                serde_json::from_str(def.example).unwrap_or_else(|e| panic!("{}: {e}", def.name));
             assert!(example.is_object(), "{}", def.name);
             if def.hints.read_only {
                 assert!(!def.hints.destructive, "{}", def.name);
@@ -1840,14 +1927,23 @@ mod tests {
         let listed: Vec<ListedTool> = defs.into_iter().map(ListedTool::from).collect();
         for tool in &listed {
             let annotations = tool.annotations.as_ref().unwrap();
-            for hint in ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"] {
+            for hint in [
+                "readOnlyHint",
+                "destructiveHint",
+                "idempotentHint",
+                "openWorldHint",
+            ] {
                 assert!(annotations[hint].is_boolean(), "{} {hint}", tool.name);
             }
             assert_eq!(annotations["title"], json!(tool.title), "{}", tool.name);
         }
         let always: Vec<&str> = listed
             .iter()
-            .filter(|t| t.meta.as_ref().is_some_and(|m| m["anthropic/alwaysLoad"] == true))
+            .filter(|t| {
+                t.meta
+                    .as_ref()
+                    .is_some_and(|m| m["anthropic/alwaysLoad"] == true)
+            })
             .map(|t| t.name.as_str())
             .collect();
         assert_eq!(always, [WAIT_ON_BACKGROUND]);
@@ -1862,17 +1958,37 @@ mod tests {
             (defs::CATALOG, json!({ "kind": "devices" })),
             (defs::LIST_CHATS, json!({})),
             (defs::READ_CHAT, json!({ "chat": "alpha", "limit": 0 })),
-            (defs::CREATE_CHATS, json!({ "requests": [{ "project": "space-1" }] })),
-            (defs::WAIT_FOR_TURN, json!({ "chat": "alpha", "timeout_secs": 1 })),
+            (
+                defs::CREATE_CHATS,
+                json!({ "requests": [{ "project": "space-1" }] }),
+            ),
+            (
+                defs::WAIT_FOR_TURN,
+                json!({ "chat": "alpha", "timeout_secs": 1 }),
+            ),
         ];
         for (name, args) in calls {
-            let out = tools.call(name, args).await.unwrap_or_else(|e| panic!("{name}: {e}"));
-            let schema = defs.iter().find(|d| d.name == name).unwrap().output_schema.clone().unwrap();
+            let out = tools
+                .call(name, args)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let schema = defs
+                .iter()
+                .find(|d| d.name == name)
+                .unwrap()
+                .output_schema
+                .clone()
+                .unwrap();
             for key in schema["required"].as_array().unwrap() {
-                assert!(out.get(key.as_str().unwrap()).is_some(), "{name} lacks {key}: {out}");
+                assert!(
+                    out.get(key.as_str().unwrap()).is_some(),
+                    "{name} lacks {key}: {out}"
+                );
             }
             for (key, prop) in schema["properties"].as_object().unwrap() {
-                let (Some(value), Some(kind)) = (out.get(key), prop.get("type")) else { continue };
+                let (Some(value), Some(kind)) = (out.get(key), prop.get("type")) else {
+                    continue;
+                };
                 let kinds: Vec<&str> = match kind {
                     Value::String(k) => vec![k.as_str()],
                     Value::Array(ks) => ks.iter().filter_map(Value::as_str).collect(),
@@ -1887,7 +2003,10 @@ mod tests {
                     Value::Array(_) => "array",
                     Value::Object(_) => "object",
                 };
-                assert!(kinds.contains(&actual) || (actual == "integer" && kinds.contains(&"number")), "{name}.{key}: {actual} not in {kinds:?}");
+                assert!(
+                    kinds.contains(&actual) || (actual == "integer" && kinds.contains(&"number")),
+                    "{name}.{key}: {actual} not in {kinds:?}"
+                );
             }
         }
     }
@@ -1896,13 +2015,23 @@ mod tests {
     async fn a_repeated_client_request_id_replays_instead_of_creating_twice() {
         let world = Arc::new(World::default());
         let tools = tools(world.clone(), Origin::default());
-        let request = json!({ "requests": [{ "project": "space-1", "clientRequestId": "docs-1" }] });
-        let first = tools.call(defs::CREATE_CHATS, request.clone()).await.unwrap();
+        let request =
+            json!({ "requests": [{ "project": "space-1", "clientRequestId": "docs-1" }] });
+        let first = tools
+            .call(defs::CREATE_CHATS, request.clone())
+            .await
+            .unwrap();
         let again = tools.call(defs::CREATE_CHATS, request).await.unwrap();
         assert_eq!(first["results"][0]["chatId"], again["results"][0]["chatId"]);
         assert!(first["results"][0].get("replayed").is_none());
         assert_eq!(again["results"][0]["replayed"], true);
-        let creates = world.writes.lock().unwrap().iter().filter(|(_, p)| p["op"] == "createChat").count();
+        let creates = world
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, p)| p["op"] == "createChat")
+            .count();
         assert_eq!(creates, 1);
     }
 
@@ -1910,10 +2039,16 @@ mod tests {
     async fn a_mistyped_chat_gets_a_did_you_mean_and_a_code() {
         let world = Arc::new(World::default());
         let tools = tools(world, Origin::default());
-        let error = tools.call(defs::READ_CHAT, json!({ "chat": "Alpah" })).await.unwrap_err();
+        let error = tools
+            .call(defs::READ_CHAT, json!({ "chat": "Alpah" }))
+            .await
+            .unwrap_err();
         assert_eq!(error.code, crate::error::NOT_FOUND);
         assert!(error.message.contains("Did you mean \"Alpha\""), "{error}");
-        let me = tools.call(defs::READ_CHAT, json!({ "chat": "me" })).await.unwrap_err();
+        let me = tools
+            .call(defs::READ_CHAT, json!({ "chat": "me" }))
+            .await
+            .unwrap_err();
         assert_eq!(me.code, crate::error::INVALID_ARGUMENTS);
     }
 
@@ -1922,13 +2057,22 @@ mod tests {
         let world = Arc::new(World::default());
         let tools = tools(world, Origin::default());
         let out = tools
-            .call(defs::CREATE_CHATS, json!({ "requests": [{ "project": "space-1", "prompt": "go" }] }))
+            .call(
+                defs::CREATE_CHATS,
+                json!({ "requests": [{ "project": "space-1", "prompt": "go" }] }),
+            )
             .await
             .unwrap();
         let next = out["next"].as_str().unwrap();
-        assert!(next.contains("wait_for_turn") && !next.contains("end your turn"), "{next}");
+        assert!(
+            next.contains("wait_for_turn") && !next.contains("end your turn"),
+            "{next}"
+        );
         let idle = tools
-            .call(defs::CREATE_CHATS, json!({ "requests": [{ "project": "space-1" }] }))
+            .call(
+                defs::CREATE_CHATS,
+                json!({ "requests": [{ "project": "space-1" }] }),
+            )
             .await
             .unwrap();
         assert!(idle["next"].as_str().unwrap().contains("message_chats"));
@@ -1938,20 +2082,32 @@ mod tests {
     fn visual_reference_answers_topics_and_its_examples_pass_the_check() {
         let list = visual::reference(Default::default()).unwrap();
         assert!(list["topics"].as_array().unwrap().len() >= 10);
-        let basics = visual::reference(serde_json::from_value(json!({ "topic": "basics" })).unwrap()).unwrap();
+        let basics =
+            visual::reference(serde_json::from_value(json!({ "topic": "basics" })).unwrap())
+                .unwrap();
         let body = basics["reference"].as_str().unwrap();
-        let code = body.split("```lua\n").nth(1).unwrap().split("```").next().unwrap();
+        let code = body
+            .split("```lua\n")
+            .nth(1)
+            .unwrap()
+            .split("```")
+            .next()
+            .unwrap();
         zeron_visual::check(code, 1).unwrap();
         let skill = zeron_proto::visual_reference::skill_markdown();
         for name in zeron_visual::TOKEN_NAMES {
             assert!(skill.contains(name), "{name}");
         }
-        assert!(visual::reference(serde_json::from_value(json!({ "topic": "nope" })).unwrap()).is_err());
+        assert!(
+            visual::reference(serde_json::from_value(json!({ "topic": "nope" })).unwrap()).is_err()
+        );
     }
 
     #[test]
     fn the_show_visual_example_passes_its_own_check() {
-        let start = visual::SHOW_VISUAL_DESCRIPTION.find("local s = ui.state").unwrap();
+        let start = visual::SHOW_VISUAL_DESCRIPTION
+            .find("local s = ui.state")
+            .unwrap();
         let end = start
             + visual::SHOW_VISUAL_DESCRIPTION[start..]
                 .find("\n\nZeron runs the script")
@@ -2013,7 +2169,10 @@ mod tests {
         let world = Arc::new(World::default());
         let outside = tools(world.clone(), Origin::default());
         assert!(!outside.has("show_image"));
-        assert!(!outside.has("wait_on_background"), "a wait is a chat's agent's to say");
+        assert!(
+            !outside.has("wait_on_background"),
+            "a wait is a chat's agent's to say"
+        );
         assert!(
             outside
                 .call("show_image", json!({ "path": path }))
@@ -2473,7 +2632,13 @@ mod tests {
             json!({ "name": "wait_on_background", "arguments": { "task_ids": ["b1"] } }),
         )
         .await;
-        assert!(call["error"]["message"].as_str().unwrap().contains("unknown tool"), "{call}");
+        assert!(
+            call["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown tool"),
+            "{call}"
+        );
     }
 
     fn origin(chat: &str) -> Origin {
@@ -2509,10 +2674,16 @@ mod tests {
         // Asking for more is lowered to its own, silently, and said in the
         // reply: no full-access child, no wider sandbox.
         let capped = tools
-            .legacy("create_chat", json!({"access": "full-access", "sandbox": "danger-full-access"}))
+            .legacy(
+                "create_chat",
+                json!({"access": "full-access", "sandbox": "danger-full-access"}),
+            )
             .await
             .unwrap();
-        assert!(capped["accessCapped"].as_str().unwrap().contains("no more"), "{capped}");
+        assert!(
+            capped["accessCapped"].as_str().unwrap().contains("no more"),
+            "{capped}"
+        );
         let writes = world.writes.lock().unwrap();
         let created: Vec<&Value> = writes
             .iter()
@@ -2775,11 +2946,19 @@ mod tests {
             (json!({"kind":"chat"}), "chat", Value::Null),
             (json!({"kind":"chat", "parent":"  "}), "chat", Value::Null),
             (json!({"kind":"side"}), "side", json!("chat-alpha-1")),
-            (json!({"kind":"subagent"}), "subagent", json!("chat-alpha-1")),
+            (
+                json!({"kind":"subagent"}),
+                "subagent",
+                json!("chat-alpha-1"),
+            ),
             // A child of your own chat, kind omitted: a subagent.
             (json!({}), "subagent", json!("chat-alpha-1")),
             (json!({"parent":"Beta"}), "subagent", json!("chat-beta-2")),
-            (json!({"kind":"side", "parent":"Beta"}), "side", json!("chat-beta-2")),
+            (
+                json!({"kind":"side", "parent":"Beta"}),
+                "side",
+                json!("chat-beta-2"),
+            ),
         ] {
             let created = from_chat.legacy("create_chat", args).await.unwrap();
             assert_eq!(created["kind"], kind);
@@ -2807,7 +2986,9 @@ mod tests {
         );
         // An explicit parent from outside any chat: a subagent of it.
         assert_eq!(
-            root.legacy("create_chat", json!({"parent":"Alpha"})).await.unwrap()["kind"],
+            root.legacy("create_chat", json!({"parent":"Alpha"}))
+                .await
+                .unwrap()["kind"],
             "subagent"
         );
     }
@@ -3408,6 +3589,9 @@ mod tests {
         let error = &invalid["result"]["structuredContent"];
         assert_eq!(error["code"], "invalid_arguments");
         let message = error["message"].as_str().unwrap();
-        assert!(message.contains("unknown field `lmit`") && message.contains("Valid call: read_chat {"), "{message}");
+        assert!(
+            message.contains("unknown field `lmit`") && message.contains("Valid call: read_chat {"),
+            "{message}"
+        );
     }
 }

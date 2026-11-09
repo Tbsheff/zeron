@@ -689,9 +689,12 @@ impl Harness for OpencodeHarness {
             initial_native_command_selected,
         }));
         Ok(futures::stream::unfold(event_rx, |mut rx| async move {
-            rx.recv()
-                .await
-                .map(|ev| (ev.map(|ev| crate::with_failure(HarnessId::Opencode, ev)), rx))
+            rx.recv().await.map(|ev| {
+                (
+                    ev.map(|ev| crate::with_failure(HarnessId::Opencode, ev)),
+                    rx,
+                )
+            })
         })
         .boxed())
     }
@@ -2062,6 +2065,7 @@ async fn run_session(session: Session) {
     let RunControls {
         realtime: _,
         execution_lease: _execution_lease,
+        strict_resume,
         request_input,
         mut steering,
         interrupt,
@@ -2113,6 +2117,14 @@ async fn run_session(session: Session) {
                         id
                     }
                     Err(e) => {
+                        if strict_resume {
+                            if e.to_string().contains(": 404 ") {
+                                return Err(HarnessError::Protocol(format!(
+                                    "Session not found: strict OpenCode resume rejected: {e}"
+                                )));
+                            }
+                            return Err(e);
+                        }
                         tracing::debug!(
                             target: "zeron_harness::opencode",
                             "session resume failed (starting fresh): {e}"
@@ -5880,7 +5892,16 @@ const ASKED_PERMISSIONS: [&str; 3] = ["bash", "webfetch", "websearch"];
 /// live on 1.19.4): looking around, the agent's own todo list and
 /// questions, and subagents, whose tools answer to the same rules.
 const UNASKED_PERMISSIONS: [&str; 10] = [
-    "read", "glob", "grep", "list", "lsp", "todoread", "todowrite", "question", "task", "skill",
+    "read",
+    "glob",
+    "grep",
+    "list",
+    "lsp",
+    "todoread",
+    "todowrite",
+    "question",
+    "task",
+    "skill",
 ];
 
 /// Where the `plan` agent writes its plan: `.opencode/plans/` in a

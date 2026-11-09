@@ -10,6 +10,14 @@ use zeron_orch::{
 use zeron_proto::{DoneStatus, FailureClass, HarnessId, RunRequest};
 use zeron_sync::DocsStore;
 
+#[path = "wire/questions.rs"]
+mod question_wire;
+#[path = "remote.rs"]
+pub mod remote;
+mod tasks;
+
+pub use tasks::{ChildSpec, DelegateRequest, OrchError, RUNNING_NEXT, TaskView, access_level};
+
 use super::DriverError;
 use super::driver::{ApplyResult, Driver};
 use super::store::{Applied, OutboxRow};
@@ -59,6 +67,8 @@ pub enum Via {
     },
     Resume {
         prompt: String,
+        #[serde(default)]
+        worktree: Option<zeron_proto::WorktreeSpec>,
     },
 }
 
@@ -86,7 +96,46 @@ pub trait RunEngine: Send + Sync {
     fn owns_run(&self, chat: &str) -> bool;
     fn last_done(&self, chat: &str) -> Option<(u64, DoneStatus, Option<FailureClass>)>;
     fn journal_seq(&self, chat: &str) -> u64;
+    fn effective_access(&self, _chat: &str) -> Option<u8> {
+        None
+    }
+    fn create_child(&self, parent: &str, spec: &ChildSpec) -> Result<(), EngineError>;
+    fn result_text(&self, chat: &str) -> Option<String>;
+    fn reports_mcp_results(&self, chat: &str) -> bool;
+    fn task_results(
+        &self,
+        chat: &str,
+        message_id: &str,
+        results: Vec<zeron_doc::TaskResultPart>,
+    ) -> Result<(), EngineError>;
     fn kick_drain(&self, chat: &str);
+    fn respond_question(
+        &self,
+        _chat: &str,
+        _request: &str,
+        _answers: Vec<zeron_proto::UserInputAnswer>,
+    ) -> Result<bool, EngineError> {
+        Ok(false)
+    }
+    fn notify_question(&self, _chat: &str, _request: &str) {}
+    fn save_native_snapshot(&self, _doc: &str, _snapshot: &[u8]) -> Result<(), EngineError> {
+        Err(EngineError::Other(
+            "native snapshot writer unavailable".into(),
+        ))
+    }
+    fn native_changed(&self, _chat: &str, _tool: &str, _status: &str) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    fn orch_route(&self, _chat: &str) -> Option<super::placement::ChatRoute> {
+        None
+    }
+    fn orch_supports(&self, _device: &str) -> bool {
+        false
+    }
+    fn orch_send(&self, _message: &zeron_doc::OrchMessage) -> Result<bool, String> {
+        Err("remote orchestration unavailable".into())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +197,9 @@ fn auto_step(s: &OrchState, th: &Thread, chat: &str) -> Option<(String, Event)> 
             )
         } else if ev.outcome.retryable() && th.may_retry(s.config.max_retry) {
             (format!("retry:{tag}"), RunEvent::RetryAttempt { t, ev })
+        } else if ev.outcome == Outcome::Completed && th.wait_on.is_some() {
+            let key = format!("abandon:{tag}");
+            return Some((key, Event::Del(DelEvent::WaitAbandon { t })));
         } else {
             (format!("end:{tag}"), RunEvent::IngestEnd { t, ev })
         };
@@ -160,10 +212,15 @@ fn auto_step(s: &OrchState, th: &Thread, chat: &str) -> Option<(String, Event)> 
         let key = format!("ulr:{chat}:{}", th.rord());
         return Some((key, Event::Run(RunEvent::UsageLimitRecovery { t })));
     }
-    let head_ok = th
-        .queue
-        .front()
-        .is_some_and(|m| !matches!(m, Msg::Wake { .. }));
+    if let Some(ev) = super::questions::next(s, t) {
+        return Some((format!("question-start:{chat}:{}", th.rord() + 1), ev));
+    }
+    if let Some(Msg::Wake { .. }) = th.queue.front() {
+        let pass = matches!(th.held, Hold::None | Hold::Fail);
+        let key = format!("wakestart:{chat}:{}", th.rord() + 1);
+        return pass.then_some((key, Event::Del(DelEvent::StartFromQueueWake { t })));
+    }
+    let head_ok = th.queue.front().is_some();
     (th.held == Hold::None && head_ok).then(|| {
         let key = format!("start:{chat}:{}", th.rord() + 1);
         (key, Event::Run(RunEvent::StartFromQueue { t }))
@@ -173,6 +230,8 @@ fn auto_step(s: &OrchState, th: &Thread, chat: &str) -> Option<(String, Event)> 
 fn enabled(ev: Event) -> impl Fn(&OrchState) -> bool {
     move |s| step(s, ev).is_ok()
 }
+
+type PendingCall = (AttemptId, String, Option<serde_json::Value>);
 
 pub struct OrchWire {
     me: std::sync::Weak<OrchWire>,
@@ -190,6 +249,8 @@ pub struct OrchWire {
     lose: Mutex<HashSet<String>>,
     dead: std::sync::atomic::AtomicBool,
     wake: tokio::sync::Notify,
+    task_events: tokio::sync::Notify,
+    calls: Mutex<HashMap<(String, String), PendingCall>>,
 }
 
 impl OrchWire {
@@ -200,7 +261,7 @@ impl OrchWire {
     ) -> Result<Arc<Self>, DriverError> {
         let driver = Driver::open(store, device, opts.config)?;
         let boot_live = live_attempts(&driver.state()?);
-        Ok(Arc::new_cyclic(|me| Self {
+        let wire = Arc::new_cyclic(|me| Self {
             me: me.clone(),
             driver,
             opts,
@@ -216,7 +277,11 @@ impl OrchWire {
             lose: Mutex::new(HashSet::new()),
             dead: std::sync::atomic::AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
-        }))
+            task_events: tokio::sync::Notify::new(),
+            calls: Mutex::new(HashMap::new()),
+        });
+        wire.crash_waits()?;
+        Ok(wire)
     }
 
     pub fn driver(&self) -> &Driver {
@@ -383,17 +448,24 @@ impl OrchWire {
         Ok(Some(ThreadId(n)))
     }
 
-    fn thread(&self, chat: &str) -> Result<ThreadId, DriverError> {
+    fn intern_thread(&self, chat: &str) -> Result<ThreadId, DriverError> {
         let (n, fresh) = self.driver.intern(&format!("chat:{chat}"), "n:thread")?;
         let n = u32::try_from(n).map_err(|_| DriverError::Corrupt("thread id overflow".into()))?;
         if fresh {
             self.driver.put_meta(&format!("thread:{n}"), chat)?;
         }
-        let t = ThreadId(n);
+        Ok(ThreadId(n))
+    }
+
+    fn thread(&self, chat: &str) -> Result<ThreadId, DriverError> {
+        let t = self.intern_thread(chat)?;
+        if self.driver.state()?.thread(t).is_ok() {
+            return Ok(t);
+        }
         let ev = Event::Del(DelEvent::OpenRoot {
             t,
             access: 2,
-            reconfigure: true,
+            reconfigure: false,
         });
         self.driver
             .apply_if(&format!("open:{chat}"), ev, &enabled(ev))?;
@@ -491,6 +563,9 @@ impl OrchWire {
     }
 
     fn pump(&self, t: ThreadId, chat: &str, fx: &mut Vec<String>) -> Result<(), DriverError> {
+        if self.remote_shadow(chat)? {
+            return self.pump_shadow(chat, t, fx);
+        }
         for _ in 0..32 {
             let s = self.driver.state()?;
             let Ok(th) = s.thread(t) else { return Ok(()) };
@@ -545,6 +620,12 @@ impl OrchWire {
         cmd: Option<&str>,
     ) -> Result<Decision, DriverError> {
         let t = self.thread(&p.chat)?;
+        if let Via::Dispatch { request, .. } = &p.via {
+            let access = tasks::access_level(request.access);
+            let ev = Event::Del(DelEvent::NarrowAccess { t, access });
+            self.driver
+                .apply_if(&format!("access:{}:{}", p.chat, access), ev, &enabled(ev))?;
+        }
         let n = self.msg(&p.message_id)?;
         if kind != SendKind::Redeliver && self.ran(&p.message_id)? {
             return Ok(Decision::Refused("R17: this message id already ran"));
@@ -788,6 +869,9 @@ impl OrchWire {
         engine: &dyn RunEngine,
         only: Option<&[String]>,
     ) -> Vec<Result<Ran, EngineError>> {
+        if let Err(err) = self.retry_native_terminals(engine) {
+            tracing::warn!(error = %err, "native terminal save remains pending");
+        }
         let rows = match self.driver.pending() {
             Ok(rows) => rows,
             Err(err) => return vec![Err(self.to_engine(err))],
@@ -807,6 +891,17 @@ impl OrchWire {
                 continue;
             }
             let res = self.execute(engine, &row, false).await;
+            if res.is_err()
+                && !matches!(
+                    row.effect,
+                    Effect::StartRun { .. } | Effect::StartAttempt { .. } | Effect::SteerRun { .. }
+                )
+            {
+                busy.extend(t);
+                lock(&self.claimed).remove(&row.effect_id);
+                out.push(res);
+                continue;
+            }
             if let Err(err) = self.driver.complete(&row.effect_id) {
                 out.push(Err(self.to_engine(err)));
                 return out;
@@ -824,20 +919,40 @@ impl OrchWire {
         replay: bool,
     ) -> Result<Ran, EngineError> {
         let wrap = |e: DriverError| EngineError::Other(format!("orchestrator: {e}"));
+        if self.remote_effect(engine, &row.effect).map_err(wrap)? {
+            return Ok(Ran::Nothing);
+        }
         match &row.effect {
-            Effect::StartRun { run, start, .. } => {
+            Effect::StartRun {
+                run,
+                start,
+                delivered,
+                access,
+            } => {
                 let at = AttemptId { run: *run, n: 1 };
-                let p = self.start_pending(*run, *start).map_err(wrap)?;
+                if !self.may_start(at).map_err(wrap)? {
+                    return Ok(Ran::Nothing);
+                }
+                self.stash_delivered(*run, delivered).map_err(wrap)?;
+                let mut p = self.start_pending(engine, *run, *start).map_err(wrap)?;
+                tasks::clamp_access(&mut p, *access);
                 self.start(engine, &row.effect_id, at, p, replay).await
             }
             Effect::StartAttempt {
                 attempt,
                 msg,
                 reason,
-                ..
+                access,
             } => {
+                if !self.may_start(*attempt).map_err(wrap)? {
+                    return Ok(Ran::Nothing);
+                }
                 self.back_off(*reason, attempt.n).await;
-                let p = self.attempt_pending(*attempt, *msg).map_err(wrap)?;
+                if !self.may_start(*attempt).map_err(wrap)? {
+                    return Ok(Ran::Nothing);
+                }
+                let mut p = self.attempt_pending(engine, *attempt, *msg).map_err(wrap)?;
+                tasks::clamp_access(&mut p, *access);
                 self.start(engine, &row.effect_id, *attempt, p, replay)
                     .await
             }
@@ -859,7 +974,77 @@ impl OrchWire {
                 self.arm_timer(*run).map_err(wrap)?;
                 Ok(Ran::Nothing)
             }
-            _ => Ok(Ran::Nothing),
+            Effect::CreateChild { parent, child, .. } => {
+                self.create_child(engine, *parent, *child).map_err(wrap)?;
+                Ok(Ran::Nothing)
+            }
+            Effect::RespondInput { child, .. } => {
+                let chat = self.chat_of(*child).map_err(wrap)?;
+                if let Some((request, answers)) =
+                    super::questions::response(&self.driver, &row.effect).map_err(wrap)?
+                {
+                    if !engine.respond_question(&chat, &request, answers)? {
+                        return Err(EngineError::Other(
+                            "Input resolver is unavailable; durable answer remains pending".into(),
+                        ));
+                    }
+                }
+                Ok(Ran::Nothing)
+            }
+            Effect::QuestionView { .. } => {
+                self.task_events.notify_waiters();
+                self.pump_all().map_err(wrap)?;
+                self.wake.notify_one();
+                Ok(Ran::Nothing)
+            }
+            Effect::NotifyQuestion { child, qid, epoch } => {
+                let s = self.driver.state().map_err(wrap)?;
+                if s.questions
+                    .get(&(*child, *qid))
+                    .is_some_and(|q| q.pending && q.epoch == *epoch && q.at_person)
+                {
+                    let chat = self.chat_of(*child).map_err(wrap)?;
+                    let request = self
+                        .driver
+                        .meta(&format!("question-id:{qid}"))
+                        .map_err(wrap)?
+                        .unwrap_or_default();
+                    engine.notify_question(&chat, &request);
+                }
+                Ok(Ran::Nothing)
+            }
+            Effect::NativeChanged { parent, key } => {
+                let state = self.driver.state().map_err(wrap)?;
+                if let Some(n) = state.natives.get(&(*parent, *key)) {
+                    let chat = self.chat_of(*parent).map_err(wrap)?;
+                    let tool = super::native::tool_id(&self.driver, *key).map_err(wrap)?;
+                    let status = match n.status {
+                        zeron_orch::native::NativeStatus::Running => "running",
+                        zeron_orch::native::NativeStatus::Completed => "done",
+                        _ => "failed",
+                    };
+                    engine.native_changed(&chat, &tool, status)?;
+                }
+                self.task_events.notify_waiters();
+                Ok(Ran::Nothing)
+            }
+            Effect::DeliverNative {
+                parent,
+                key,
+                generation,
+            } => {
+                self.deliver_native(engine, *parent, *key, *generation)
+                    .map_err(wrap)?;
+                Ok(Ran::Nothing)
+            }
+            Effect::Send(m) => {
+                self.deliver(engine, *m).map_err(wrap)?;
+                Ok(Ran::Nothing)
+            }
+            Effect::CompleteWait { .. } | Effect::Reconfigure { .. } => {
+                self.task_events.notify_waiters();
+                Ok(Ran::Nothing)
+            }
         }
     }
 
@@ -883,17 +1068,41 @@ impl OrchWire {
         out
     }
 
-    fn start_pending(&self, run: RunId, start: Start) -> Result<Pending, DriverError> {
+    fn start_pending(
+        &self,
+        engine: &dyn RunEngine,
+        run: RunId,
+        start: Start,
+    ) -> Result<Pending, DriverError> {
         match start {
             Start::Queued(Msg::Person(n) | Msg::Server(n)) => self.pending_of(n),
             Start::Resume => self.resume_pending(run),
-            Start::Queued(other) => Err(DriverError::Corrupt(format!(
-                "slice 3 cannot start {other:?}"
-            ))),
+            Start::Questions => {
+                let chat = self.chat_of(run.thread)?;
+                let prompt =
+                    super::questions::prompt(&self.driver, &self.driver.state()?, run.thread)?;
+                Ok(Pending {
+                    chat,
+                    message_id: format!("orch-question-{}", run.ord),
+                    via: Via::Resume {
+                        prompt,
+                        worktree: None,
+                    },
+                })
+            }
+            Start::Queued(Msg::Task) => self.task_pending(run),
+            Start::Queued(Msg::Wake { run: r, generation }) => {
+                self.wake_pending(engine, run, r, generation)
+            }
         }
     }
 
-    fn attempt_pending(&self, at: AttemptId, msg: Option<u64>) -> Result<Pending, DriverError> {
+    fn attempt_pending(
+        &self,
+        engine: &dyn RunEngine,
+        at: AttemptId,
+        msg: Option<u64>,
+    ) -> Result<Pending, DriverError> {
         if let Some(n) = msg {
             return self.pending_of(n);
         }
@@ -905,7 +1114,7 @@ impl OrchWire {
             .run(at.run.ord)
             .map(|r| r.start)
             .ok_or_else(|| DriverError::Corrupt(format!("no run {}", at.run.ord)))?;
-        self.start_pending(at.run, start)
+        self.start_pending(engine, at.run, start)
     }
 
     fn resume_pending(&self, run: RunId) -> Result<Pending, DriverError> {
@@ -914,6 +1123,7 @@ impl OrchWire {
             message_id: format!("orch-resume-{}", run.ord),
             via: Via::Resume {
                 prompt: RESUME_PROMPT.to_owned(),
+                worktree: None,
             },
             chat,
         })
@@ -925,30 +1135,99 @@ impl OrchWire {
         effect_id: &str,
         at: AttemptId,
         p: Pending,
-        replay: bool,
+        _replay: bool,
     ) -> Result<Ran, EngineError> {
         let marker = format!("fx:{effect_id}");
-        if replay && self.driver.meta(&marker).ok().flatten().is_some() {
+        let access_ceiling = self.driver.state().ok().and_then(|state| {
+            state.thread(at.run.thread).ok().map(|thread| thread.access)
+        });
+        let dispatch_kind = match &p.via {
+            Via::Dispatch { .. } => "dispatch",
+            Via::Steer { .. } => "steer",
+            Via::Resume { .. } => "resume",
+        };
+        let observe = |outcome: &str, provider_return_id: Option<&str>, before: u64,
+                       after: u64, effective_access: Option<u8>| -> Result<(), EngineError> {
+            let data = serde_json::json!({
+                "outcome": outcome, "dispatch_kind": dispatch_kind,
+                "chat": p.chat, "run": at.run.ord, "attempt": at.n,
+                "effect_id": effect_id, "message_id": p.message_id,
+                "provider_return_id": provider_return_id,
+                "journal_seq_before": before, "journal_seq_after": after,
+                "journal_change": if after > before { "advanced" } else if after == before { "unchanged" } else { "reset" },
+                "effective_access": effective_access,
+                "access_ceiling": if outcome == "already_done" { None } else { access_ceiling },
+            });
+            self.driver.observe_mechanism(
+                &if outcome == "already_done" {
+                    format!("provider-start:{effect_id}:{outcome}:{after}")
+                } else { format!("provider-start:{effect_id}:{outcome}") }, "provider_start", data,
+            ).map_err(|error| self.to_engine(error))?;
+            if after > before {
+                self.driver.observe_mechanism(
+                    &format!("journal:{}:{after}", p.chat), "journal_observed",
+                    serde_json::json!({
+                        "chat": p.chat, "run": at.run.ord, "attempt": at.n,
+                        "effect_id": effect_id, "message_id": p.message_id,
+                        "journal_seq_before": before, "journal_seq_after": after,
+                    }),
+                ).map_err(|error| self.to_engine(error))?;
+            }
+            Ok(())
+        };
+        let intent = format!("start-intent:{effect_id}");
+        if self.driver.meta(&marker).map_err(|error| self.to_engine(error))?.is_some() {
             tracing::info!(chat = %p.chat, message = %p.message_id,
                 "outbox replay: this attempt already started; journal recovery owns it");
+            let seq = engine.journal_seq(&p.chat);
+            observe("already_done", None, seq, seq, None)?;
+            return Ok(Ran::Nothing);
+        }
+        if let Some(baseline) = self.driver.meta(&intent).map_err(|error| self.to_engine(error))? {
+            let (run, attempt, before) = parse_jseq(&baseline)
+                .ok_or_else(|| EngineError::Other("invalid provider start intent".into()))?;
+            if (run, attempt) != (at.run.ord, at.n) {
+                return Err(EngineError::Other("provider start intent attempt mismatch".into()));
+            }
+            self.driver.put_meta(&format!("jseq:{}", p.chat), &baseline)
+                .map_err(|error| self.to_engine(error))?;
+            let after = engine.journal_seq(&p.chat);
+            let owned = engine.owns_run(&p.chat);
+            if owned || after > before {
+                self.driver.put_meta(&marker, "1").map_err(|error| self.to_engine(error))?;
+                observe("already_done", None, after, after, None)?;
+            } else {
+                observe("uncertain", None, before, after, None)?;
+            }
+            if !owned {
+                self.end_stuck(engine, &p.chat, at).map_err(|error| self.to_engine(error))?;
+            }
             return Ok(Ran::Nothing);
         }
         lock(&self.expect).insert(p.chat.clone(), at);
-        let jseq = format!("{}:{}:{}", at.run.ord, at.n, engine.journal_seq(&p.chat));
-        if let Err(err) = self.driver.put_meta(&format!("jseq:{}", p.chat), &jseq) {
-            tracing::warn!(error = %err, "orchestrator journal mark failed");
+        let before = engine.journal_seq(&p.chat);
+        let jseq = format!("{}:{}:{}", at.run.ord, at.n, before);
+        if let Err(error) = self.driver.put_meta(&format!("jseq:{}", p.chat), &jseq)
+            .and_then(|()| self.driver.put_meta(&intent, &jseq))
+        {
+            self.start_failed(&p.chat, at);
+            return Err(self.to_engine(error));
         }
-        match self.quietly(&p.chat, engine.start(&p)).await {
+        let result = self.quietly(&p.chat, engine.start(&p)).await;
+        let after = engine.journal_seq(&p.chat);
+        match result {
             Ok(id) => {
-                if let Err(err) = self.driver.put_meta(&marker, "1") {
-                    tracing::warn!(error = %err, "orchestrator start marker failed");
-                }
+                let marked = self.driver.put_meta(&marker, "1");
                 self.mark_ran(&p.message_id);
+                observe("engine_start_ok", Some(&id), before, after, engine.effective_access(&p.chat))?;
+                marked.map_err(|error| self.to_engine(error))?;
                 Ok(Ran::Started(id))
             }
             Err(err) => {
+                let captured = observe("failed", None, before, after, None);
                 lock(&self.claimed_msgs).remove(&p.message_id);
                 self.start_failed(&p.chat, at);
+                captured?;
                 Err(err)
             }
         }
@@ -963,13 +1242,38 @@ impl OrchWire {
         }
     }
 
+    fn may_start(&self, at: AttemptId) -> Result<bool, DriverError> {
+        let state = self.driver.state()?;
+        let Ok(th) = state.thread(at.run.thread) else {
+            return Ok(false);
+        };
+        if !th.is_live() || th.attempt_id() != at {
+            return Ok(false);
+        }
+        if th.int_req || th.held == Hold::Stop {
+            let chat = self.chat_of(at.run.thread)?;
+            self.terminal_unstarted(&chat, at, Outcome::Interrupted)?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     fn end_unstarted(&self, chat: &str, at: AttemptId) -> Result<(), DriverError> {
+        self.terminal_unstarted(chat, at, Outcome::Failed)
+    }
+
+    fn terminal_unstarted(
+        &self,
+        chat: &str,
+        at: AttemptId,
+        outcome: Outcome,
+    ) -> Result<(), DriverError> {
         let _g = lock(&self.gate);
         let ev = Event::Run(RunEvent::ProviderTerminal {
             t: at.run.thread,
             run: at.run.ord,
             attempt: at.n,
-            outcome: Outcome::Failed,
+            outcome,
         });
         let key = format!("startfail:{chat}:{}:{}", at.run.ord, at.n);
         self.driver.apply_if(&key, ev, &enabled(ev))?;
@@ -1077,13 +1381,30 @@ impl OrchWire {
     }
 
     pub async fn recover(&self, engine: &dyn RunEngine) -> Result<(), EngineError> {
+        self.retry_native_terminals(engine)
+            .map_err(|e| self.to_engine(e))?;
+        super::native::recover(&self.driver).map_err(|e| self.to_engine(e))?;
         let rows = self.driver.pending().map_err(|e| self.to_engine(e))?;
+        let mut busy = HashSet::new();
         for row in rows {
+            let t = order_key(&row.effect);
+            if t.is_some_and(|t| busy.contains(&t)) {
+                continue;
+            }
             if !lock(&self.claimed).insert(row.effect_id.clone()) {
+                busy.extend(t);
                 continue;
             }
             if let Err(err) = self.execute(engine, &row, true).await {
                 tracing::warn!(effect = %row.effect_id, error = %err, "outbox replay failed");
+                if !matches!(
+                    row.effect,
+                    Effect::StartRun { .. } | Effect::StartAttempt { .. } | Effect::SteerRun { .. }
+                ) {
+                    busy.extend(t);
+                    lock(&self.claimed).remove(&row.effect_id);
+                    continue;
+                }
             }
             self.driver
                 .complete(&row.effect_id)
@@ -1091,6 +1412,7 @@ impl OrchWire {
             lock(&self.claimed).remove(&row.effect_id);
         }
         self.reconcile(engine).map_err(|e| self.to_engine(e))?;
+        self.pump_all().map_err(|e| self.to_engine(e))?;
         self.rearm().map_err(|e| self.to_engine(e))?;
         self.wake.notify_one();
         Ok(())
@@ -1112,6 +1434,16 @@ impl OrchWire {
         Ok(())
     }
 
+    fn pump_all(&self) -> Result<(), DriverError> {
+        let _g = lock(&self.gate);
+        let ids: Vec<ThreadId> = self.driver.state()?.threads.keys().copied().collect();
+        for t in ids {
+            let chat = self.chat_of(t)?;
+            self.pump(t, &chat, &mut Vec::new())?;
+        }
+        Ok(())
+    }
+
     fn rearm(&self) -> Result<(), DriverError> {
         let s = self.driver.state()?;
         for th in s.threads.values() {
@@ -1126,13 +1458,29 @@ impl OrchWire {
 fn order_key(effect: &Effect) -> Option<ThreadId> {
     match effect {
         Effect::CreateChild { child, .. } => Some(*child),
-        Effect::StartRun { run, .. }
-        | Effect::InterruptRun { run }
-        | Effect::ArmTimer { run } => Some(run.thread),
+        Effect::StartRun { run, .. } | Effect::InterruptRun { run } | Effect::ArmTimer { run } => {
+            Some(run.thread)
+        }
         Effect::StartAttempt { attempt, .. }
         | Effect::SteerRun { attempt, .. }
         | Effect::InterruptAttempt { attempt } => Some(attempt.run.thread),
-        Effect::CompleteWait { .. } | Effect::Reconfigure { .. } | Effect::Send(_) => None,
+        Effect::RespondInput { child, .. } => Some(*child),
+        Effect::NativeChanged { parent, .. } | Effect::DeliverNative { parent, .. } => {
+            Some(*parent)
+        }
+        Effect::Reconfigure { t, .. } => Some(*t),
+        Effect::Send(zeron_orch::Message::Offer { parent, .. }) => Some(*parent),
+        Effect::Send(
+            zeron_orch::Message::Notice { child, .. }
+            | zeron_orch::Message::Stop { child, .. }
+            | zeron_orch::Message::QuestionUp { child, .. }
+            | zeron_orch::Message::AnswerDown { child, .. }
+            | zeron_orch::Message::QuestionClosed { child, .. }
+            | zeron_orch::Message::QuestionRelease { child, .. },
+        ) => Some(*child),
+        Effect::QuestionView { .. }
+        | Effect::NotifyQuestion { .. }
+        | Effect::CompleteWait { .. } => None,
     }
 }
 
@@ -1200,3 +1548,7 @@ where
         }
     }
 }
+
+#[cfg(test)]
+#[path = "wire/provider_mechanism_tests.rs"]
+mod provider_mechanism_tests;

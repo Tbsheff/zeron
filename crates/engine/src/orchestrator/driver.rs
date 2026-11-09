@@ -72,22 +72,86 @@ pub fn effect_id(key: &str, idx: usize) -> String {
 pub struct Driver {
     store: Arc<DocsStore>,
     device: String,
+    capture: bool,
     faults: Faults,
     changed: tokio::sync::watch::Sender<u64>,
 }
 
 impl Driver {
     pub fn open(store: Arc<DocsStore>, device: &str, config: Config) -> Result<Self, DriverError> {
-        store.transact(|tx| init(tx, device, config))?;
+        Self::open_with_capture(
+            store,
+            device,
+            config,
+            std::env::var("ORCH_CAPTURE_MECHANISM").is_ok_and(|v| v == "1"),
+        )
+    }
+
+    pub fn open_with_capture(
+        store: Arc<DocsStore>,
+        device: &str,
+        config: Config,
+        capture: bool,
+    ) -> Result<Self, DriverError> {
+        let capture = store.transact(|tx| {
+            let existing = store::load_state(tx)?.is_some();
+            init(tx, device, config)?;
+            super::mechanism::init(tx)?;
+            let capture = capture || store::meta(tx, "mechanism_capture")?.as_deref() == Some("1");
+            if capture {
+                store::put_meta(tx, "mechanism_capture", "1")?;
+                super::mechanism::capture(
+                    tx,
+                    &store::meta(tx, "device")?.ok_or_else(|| DriverError::Corrupt("missing device".into()))?,
+                    if existing { "RecoveryOpen" } else { "Init" },
+                    serde_json::json!({}),
+                )?;
+            }
+            Ok::<bool, DriverError>(capture)
+        })?;
         let device = store
             .transact(|tx| store::meta(tx, "device"))?
             .ok_or_else(|| DriverError::Corrupt("orch_meta has no device".into()))?;
         Ok(Self {
             store,
             device,
+            capture,
             faults: Faults::default(),
             changed: tokio::sync::watch::Sender::new(0),
         })
+    }
+
+    pub fn mechanism_capture_enabled(&self) -> bool { self.capture }
+
+    pub fn mechanism_lines(&self) -> Result<Vec<String>, DriverError> {
+        self.store.transact(super::mechanism::lines)
+    }
+
+    pub fn observe_mechanism(
+        &self,
+        id: &str,
+        kind: &str,
+        data: serde_json::Value,
+    ) -> Result<(), DriverError> {
+        if !self.capture {
+            return Ok(());
+        }
+        self.store.transact(|tx| {
+            super::mechanism::fact(tx, id, kind, &data)?;
+            self.capture_tx(tx, "Observe", serde_json::json!({"fact_id":id,"kind":kind}))
+        })
+    }
+
+    fn capture_tx(
+        &self,
+        tx: &Transaction<'_>,
+        action: &str,
+        args: serde_json::Value,
+    ) -> Result<(), DriverError> {
+        if self.capture {
+            super::mechanism::capture(tx, &self.device, action, args)?;
+        }
+        Ok(())
     }
 
     pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -176,7 +240,14 @@ impl Driver {
 
     pub fn complete(&self, effect_id: &str) -> Result<(), DriverError> {
         self.faults.hit(FaultPoint::Fp2EffectRunNotMarked)?;
-        self.store.transact(|tx| store::mark_done(tx, effect_id))?;
+        self.store.transact(|tx| {
+            store::mark_done(tx, effect_id)?;
+            self.capture_tx(
+                tx,
+                "CompleteEffect",
+                serde_json::json!({"effect_id":effect_id}),
+            )
+        })?;
         self.changed();
         Ok(())
     }
@@ -219,6 +290,7 @@ impl Driver {
         };
         if let Some(prev) = store::receipt(tx, key)? {
             write_trace(tx, Step { dup: true, ..base })?;
+            self.capture_tx(tx, "Apply", serde_json::json!({"key":key,"command_id":cmd,"event":event,"duplicate":true,"accepted":matches!(prev, Applied::Accepted {..})}))?;
             return Ok(ApplyResult {
                 applied: prev,
                 duplicate: true,
@@ -249,6 +321,7 @@ impl Driver {
                 ..base
             },
         )?;
+        self.capture_tx(tx, "Apply", serde_json::json!({"key":key,"command_id":cmd,"event":event,"duplicate":false,"accepted":matches!(applied, Applied::Accepted {..})}))?;
         Ok(ApplyResult {
             applied,
             duplicate: false,
@@ -282,7 +355,17 @@ impl Driver {
 
     pub fn mark_command(&self, cmd: &str) -> Result<(), DriverError> {
         self.faults.hit(FaultPoint::Fp4ReceiptNotMarked)?;
-        self.store.mark_processed(cmd)?;
+        self.store.transact(|tx| {
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            tx.execute(
+                "INSERT OR IGNORE INTO processed_commands(command_id,processed_at) VALUES(?1,?2)",
+                rusqlite::params![cmd, ms],
+            )?;
+            self.capture_tx(tx, "MarkCommand", serde_json::json!({"command_id":cmd}))
+        })?;
         self.changed();
         Ok(())
     }
@@ -300,10 +383,7 @@ impl Driver {
         for row in &rows {
             sink.execute(&row.effect_id, &row.effect)
                 .map_err(|e| DriverError::Effect(row.effect_id.clone(), e.0))?;
-            self.faults.hit(FaultPoint::Fp2EffectRunNotMarked)?;
-            self.store
-                .transact(|tx| store::mark_done(tx, &row.effect_id))?;
-            self.changed();
+            self.complete(&row.effect_id)?;
         }
         Ok(rows.len())
     }

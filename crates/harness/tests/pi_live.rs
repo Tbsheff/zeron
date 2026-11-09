@@ -70,6 +70,7 @@ async fn real_pi_mock_lifecycle() {
         let controls = RunControls {
             realtime: None,
             execution_lease: None,
+            strict_resume: false,
             steering,
             interrupt: interrupt.clone(),
             request_input: Box::new(|questions| {
@@ -183,6 +184,7 @@ async fn real_pi_mock_lifecycle() {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         steering,
         interrupt: CancellationToken::new(),
         request_input: Box::new(|_| oneshot::channel().1),
@@ -260,6 +262,7 @@ async fn real_pi_steering_bursts_share_the_next_model_call() {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         steering,
         interrupt: CancellationToken::new(),
         request_input: Box::new(|_| oneshot::channel().1),

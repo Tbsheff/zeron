@@ -213,6 +213,12 @@ fn message(fx: &Fixture, m: Message) -> Value {
         Message::Stop { child, stop } => {
             json!({"k": "stop", "t": fx.name_of(Some(child)), "r": stop, "g": 0})
         }
+        Message::QuestionUp { .. }
+        | Message::AnswerDown { .. }
+        | Message::QuestionClosed { .. }
+        | Message::QuestionRelease { .. } => {
+            panic!("question effects require a question model fixture")
+        }
     }
 }
 
@@ -272,6 +278,7 @@ fn kind(k: RunKind) -> &'static str {
         RunKind::Task => "task",
         RunKind::Wake => "wake",
         RunKind::Resume => "resume",
+        RunKind::Questions => "questions",
     }
 }
 

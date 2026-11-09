@@ -1,0 +1,17 @@
+{
+  "name": "tla",
+  "version": "1.0.0",
+  "description": "TLA+ model of T3 orchestration v2 for the Zeron port, checked with tla-ts",
+  "scripts": {
+    "check": "node run.mjs MC_T3 MC_Zeron",
+    "check:all": "node run.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "tla-ts": "^0.0.8"
+  },
+  "private": true
+}

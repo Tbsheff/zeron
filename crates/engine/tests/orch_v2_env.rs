@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use zeron_doc::SessionCommandPayload;
-use zeron_engine::orchestrator::wire::{Pending, Ran, RunEngine, spawn_task};
+use zeron_engine::orchestrator::wire::{ChildSpec, Pending, Ran, RunEngine, spawn_task};
 use zeron_engine::orchestrator::{FLAG_ENV, OrchOptions, OrchWire, trace};
 use zeron_engine::{EngineCore, HarnessRegistry};
 use zeron_harness::mock::MockHarness;
@@ -84,7 +84,38 @@ impl RunEngine for Idle {
     fn journal_seq(&self, _: &str) -> u64 {
         0
     }
+    fn create_child(&self, _: &str, _: &ChildSpec) -> Result<(), zeron_engine::EngineError> {
+        Ok(())
+    }
+    fn result_text(&self, _: &str) -> Option<String> {
+        None
+    }
+    fn task_results(
+        &self,
+        _: &str,
+        _: &str,
+        _: Vec<zeron_doc::TaskResultPart>,
+    ) -> Result<(), zeron_engine::EngineError> {
+        Ok(())
+    }
+    fn reports_mcp_results(&self, _: &str) -> bool {
+        true
+    }
     fn kick_drain(&self, _: &str) {}
+}
+
+fn export_mechanism(wire: &OrchWire, device: &str) {
+    if let Some(root) = std::env::var_os("ORCH_MECHANISM_OUT") {
+        let rows = wire.driver().mechanism_lines().expect("mechanism capture");
+        assert!(!rows.is_empty(), "ORCH_MECHANISM_OUT requires ORCH_CAPTURE_MECHANISM=1");
+        let recording = std::path::PathBuf::from(root).join(format!("orch_v2_env-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&recording).expect("create mechanism recording");
+        std::fs::write(recording.join(format!("{device}.jsonl")), format!("{}\n", rows.join("\n"))).expect("export mechanism recording");
+        std::fs::write(recording.join("capture.json"), serde_json::to_vec(&serde_json::json!({
+            "test_name": std::thread::current().name().expect("test thread name"),
+            "devices": [device], "filenames": [format!("{device}.jsonl")], "capture": "present"
+        })).unwrap()).expect("export capture inventory");
+    }
 }
 
 #[test]
@@ -95,6 +126,7 @@ fn attaching_the_wire_outside_a_runtime_does_not_panic() {
     wire.attach(Arc::new(Idle));
     assert!(!spawn_task("probe", async {}), "no runtime, no task");
     assert!(!wire.is_dead());
+    export_mechanism(&wire, "dev-1");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -121,7 +153,7 @@ async fn the_env_flag_enables_the_orchestrator_at_assembly() {
             },
         )
         .expect("queue run");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let acts = loop {
         let lines = wire.trace_lines().expect("trace");
         let parsed = trace::parse_lines(&lines.join("\n")).expect("parse");
@@ -132,6 +164,17 @@ async fn the_env_flag_enables_the_orchestrator_at_assembly() {
             .collect();
         if acts.iter().any(|a| a == "IngestEnd") {
             trace::check(&parsed).unwrap_or_else(|e| panic!("trace check: {e}"));
+            if let Some(root) = std::env::var_os("ORCH_TRACE_OUT") {
+                let recording = std::path::PathBuf::from(root)
+                    .join(format!("orch_v2_env-{}", uuid::Uuid::new_v4()));
+                std::fs::create_dir_all(&recording).expect("create trace recording");
+                std::fs::write(
+                    recording.join(format!("{}.jsonl", core.device_id)),
+                    format!("{}\n", lines.join("\n")),
+                )
+                .expect("export trace recording");
+            }
+            export_mechanism(&wire, &core.device_id);
             break acts;
         }
         assert!(

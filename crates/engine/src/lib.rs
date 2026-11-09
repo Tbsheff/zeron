@@ -83,9 +83,7 @@ pub mod workspace_search;
 mod worktree_settings;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
-pub use auth::{
-    Auth, AuthConfig, AuthState, AuthUser, OrgMembership, ScreenHint, SignInOptions,
-};
+pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership, ScreenHint, SignInOptions};
 pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
 pub use diff_sync::{
     CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TreeSnapshot, TurnSnapshot,
@@ -343,7 +341,12 @@ impl EngineCore {
                     .into_iter()
                     .filter(|c| c.device_id == device_id)
                     .filter_map(|c| c.cwd)
-                    .chain(spaces.into_iter().filter(|s| s.device_id == device_id).map(|s| s.path))
+                    .chain(
+                        spaces
+                            .into_iter()
+                            .filter(|s| s.device_id == device_id)
+                            .map(|s| s.path),
+                    )
                     .filter(|f| !f.is_empty())
                     .collect();
                 folders.sort();
@@ -355,9 +358,30 @@ impl EngineCore {
         let viewport_focus = desktop_notify::ViewportFocus::default();
         {
             let (data_dir, focus) = (data_dir.to_path_buf(), viewport_focus.clone());
+            sessions.set_question_notifier(Arc::new(move |chat| {
+                desktop_notify::post_for(
+                    &data_dir,
+                    &focus,
+                    "orchestrator-question",
+                    "Agent needs an answer",
+                    "Open the child chat to answer.",
+                    Some(chat),
+                );
+            }));
+        }
+        {
+            let (data_dir, focus) = (data_dir.to_path_buf(), viewport_focus.clone());
             plugins.set_notifier(move |source, title, body, session| {
-                let title: String = title.lines().next().unwrap_or_default().trim().chars().take(120).collect();
-                desktop_notify::post_for(&data_dir, &focus, source, &title, body, session).to_owned()
+                let title: String = title
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .chars()
+                    .take(120)
+                    .collect();
+                desktop_notify::post_for(&data_dir, &focus, source, &title, body, session)
+                    .to_owned()
             });
         }
         if let Some(edge) = &edge {
@@ -1205,11 +1229,16 @@ impl Engine {
             // peer's edge stamps it and the peer knows who's asking
             // (`Caller::Peer{device}`); without a key, dials go unstamped.
             let (proof_dir, proof_device) = (config.data_dir.clone(), core.device_id.clone());
-            link_config.caller_proof = Some(Arc::new(move |target: &str, conn_id: &str, ts: i64| {
-                let (key, signature) =
-                    plugins::signing::device_link_proof(&proof_dir, target, conn_id, ts)?;
-                Some(zeron_rpc::CallerProof { device: proof_device.clone(), key, signature })
-            }));
+            link_config.caller_proof =
+                Some(Arc::new(move |target: &str, conn_id: &str, ts: i64| {
+                    let (key, signature) =
+                        plugins::signing::device_link_proof(&proof_dir, target, conn_id, ts)?;
+                    Some(zeron_rpc::CallerProof {
+                        device: proof_device.clone(),
+                        key,
+                        signature,
+                    })
+                }));
             let links = zeron_rpc::LinkCache::new(link_config);
             let links_for_presence = links.clone();
             core.workspace

@@ -46,6 +46,7 @@ pub enum Msg {
 pub enum Start {
     Queued(Msg),
     Resume,
+    Questions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -55,6 +56,7 @@ pub enum RunKind {
     Task,
     Wake,
     Resume,
+    Questions,
 }
 
 impl Start {
@@ -65,6 +67,7 @@ impl Start {
             Start::Queued(Msg::Task) => RunKind::Task,
             Start::Queued(Msg::Wake { .. }) => RunKind::Wake,
             Start::Resume => RunKind::Resume,
+            Start::Questions => RunKind::Questions,
         }
     }
 }
@@ -372,6 +375,7 @@ impl Thread {
     }
 
     pub(crate) fn new_attempt(&mut self, n: u32, reason: Reason) {
+        self.wait_on = None;
         self.attempt.n = n;
         self.attempt.reason = reason;
         self.attempt.emitted = false;
@@ -419,6 +423,31 @@ pub enum Message {
         child: ThreadId,
         stop: u32,
     },
+    QuestionUp {
+        child: ThreadId,
+        qid: u64,
+        epoch: u32,
+        to: Option<ThreadId>,
+    },
+    AnswerDown {
+        child: ThreadId,
+        qid: u64,
+        epoch: u32,
+        via: ThreadId,
+        answer: u64,
+    },
+    QuestionClosed {
+        child: ThreadId,
+        qid: u64,
+        epoch: u32,
+        to: ThreadId,
+    },
+    QuestionRelease {
+        child: ThreadId,
+        qid: u64,
+        epoch: u32,
+        via: ThreadId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -428,6 +457,12 @@ pub struct OrchState {
     pub outbox: VecSet<Message>,
     pub stop_receipts: VecSet<(ThreadId, u32)>,
     pub stops: u32,
+    #[serde(default)]
+    pub questions: VecMap<(ThreadId, u64), crate::questions::Question>,
+    #[serde(default)]
+    pub question_receipts: VecSet<Message>,
+    #[serde(default)]
+    pub natives: VecMap<(ThreadId, u64), crate::native::NativeTask>,
 }
 
 impl OrchState {
@@ -438,6 +473,9 @@ impl OrchState {
             outbox: VecSet::new(),
             stop_receipts: VecSet::new(),
             stops: 0,
+            questions: VecMap::new(),
+            question_receipts: VecSet::new(),
+            natives: VecMap::new(),
         }
     }
 

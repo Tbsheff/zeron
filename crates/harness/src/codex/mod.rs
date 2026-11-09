@@ -1373,6 +1373,7 @@ async fn run_session(session: Session) {
     let RunControls {
         realtime,
         execution_lease: _execution_lease,
+        strict_resume,
         request_input,
         mut steering,
         interrupt,
@@ -1612,6 +1613,11 @@ async fn run_session(session: Session) {
                 // thread — visibly: the reply will not know the earlier
                 // conversation. The log keeps Codex's own words.
                 Err((Some(reason), e)) => {
+                    if strict_resume {
+                        return Err(HarnessError::Protocol(format!(
+                            "Session not found: strict Codex resume rejected: {e}"
+                        )));
+                    }
                     if command_request(&request.prompt, resume)?.is_some() {
                         return Err(e);
                     }
@@ -1648,7 +1654,13 @@ async fn run_session(session: Session) {
             effort: thread["reasoningEffort"].as_str().map(str::to_owned),
             plan: thread.pointer("/collaborationMode/mode") == Some(&json!("plan")),
         };
-        Ok::<_, HarnessError>((thread_id, children, voice_context, restore_notice, thread_mode))
+        Ok::<_, HarnessError>((
+            thread_id,
+            children,
+            voice_context,
+            restore_notice,
+            thread_mode,
+        ))
     };
     let (thread_id, mut children, voice_context, restore_notice, thread_mode) = tokio::select! {
         res = setup => match res {
@@ -3164,7 +3176,11 @@ mod tests {
         };
         assert_eq!(
             wire(AccessMode::FullAccess, false),
-            ("never", "danger-full-access", json!({"type": "dangerFullAccess"}))
+            (
+                "never",
+                "danger-full-access",
+                json!({"type": "dangerFullAccess"})
+            )
         );
         assert_eq!(
             wire(AccessMode::AutoAcceptEdits, false),
@@ -3199,9 +3215,8 @@ mod tests {
             "item/commandExecution/requestApproval",
             "item/permissions/requestApproval",
         ];
-        let allowed = |access| {
-            methods.map(|method| allowed_without_asking(access, approval_action(method)))
-        };
+        let allowed =
+            |access| methods.map(|method| allowed_without_asking(access, approval_action(method)));
         assert_eq!(allowed(AccessMode::FullAccess), [true, true, true]);
         assert_eq!(allowed(AccessMode::AutoAcceptEdits), [true, false, false]);
         assert_eq!(allowed(AccessMode::Supervised), [false, false, false]);
@@ -3448,7 +3463,10 @@ mod mcp_injection_tests {
             command: "zeron".into(),
             args: vec!["mcp".into()],
             env: [
-                (zeron_proto::McpServer::CHAT_ID_ENV.to_owned(), "c1".to_owned()),
+                (
+                    zeron_proto::McpServer::CHAT_ID_ENV.to_owned(),
+                    "c1".to_owned(),
+                ),
                 (
                     zeron_proto::McpServer::PLUGIN_INSTRUCTIONS_ENV.to_owned(),
                     plugins.display().to_string(),
@@ -3466,7 +3484,10 @@ mod mcp_injection_tests {
             assert_eq!(entry["kind"], "application", "{key}");
             assert!(entry["value"].as_str().unwrap().len() < 4_000, "{key}");
         }
-        let all: String = entries.values().map(|e| e["value"].as_str().unwrap()).collect();
+        let all: String = entries
+            .values()
+            .map(|e| e["value"].as_str().unwrap())
+            .collect();
         assert!(all.contains("Ordinary coding tasks need no Zeron tools."));
         assert!(all.contains("`show_visual`") && all.contains("## Plugins"));
         assert!(!all.contains("wait_on_background"));

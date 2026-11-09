@@ -103,7 +103,12 @@ pub struct CommandTail {
 /// The cut starts on a line where it can: a single line longer than the
 /// byte budget keeps its end. `None` when nothing but whitespace is left.
 pub fn command_output_tail(command: &str, text: &str) -> Option<CommandTail> {
-    command_output_end(command, text, COMMAND_TAIL_MAX_LINES, COMMAND_TAIL_MAX_BYTES)
+    command_output_end(
+        command,
+        text,
+        COMMAND_TAIL_MAX_LINES,
+        COMMAND_TAIL_MAX_BYTES,
+    )
 }
 
 /// The end of `command`'s output, at most `max_lines` lines and `max_bytes`
@@ -222,10 +227,47 @@ pub enum SubagentStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextCoverage {
+    pub transfer_id: String,
+    pub source_chat_id: String,
+    #[serde(default)]
+    pub base_message_id: Option<String>,
+    pub point_message_id: String,
+    #[serde(default)]
+    pub selected_message_ids: Vec<String>,
+    pub omitted_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskResultPart {
+    pub task_id: String,
+    pub chat_id: String,
+    pub status: String,
+    pub text: String,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
 /// One rendered part of an assistant message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum MessagePart {
+    TaskResults {
+        id: String,
+        results: Vec<TaskResultPart>,
+    },
+    Handoff {
+        id: String,
+        strategy: String,
+        coverage: ContextCoverage,
+    },
+    MergeBack {
+        id: String,
+        coverage: ContextCoverage,
+    },
     Text {
         id: String,
         text: String,
@@ -369,9 +411,51 @@ pub enum MessagePart {
 }
 
 impl MessagePart {
+    pub fn orchestration_text(&self) -> Option<String> {
+        match self {
+            Self::TaskResults { results, .. } => Some(
+                results
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "Task {}: {}\n{}{}",
+                            r.task_id,
+                            r.status,
+                            r.text,
+                            if r.truncated {
+                                "\nRead the task for the full result."
+                            } else {
+                                ""
+                            }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            ),
+            Self::Handoff {
+                strategy, coverage, ..
+            } => Some(format!(
+                "Transferred context from {} ({strategy}): {} messages; {} omitted.",
+                coverage.source_chat_id,
+                coverage.selected_message_ids.len(),
+                coverage.omitted_count
+            )),
+            Self::MergeBack { coverage, .. } => Some(format!(
+                "Merged context from {}: {} messages; {} omitted.",
+                coverage.source_chat_id,
+                coverage.selected_message_ids.len(),
+                coverage.omitted_count
+            )),
+            _ => None,
+        }
+    }
+
     pub fn id(&self) -> &str {
         match self {
-            MessagePart::Text { id, .. }
+            MessagePart::TaskResults { id, .. }
+            | MessagePart::Handoff { id, .. }
+            | MessagePart::MergeBack { id, .. }
+            | MessagePart::Text { id, .. }
             | MessagePart::Image { id, .. }
             | MessagePart::Visual { id, .. }
             | MessagePart::Reasoning { id, .. }
@@ -385,6 +469,16 @@ impl MessagePart {
 
     pub fn byte_len(&self) -> usize {
         match self {
+            MessagePart::TaskResults { results, .. } => results
+                .iter()
+                .map(|r| r.task_id.len() + r.chat_id.len() + r.status.len() + r.text.len())
+                .sum(),
+            MessagePart::Handoff {
+                strategy, coverage, ..
+            } => strategy.len() + serde_json::to_vec(coverage).map_or(0, |v| v.len()),
+            MessagePart::MergeBack { coverage, .. } => {
+                serde_json::to_vec(coverage).map_or(0, |v| v.len())
+            }
             MessagePart::Text { text, .. } | MessagePart::Reasoning { text, .. } => text.len(),
             MessagePart::Tool {
                 call,

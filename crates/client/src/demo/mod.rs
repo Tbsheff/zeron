@@ -307,6 +307,9 @@ impl DemoHost {
         };
         let commands = core.doc().read_commands().unwrap_or_default();
         for command in commands {
+            if matches!(&command.payload, SessionCommandPayload::Orch { .. }) {
+                continue;
+            }
             if command.status != SessionCommandStatus::Pending
                 || !lock(&self.processed).insert(command.id.clone())
             {
@@ -316,6 +319,7 @@ impl DemoHost {
                 doc.set_command_status(&command.id, SessionCommandStatus::Applied, None)
             });
             match command.payload {
+                SessionCommandPayload::Orch { .. } => {}
                 SessionCommandPayload::Run {
                     request,
                     message_id,

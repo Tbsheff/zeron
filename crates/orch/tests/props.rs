@@ -135,6 +135,15 @@ fn outbox_events(s: &OrchState, out: &mut Vec<Event>) {
                     how,
                 },
                 Message::Stop { child, stop } => OutboxEvent::DoStop { child, stop, how },
+                Message::QuestionUp { .. }
+                | Message::AnswerDown { .. }
+                | Message::QuestionClosed { .. }
+                | Message::QuestionRelease { .. } => {
+                    out.push(Event::Question(
+                        zeron_orch::questions::QuestionEvent::Deliver { message: *m, how },
+                    ));
+                    continue;
+                }
             };
             out.push(Event::Outbox(e));
         }

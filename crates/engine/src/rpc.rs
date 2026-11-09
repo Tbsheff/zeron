@@ -60,6 +60,8 @@
 //! whose checkout always lives on the routed target device.
 
 mod agent_gate;
+mod orch_tasks;
+mod orch_transfer;
 mod voice_chat;
 mod voice_remote;
 use async_trait::async_trait;
@@ -1623,7 +1625,7 @@ impl EngineRpc {
                         {
                             self.cancel_remote_login(target, &login_id).await;
                             return RpcReply::value(&AgentLoginPoll {
-            code: None,
+                                code: None,
                                 status: AgentLoginStatus::Error,
                                 message: Some(error.to_string()),
                                 url: None,
@@ -1674,7 +1676,10 @@ impl EngineRpc {
     ) -> Result<RpcReply, RpcError> {
         const RETRY: std::time::Duration = std::time::Duration::from_millis(500);
         const ASK_AGAIN: std::time::Duration = std::time::Duration::from_secs(30);
-        let first = match self.forward(&target, methods::UPDATE_STATUS, params.clone()).await? {
+        let first = match self
+            .forward(&target, methods::UPDATE_STATUS, params.clone())
+            .await?
+        {
             RpcReply::Stream(stream) => stream,
             value @ RpcReply::Value(_) => return Ok(value),
         };
@@ -1702,8 +1707,9 @@ impl EngineRpc {
                     } else {
                         tokio::time::sleep(RETRY).await;
                     }
-                    if let Ok(RpcReply::Stream(stream)) =
-                        rpc.forward(&target, methods::UPDATE_STATUS, params.clone()).await
+                    if let Ok(RpcReply::Stream(stream)) = rpc
+                        .forward(&target, methods::UPDATE_STATUS, params.clone())
+                        .await
                     {
                         current = Some(stream);
                     }
@@ -2105,8 +2111,12 @@ impl EngineRpc {
                 self.voice.retire_chat(&chat_id);
                 self.workspace
                     .set_chat_config(&chat_id, &config)
-                    .map_err(failed)
-                    .map(drop)
+                    .map_err(failed)?;
+                if let Some(wire) = self.sessions.orchestrator() {
+                    wire.narrow_access_now(&chat_id, config.access)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                }
+                Ok(())
             }
             MutateParams::DeleteChat { chat_id } => {
                 let on_cloud = self
@@ -2734,7 +2744,11 @@ impl RpcService for AuthRpc {
                             "error": error.code(),
                             "message": error.to_string(),
                         });
-                        if let crate::auth::DeleteAccountError::Refused { organization: Some(org), .. } = &error {
+                        if let crate::auth::DeleteAccountError::Refused {
+                            organization: Some(org),
+                            ..
+                        } = &error
+                        {
                             reply["organization"] = serde_json::json!(org);
                         }
                         RpcReply::value(&reply)
@@ -2831,6 +2845,9 @@ impl RpcService for EngineRpc {
         // An agent's chats: capped at its own access, runs as the chat is
         // set, attributed by Zeron (rpc/agent_gate.rs). Before forwarding.
         let params = self.agent_gate(method, params)?;
+        if let Some(reply) = self.orch_message(method, &params).await? {
+            return Ok(reply);
+        }
         // Device-addressed routing: forward calls that target another device over its
         // relay. The target compares the id to its own, so forwards cannot loop.
         if forwardable(method)
@@ -2840,9 +2857,11 @@ impl RpcService for EngineRpc {
             let target = target.to_string();
             // A file on this device can't be read there: another device
             // installs from a link.
-            if method == methods::INSTALL_PLUGIN && params.get("path").is_some_and(|p| !p.is_null()) {
+            if method == methods::INSTALL_PLUGIN && params.get("path").is_some_and(|p| !p.is_null())
+            {
                 return Err(RpcError::BadParams(
-                    "Another device installs a plugin from a link (url), not a file on this one".into(),
+                    "Another device installs a plugin from a link (url), not a file on this one"
+                        .into(),
                 ));
             }
             // Allowing a plugin is that device's person's, in its own window
@@ -3100,12 +3119,32 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&commands)
             }
             methods::QUEUE_COMMAND => {
+                let epoch = params
+                    .get("questionEpoch")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok());
                 let p: QueueCommandParams = parse_params(params)?;
+                if let zeron_rpc::Caller::Agent { chat: Some(agent) } = zeron_rpc::caller()
+                    && let Some(wire) = self.sessions.orchestrator()
+                    && let SessionCommandPayload::RespondInput {
+                        request_id,
+                        answers,
+                    } = &p.command
+                    && let Some(command_id) = wire
+                        .answer_input_command(&agent, &p.chat_id, request_id, epoch, answers)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                {
+                    return RpcReply::value(&serde_json::json!({"commandId":command_id}));
+                }
                 let command_id = self
                     .doc_host
                     .queue_command_with_transfers(&p.chat_id, p.command, p.transfers)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
+            }
+            orch_transfer::METHOD => self.orch_transfer(params),
+            methods::ORCH_DELEGATE | methods::ORCH_TASK_STATUS | methods::ORCH_TASK_CANCEL => {
+                self.orch_call(method, params).await
             }
             methods::TAKE_PROJECT_ACTION_SETUP => {
                 let p: TakeProjectActionSetupParams = parse_params(params)?;
@@ -3274,6 +3313,24 @@ impl RpcService for EngineRpc {
                         })
                         .map_err(|e| RpcError::Failed(e.to_string()))?;
                 }
+                if let Some(wire) = self.sessions.orchestrator() {
+                    let before = crate::orchestrator::transfer::begin_operation(wire.driver(), &self.doc_host, &target, &chat.id).map_err(RpcError::Failed)?;
+                    let args = if before.is_some() { serde_json::json!({"id":format!("fork:{}",chat.id),
+                        "source_chat":source.id,"target_chat":chat.id,"base":serde_json::Value::Null,"point":entries[boundary].id,
+                        "source":crate::orchestrator::transfer::source_fact(&entries[..=boundary]),"target_local":true}) } else {serde_json::Value::Null};
+                    crate::orchestrator::transfer::pin(
+                        target.doc(),
+                        &format!("fork:{}", chat.id),
+                        &source.id,
+                        &chat.id,
+                        None,
+                        &entries[boundary].id,
+                        &entries[..=boundary],
+                    )
+                    .map_err(RpcError::Failed)?;
+                    self.doc_host.persist_fork(&target).map_err(failed)?;
+                    crate::orchestrator::transfer::end_operation(wire.driver(), &self.doc_host, &chat.id, before, "ForkPin", args, true).map_err(RpcError::Failed)?;
+                }
                 self.doc_host.persist_fork(&target).map_err(failed)?;
                 self.workspace.import_chat_row(&chat).map_err(failed)?;
                 RpcReply::value(&chat)
@@ -3289,9 +3346,19 @@ impl RpcService for EngineRpc {
                     session: Option<String>,
                 }
                 let p: Params = parse_params(params)?;
-                let title: String = p.title.lines().next().unwrap_or_default().trim().chars().take(120).collect();
+                let title: String = p
+                    .title
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .chars()
+                    .take(120)
+                    .collect();
                 if title.is_empty() || p.source.is_empty() {
-                    return Err(RpcError::BadParams("A notification needs a title and who asked".into()));
+                    return Err(RpcError::BadParams(
+                        "A notification needs a title and who asked".into(),
+                    ));
                 }
                 let outcome = crate::desktop_notify::post_for(
                     self.repos.data_dir(),
@@ -3477,10 +3544,11 @@ impl RpcService for EngineRpc {
                 if p.task_ids.is_empty() || p.task_ids.len() > 20 {
                     return Err(RpcError::BadParams("name 1 to 20 task ids".into()));
                 }
-                match self
-                    .sessions
-                    .await_background(&p.chat_id, &p.task_ids, p.waiting.unwrap_or(true))
-                {
+                match self.sessions.await_background(
+                    &p.chat_id,
+                    &p.task_ids,
+                    p.waiting.unwrap_or(true),
+                ) {
                     Ok(outcome) => RpcReply::value(&serde_json::json!({
                         "matched": outcome.matched,
                         "unmatched": outcome.unmatched,
@@ -4006,7 +4074,9 @@ impl RpcService for EngineRpc {
                     ));
                 }
                 if !crate::source_control::valid_comment_body(&p.body) {
-                    return Err(RpcError::BadParams("Comment must contain 1–60000 bytes".into()));
+                    return Err(RpcError::BadParams(
+                        "Comment must contain 1–60000 bytes".into(),
+                    ));
                 }
                 let comment = self
                     .github
@@ -4031,7 +4101,9 @@ impl RpcService for EngineRpc {
                 }
                 if method == methods::REPLY_CHANGE_REQUEST_THREAD {
                     if !crate::source_control::valid_comment_body(&p.body) {
-                        return Err(RpcError::BadParams("Comment must contain 1–60000 bytes".into()));
+                        return Err(RpcError::BadParams(
+                            "Comment must contain 1–60000 bytes".into(),
+                        ));
                     }
                     let comment = self
                         .github
@@ -4040,7 +4112,9 @@ impl RpcService for EngineRpc {
                         .map_err(change_request_rpc_error)?;
                     return RpcReply::value(&comment);
                 }
-                let resolved = p.resolved.ok_or_else(|| RpcError::BadParams("resolved: true or false".into()))?;
+                let resolved = p
+                    .resolved
+                    .ok_or_else(|| RpcError::BadParams("resolved: true or false".into()))?;
                 let now = self
                     .github
                     .set_thread_resolved(&p.url, &p.thread, resolved)
@@ -5237,12 +5311,12 @@ impl RpcService for EngineRpc {
                     .map_err(|e| match e {
                         E::NotACommand | E::BadOffset => RpcError::BadParams(e.to_string()),
                         // Stable codes: a client words these for its reader.
-                        E::NotAvailable => RpcError::Capability(
-                            capability_errors::TOOL_OUTPUT_UNAVAILABLE.into(),
-                        ),
-                        E::NotFinished => RpcError::Capability(
-                            capability_errors::TOOL_OUTPUT_NOT_FINISHED.into(),
-                        ),
+                        E::NotAvailable => {
+                            RpcError::Capability(capability_errors::TOOL_OUTPUT_UNAVAILABLE.into())
+                        }
+                        E::NotFinished => {
+                            RpcError::Capability(capability_errors::TOOL_OUTPUT_NOT_FINISHED.into())
+                        }
                         E::Journal(err) => RpcError::Failed(err.to_string()),
                     })?;
                 RpcReply::value(&chunk)
@@ -5445,7 +5519,12 @@ mod tests {
         let rpc = core.rpc_service();
         use zeron_proto::ChildKind;
         for (chat, parent, kind, expected) in [
-            ("sub", Some("main"), Some("subagent"), Some(ChildKind::Subagent)),
+            (
+                "sub",
+                Some("main"),
+                Some("subagent"),
+                Some(ChildKind::Subagent),
+            ),
             ("side", Some("main"), Some("side"), Some(ChildKind::Side)),
             // A person's side chat names none; a newer peer's kind reads as none.
             ("plain-side", Some("main"), None, None),

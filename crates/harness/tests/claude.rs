@@ -15,8 +15,8 @@ use zeron_harness::{
     CancellationToken, ClaudeHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use zeron_proto::{
-    AgentEvent, DoneStatus, FailureClass, HarnessId, RunRequest, SandboxLevel, ToolCall, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, DoneStatus, FailureClass, HarnessId, RunRequest, SandboxLevel, ToolCall,
+    UserInputAnswer, UserInputQuestion,
 };
 
 fn fixture_path() -> PathBuf {
@@ -66,6 +66,7 @@ fn controls(
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -333,7 +334,9 @@ async fn a_background_wake_is_signalled_and_what_the_agent_waits_on_follows_the_
     let woke = {
         let turn = turn.clone();
         tokio::spawn(async move {
-            tokio::time::timeout(Duration::from_secs(10), turn.woke()).await.is_ok()
+            tokio::time::timeout(Duration::from_secs(10), turn.woke())
+                .await
+                .is_ok()
         })
     };
     // Snapshot every list the agent waits on, as it changes.
@@ -343,7 +346,11 @@ async fn a_background_wake_is_signalled_and_what_the_agent_waits_on_follows_the_
         let turn = turn.clone();
         tokio::spawn(async move {
             while waiting.changed().await.is_ok() {
-                let ids: Vec<String> = waiting.borrow_and_update().iter().map(|w| w.id.clone()).collect();
+                let ids: Vec<String> = waiting
+                    .borrow_and_update()
+                    .iter()
+                    .map(|w| w.id.clone())
+                    .collect();
                 // The agent marks the shell it waits on as soon as it's listed.
                 if ids == ["ag1"] {
                     let _ = turn.mark_awaited(&["bn1".into()], true);
@@ -359,11 +366,17 @@ async fn a_background_wake_is_signalled_and_what_the_agent_waits_on_follows_the_
     // The background agent counts at once; the shell once marked; both go
     // when the roster drains.
     assert!(seen.contains(&vec!["ag1".to_string()]), "{seen:?}");
-    assert!(seen.contains(&vec!["ag1".to_string(), "bn1".to_string()]), "{seen:?}");
+    assert!(
+        seen.contains(&vec!["ag1".to_string(), "bn1".to_string()]),
+        "{seen:?}"
+    );
     assert_eq!(seen.last(), Some(&Vec::new()), "{seen:?}");
     // The first init is the session's start, not a wake: one wake only.
     assert_eq!(
-        events.iter().filter(|e| matches!(e, AgentEvent::Done { .. })).count(),
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Done { .. }))
+            .count(),
         2
     );
 }
@@ -383,6 +396,7 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         request_input: Box::new(move |questions| {
             seen.lock().unwrap().extend(questions.iter().cloned());
             let (tx, rx) = oneshot::channel();
@@ -439,6 +453,7 @@ async fn questions_closed_unanswered_deny_the_tool() {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         request_input: Box::new(|_| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Vec::new());
@@ -2626,4 +2641,27 @@ async fn live_unrestorable_session_relaunches_fresh() {
             if session_id != "11111111-2222-3333-4444-555555555555"
     )));
     assert_eq!(done(&events).0, DoneStatus::Errored);
+}
+
+#[tokio::test]
+async fn strict_resume_never_relaunches_a_fresh_session() {
+    let unknown = tempfile::tempdir().unwrap();
+    for session in ["stale-1", "stderr-only-1"] {
+        let (mut controls, _steer, _token) = controls("A");
+        controls.strict_resume = true;
+        let events = run_to_end(
+            &harness(),
+            resume_request(session, &unknown.path().join("missing")),
+            controls,
+        )
+        .await;
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                AgentEvent::SessionStarted { .. } | AgentEvent::TextDelta { .. }
+            )),
+            "{events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Done { status:DoneStatus::Errored, error:Some(error), .. } if error.contains("Session not found"))), "{events:?}");
+    }
 }

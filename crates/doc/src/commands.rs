@@ -21,6 +21,7 @@ pub enum SessionCommandKind {
     Steer,
     Interrupt,
     RespondInput,
+    Orch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +49,9 @@ pub enum SessionCommandPayload {
         prompt: String,
         message_id: Option<String>,
     },
+    Orch {
+        message: OrchMessage,
+    },
     Interrupt {},
     #[serde(rename_all = "camelCase")]
     RespondInput {
@@ -59,6 +63,7 @@ pub enum SessionCommandPayload {
 impl SessionCommandPayload {
     pub fn kind(&self) -> SessionCommandKind {
         match self {
+            SessionCommandPayload::Orch { .. } => SessionCommandKind::Orch,
             SessionCommandPayload::Run { .. } => SessionCommandKind::Run,
             SessionCommandPayload::Steer { .. } => SessionCommandKind::Steer,
             SessionCommandPayload::Interrupt {} => SessionCommandKind::Interrupt,
@@ -366,5 +371,123 @@ mod tests {
             env: Default::default(),
             extra_mcp: Vec::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchMessage {
+    pub id: String,
+    pub sender_chat: String,
+    pub target_chat: String,
+    pub sender_device: String,
+    pub body: OrchBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum OrchBody {
+    CreateChild {
+        depth: u8,
+        access: u8,
+        cohort: u32,
+        spec: serde_json::Value,
+    },
+    Notice {
+        run: u32,
+        outcome: String,
+        summary: String,
+    },
+    Stop {
+        epoch: u32,
+    },
+    Clamp {
+        epoch: u32,
+        access: u8,
+    },
+    Question {
+        question_id: String,
+        epoch: u32,
+        payload: serde_json::Value,
+    },
+    Answer {
+        question_id: String,
+        epoch: u32,
+        payload: serde_json::Value,
+    },
+    Closed {
+        question_id: String,
+        epoch: u32,
+    },
+    FollowUp {
+        run: u32,
+        prompt: String,
+        #[serde(default)]
+        access: u8,
+        #[serde(default)]
+        cohort: u32,
+    },
+    Offer {
+        run: u32,
+        generation: u32,
+    },
+}
+
+impl OrchMessage {
+    pub fn expected_id(&self) -> String {
+        let c = &self.sender_chat;
+        let t = &self.target_chat;
+        match &self.body {
+            OrchBody::CreateChild { .. } => format!("create:{t}"),
+            OrchBody::Notice { run, .. } => format!("notice:{c}:{run}"),
+            OrchBody::Stop { epoch } => format!("stop:{t}:{epoch}"),
+            OrchBody::Clamp { epoch, .. } => format!("clamp:{t}:{epoch}"),
+            OrchBody::Question {
+                question_id, epoch, ..
+            } => format!("q:{c}:{question_id}:{epoch}"),
+            OrchBody::Answer {
+                question_id, epoch, ..
+            } => format!("ans:{t}:{question_id}:{epoch}"),
+            OrchBody::Closed { question_id, epoch } => format!("closed:{c}:{question_id}:{epoch}"),
+            OrchBody::FollowUp { run, .. } => format!("follow:{t}:{run}"),
+            OrchBody::Offer { run, generation } => format!("offer:{c}:{run}:{generation}"),
+        }
+    }
+
+    pub fn upward(&self) -> bool {
+        matches!(
+            self.body,
+            OrchBody::Notice { .. } | OrchBody::Question { .. } | OrchBody::Closed { .. }
+        )
+    }
+}
+
+#[cfg(test)]
+mod orch_doc_tests {
+    use super::*;
+    use crate::SessionDoc;
+
+    #[test]
+    fn orch_out_survives_snapshot_and_epoch_rebuild() {
+        let source = SessionDoc::init("child").unwrap();
+        let notice = OrchMessage {
+            id: "notice:child:2".into(),
+            sender_chat: "child".into(),
+            target_chat: "parent".into(),
+            sender_device: "cloud".into(),
+            body: OrchBody::Notice {
+                run: 2,
+                outcome: "completed".into(),
+                summary: "done".into(),
+            },
+        };
+        assert!(source.append_orch_out(&notice).unwrap());
+        assert!(!source.append_orch_out(&notice).unwrap());
+        let imported = loro::LoroDoc::new();
+        imported.import(&source.export_snapshot().unwrap()).unwrap();
+        let recovered = SessionDoc::from_doc(imported);
+        assert_eq!(recovered.read_orch_out().unwrap(), vec![notice.clone()]);
+        let thin = crate::rebuild_thin_doc(&recovered).unwrap().doc;
+        assert_eq!(thin.read_orch_out().unwrap(), vec![notice]);
     }
 }

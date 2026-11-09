@@ -21,7 +21,7 @@ impl Applied {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboxRow {
     pub effect_id: String,
     pub seq: u64,

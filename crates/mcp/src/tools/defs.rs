@@ -77,7 +77,8 @@ const MESSAGE_CHATS_DESCRIPTION: &str = "Message other Zeron chats that exist: 1
 
 const WAIT_FOR_TURN_DESCRIPTION: &str = "Block until a chat's turn ends (completed, awaitingInput, interrupted, errored, timedOut) and return its new replies. After create_chats or message_chats it waits for that turn. Read-only. Default 600 s, max 3600. On awaitingInput, use respond_to_input. Stale or offline is not done.";
 
-const INTERRUPT_CHAT_DESCRIPTION: &str = "Stop a chat's running turn. The chat stays; message it later with message_chats.";
+const INTERRUPT_CHAT_DESCRIPTION: &str =
+    "Stop a chat's running turn. The chat stays; message it later with message_chats.";
 
 const ARCHIVE_CHAT_DESCRIPTION: &str = "Hide a chat from the sidebar; archived false restores it. Use it to tidy chats you created. Deletes nothing.";
 
@@ -242,6 +243,7 @@ pub(super) fn catalog() -> Vec<ToolDef> {
             description: RESPOND_TO_INPUT_DESCRIPTION,
             input_schema: with_chat(json!({
                 "request_id": { "type": "string" },
+                "epoch": { "type": "integer", "description": "Required for a delegated child question; copy its question epoch." },
                 "answers": {
                     "type": "array",
                     "items": {

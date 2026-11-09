@@ -358,6 +358,7 @@ struct Inner {
     /// Plugins whose native MCP servers local runs get (absent in bare tests).
     plugins: OnceLock<crate::plugins::Plugins>,
     orch: OnceLock<Arc<OrchWire>>,
+    question_notifier: OnceLock<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -409,6 +410,7 @@ impl SessionsEngine {
                 turn_listener: OnceLock::new(),
                 plugins: OnceLock::new(),
                 orch: OnceLock::new(),
+                question_notifier: OnceLock::new(),
             }),
         }
     }
@@ -416,6 +418,15 @@ impl SessionsEngine {
     pub fn enable_orchestrator(&self, wire: Arc<OrchWire>) -> bool {
         if self.inner.orch.set(wire.clone()).is_err() {
             return false;
+        }
+        if let Some(host) = self.host() {
+            let receiver = wire.clone();
+            let engine = self.clone();
+            host.set_orch_receiver(Arc::new(move |message| {
+                receiver
+                    .receive_remote(&engine, &message)
+                    .map_err(|e| e.to_string())
+            }));
         }
         wire.attach(Arc::new(self.clone()));
         true
@@ -442,6 +453,20 @@ impl SessionsEngine {
         self.orch_for(chat_id).is_some()
     }
 
+    pub(crate) fn orch_route(
+        &self,
+        chat: &str,
+    ) -> Option<crate::orchestrator::placement::ChatRoute> {
+        crate::orchestrator::placement::Registry::chat(&self.inner.workspace()?, chat)
+    }
+
+    pub(crate) fn orch_supports(&self, device: &str) -> bool {
+        use crate::orchestrator::placement::Registry;
+        self.inner
+            .workspace()
+            .is_some_and(|ws| ws.supports_orch(device))
+    }
+
     pub(crate) fn orch_command_done(&self, command_id: &str) -> bool {
         self.inner
             .orch
@@ -454,6 +479,134 @@ impl SessionsEngine {
             .orch
             .get()
             .is_none_or(|wire| wire.finish_command(command_id).is_ok())
+    }
+
+    pub(crate) fn orch_create_child(
+        &self,
+        parent: &str,
+        spec: &crate::orchestrator::wire::ChildSpec,
+    ) -> Result<(), EngineError> {
+        let ws = self
+            .inner
+            .workspace()
+            .ok_or_else(|| EngineError::Other("no workspace".into()))?;
+        ws.create_chat_hosted(
+            &spec.chat_id,
+            spec.space_id.as_deref(),
+            spec.device_id.as_deref(),
+            spec.device_id.as_deref(),
+            spec.config.clone(),
+            spec.cwd.clone(),
+            Some(parent.to_owned()),
+            Some(zeron_proto::ChildKind::Subagent),
+        )?;
+        if let Some(branch) = spec.branch.as_deref().filter(|b| !b.is_empty()) {
+            ws.set_chat_branch(&spec.chat_id, branch)?;
+        }
+        if let Some(title) = spec.title.as_deref().filter(|t| !t.trim().is_empty()) {
+            ws.rename_chat(&spec.chat_id, title.trim())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn orch_task_results(
+        &self,
+        chat: &str,
+        message_id: &str,
+        results: Vec<zeron_doc::TaskResultPart>,
+    ) -> Result<(), EngineError> {
+        let host = self
+            .host()
+            .ok_or_else(|| EngineError::Other("no document host".into()))?;
+        let handle = host.open(chat)?;
+        let doc = handle.doc();
+        if doc
+            .read_entries()?
+            .iter()
+            .any(|entry| entry.id == message_id)
+        {
+            return host.persist_fork(&handle);
+        }
+        doc.push_message(&zeron_doc::SessionMessageEntry {
+            id: message_id.to_owned(),
+            role: zeron_doc::MessageRole::User,
+            parts: vec![zeron_doc::MessagePart::TaskResults {
+                id: format!("{message_id}:results"),
+                results,
+            }],
+            created_at: chrono::Utc::now().timestamp_millis(),
+            device_id: host.device_id().to_owned(),
+            status: Some(zeron_doc::MessageStatus::Complete),
+            continuation_of: None,
+            duration_ms: None,
+        })?;
+        host.persist_fork(&handle)
+    }
+
+    pub(crate) fn orch_result_text(&self, chat_id: &str) -> Option<String> {
+        self.journal_result(chat_id)
+            .or_else(|| self.doc_result(chat_id))
+    }
+
+    fn journal_result(&self, chat_id: &str) -> Option<String> {
+        let mut events = self.inner.journal.events_rev(chat_id).ok()?.flatten();
+        let result = events.find_map(|(_, e)| match e {
+            AgentEvent::Done { result, .. } => Some(result),
+            _ => None,
+        })?;
+        if let Some(text) = result.filter(|r| !r.trim().is_empty()) {
+            return Some(text);
+        }
+        let mut parts: Vec<String> = events
+            .map(|(_, e)| e)
+            .take_while(|e| {
+                !matches!(
+                    e,
+                    AgentEvent::Done { .. }
+                        | AgentEvent::SessionStarted { .. }
+                        | AgentEvent::Steered { .. }
+                )
+            })
+            .filter_map(|e| match e {
+                AgentEvent::TextDelta { text } => Some(text),
+                _ => None,
+            })
+            .collect();
+        parts.reverse();
+        let text = parts.concat();
+        (!text.trim().is_empty()).then_some(text)
+    }
+
+    fn doc_result(&self, chat_id: &str) -> Option<String> {
+        let handle = self.host()?.open(chat_id).ok()?;
+        let entries = handle.doc().read_entries().ok()?;
+        let last = entries
+            .iter()
+            .rev()
+            .find(|e| e.role == zeron_doc::MessageRole::Assistant)?;
+        let text: Vec<&str> = last
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                zeron_doc::MessagePart::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        Some(text.join("\n"))
+    }
+
+    pub(crate) fn orch_reports_mcp_results(&self, chat_id: &str) -> bool {
+        matches!(
+            self.live_harness(chat_id),
+            Some(
+                HarnessId::ClaudeCode
+                    | HarnessId::Codex
+                    | HarnessId::Cursor
+                    | HarnessId::Pi
+                    | HarnessId::Muse
+                    | HarnessId::Mock
+            )
+        )
     }
 
     pub(crate) fn host(&self) -> Option<DocHost> {
@@ -674,9 +827,10 @@ impl SessionsEngine {
             .get(chat_id)
             .map(|h| h.turn.clone())
             .ok_or(AwaitRefused::NoRun)?;
-        turn.mark_awaited(task_ids, waiting).map_err(|refused| match refused {
-            zeron_harness::MarkRefused::NoWake => AwaitRefused::NoWake,
-        })
+        turn.mark_awaited(task_ids, waiting)
+            .map_err(|refused| match refused {
+                zeron_harness::MarkRefused::NoWake => AwaitRefused::NoWake,
+            })
     }
 
     /// The person's Stop waiting: what the agent said it waits on no longer
@@ -781,7 +935,9 @@ impl SessionsEngine {
         if !self.turn_in_flight(chat_id) {
             return None;
         }
-        lock(&self.inner.runs).get(chat_id).map(|h| h.runtime_config.harness_id)
+        lock(&self.inner.runs)
+            .get(chat_id)
+            .map(|h| h.runtime_config.harness_id)
     }
 
     /// Mark the provider-switch seam for a send about to run on `harness_id`
@@ -981,6 +1137,16 @@ impl SessionsEngine {
         stops_seen: Option<u64>,
         idle: bool,
     ) -> Result<String, EngineError> {
+        if self.inner.orch.get().is_some()
+            && !self
+                .inner
+                .workspace()
+                .is_some_and(|ws| ws.is_host_strict(chat_id))
+        {
+            return Err(EngineError::Other(
+                "orchestrator requires a known local host row".into(),
+            ));
+        }
         // Project-less chats store a home-relative cwd (the creating device
         // can't know the host's home); expand it here, on the host, where the
         // run spawns, creating a new chat's scratch folder.
@@ -1292,6 +1458,7 @@ impl SessionsEngine {
         let controls = RunControls {
             realtime: (harness_id == HarnessId::Codex).then_some(realtime),
             execution_lease: None,
+            strict_resume: false,
             request_input,
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
@@ -1511,7 +1678,7 @@ impl SessionsEngine {
         prompt: &str,
         sent: &std::sync::atomic::AtomicBool,
     ) -> Option<String> {
-        if sent.load(std::sync::atomic::Ordering::Acquire) {
+        if self.orchestrator().is_some() || sent.load(std::sync::atomic::Ordering::Acquire) {
             return None;
         }
         let session = lock(&self.inner.harness_sessions)
@@ -1950,6 +2117,65 @@ impl SessionsEngine {
     /// it unanswered — the harness answers with its own decline. Returns
     /// `false` when no such request is pending (unknown id, or the run
     /// already settled).
+    pub(crate) fn orch_native_changed(
+        &self,
+        chat: &str,
+        tool: &str,
+        status: &str,
+    ) -> Result<(), EngineError> {
+        let host = self
+            .host()
+            .ok_or_else(|| EngineError::Other("native document host unavailable".into()))?;
+        let handle = host.open(chat)?;
+        let doc = crate::orchestrator::native::doc_id(chat, tool);
+        if !handle
+            .doc()
+            .update_subagent_chip(tool, Some(&doc), Some(status), None)?
+        {
+            return Err(EngineError::Other(
+                "native spawn chip is not saved yet".into(),
+            ));
+        }
+        host.persist_fork(&handle)?;
+        let native = host.open(&doc)?;
+        host.persist_fork(&native)?;
+        Ok(())
+    }
+    pub(crate) fn set_question_notifier(&self, notify: Arc<dyn Fn(&str) + Send + Sync>) {
+        let _ = self.inner.question_notifier.set(notify);
+    }
+    pub(crate) fn orch_notify_question(&self, chat: &str) {
+        if let Some(notify) = self.inner.question_notifier.get() {
+            notify(chat);
+        }
+    }
+    pub(crate) fn orch_respond_question(
+        &self,
+        chat: &str,
+        request: &str,
+        answers: Vec<UserInputAnswer>,
+    ) -> Result<bool, EngineError> {
+        let host = self
+            .host()
+            .ok_or_else(|| EngineError::Other("Input document host unavailable".into()))?;
+        let handle = host.open(chat)?;
+        let doc = handle.doc();
+        let resolved=doc.read_entries()?.iter().flat_map(|e|e.parts.iter()).any(|p|matches!(p,zeron_doc::MessagePart::Input{request_id,resolved:true,answers:Some(saved),..}if request_id==request&&saved==&answers));
+        if resolved {
+            return Ok(true);
+        }
+        if !self.respond_input(chat, request, answers.clone())? {
+            return Ok(false);
+        }
+        if !doc.resolve_input(request, &answers)? {
+            return Err(EngineError::Other(
+                "Input part is not saved yet; answer receipt stays pending".into(),
+            ));
+        }
+        host.persist_fork(&handle)?;
+        Ok(true)
+    }
+
     pub fn respond_input(
         &self,
         chat_id: &str,
@@ -2410,6 +2636,10 @@ impl Inner {
     }
 
     fn publish(&self, chat_id: &str, event: &AgentEvent) -> u64 {
+        if let Some(wire) = self.orch.get() {
+            wire.question_event(chat_id, event);
+            wire.native_event(chat_id, event);
+        }
         let seq = match self.journal.append(chat_id, event) {
             Ok(seq) => seq,
             Err(err) => {
@@ -2431,6 +2661,13 @@ impl Inner {
             && let Some(wire) = self.orch.get()
         {
             wire.provider_done(chat_id, *status, *failure);
+        }
+        if matches!(
+            event,
+            AgentEvent::ToolCall { .. } | AgentEvent::ToolResult { .. }
+        ) && let Some(wire) = self.orch.get()
+        {
+            wire.tool_event(chat_id, event);
         }
         if let Some(hub) = lock(&self.hubs).get(chat_id) {
             let _ = hub.send(JournaledEvent {
@@ -2636,7 +2873,10 @@ impl Inner {
         // once, for every device. (An ask already open when it was put to
         // sleep is no such moment, so that one doesn't wake it.)
         if status != was
-            && matches!(status, SessionStatus::AwaitingInput | SessionStatus::Errored)
+            && matches!(
+                status,
+                SessionStatus::AwaitingInput | SessionStatus::Errored
+            )
             && let Some(ws) = self.workspace()
             && let Err(error) = ws.wake_chat(chat_id, now)
         {
@@ -2733,7 +2973,10 @@ impl Inner {
         let command = std::env::current_exe().ok()?.to_str()?.to_owned();
         let mut env: std::collections::BTreeMap<String, String> = [
             ("ZERON_IPC_PORT".to_owned(), port.to_string()),
-            (zeron_proto::McpServer::CHAT_ID_ENV.to_owned(), chat_id.to_owned()),
+            (
+                zeron_proto::McpServer::CHAT_ID_ENV.to_owned(),
+                chat_id.to_owned(),
+            ),
             ("ZERON_DEVICE_ID".to_owned(), self.device_id.clone()),
         ]
         .into_iter()
@@ -2758,6 +3001,9 @@ impl Inner {
                 zeron_rpc::ipc_auth::TOKEN_FILE_ENV.to_owned(),
                 path.to_owned(),
             );
+        }
+        if self.orch.get().is_some() {
+            env.insert(crate::orchestrator::FLAG_ENV.to_owned(), "1".to_owned());
         }
         Some(zeron_proto::McpServer {
             name: "zeron".into(),
@@ -3779,6 +4025,7 @@ impl SubagentSink {
         };
         if let Err(err) = finished {
             tracing::warn!(doc = %self.doc_id, error = %err, "subagent sink finish failed");
+            return None;
         }
         let entries = zeron_doc::join_continuation_entries(self.doc.read_entries().ok()?);
         serde_json::to_string(&entries).ok()
@@ -4050,6 +4297,79 @@ fn wake_grace() -> std::time::Duration {
         .unwrap_or(std::time::Duration::from_secs(15))
 }
 
+fn persist_transfer_doc(inner: &Inner, chat: &str) -> Result<(), String> {
+    let host = inner
+        .doc_host()
+        .ok_or_else(|| "document host is unavailable".to_owned())?;
+    let handle = host.open(chat).map_err(|e| e.to_string())?;
+    host.persist_fork(&handle).map_err(|e| e.to_string())?;
+    if let Some(wire) = inner.orch.get().filter(|wire| wire.driver().mechanism_capture_enabled()) {
+        use sha2::{Digest, Sha256};
+        let bytes = host.docs_store().load_snapshot(chat)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "saved transfer snapshot is missing".to_owned())?;
+        let raw = loro::LoroDoc::new();
+        raw.import(&bytes).map_err(|e| e.to_string())?;
+        let saved = SessionDoc::from_doc(raw);
+        let data = crate::orchestrator::transfer::durable_fact(&saved, chat);
+        let encoded = serde_json::to_vec(&data).map_err(|e| e.to_string())?;
+        let id = format!("transfer:{chat}:{:x}", Sha256::digest(&encoded));
+        wire.driver().observe_mechanism(&id, "transfer_state", data).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn begin_transfer_operation(inner: &Inner, chat: &str) -> Result<Option<serde_json::Value>, String> {
+    let Some(wire) = inner.orch.get() else { return Ok(None); };
+    if !wire.driver().mechanism_capture_enabled() { return Ok(None); }
+    let host = inner.doc_host().ok_or("document host unavailable")?;
+    let handle = host.open(chat).map_err(|e|e.to_string())?;
+    crate::orchestrator::transfer::begin_operation(wire.driver(), &host, &handle, chat)
+}
+fn end_transfer_operation(inner: &Inner, chat: &str, before: Option<serde_json::Value>, operation: &str, args: serde_json::Value, succeeded: bool) -> Result<(),String> {
+    let Some(wire) = inner.orch.get() else { return Ok(()); };
+    let host = inner.doc_host().ok_or("document host unavailable")?;
+    crate::orchestrator::transfer::end_operation(wire.driver(), &host, chat, before, operation, args, succeeded)
+}
+
+fn bind_transfer_session(
+    inner: &Inner,
+    doc: &SessionDoc,
+    chat: &str,
+    harness: HarnessId,
+    input_id: &str,
+    session_id: &str,
+    cwd: &str,
+    through: Option<&str>,
+) -> Result<(), String> {
+    let before = begin_transfer_operation(inner, chat)?;
+    let entries = doc.read_entries().map_err(|e| e.to_string())?;
+    let seen = through
+        .map(str::to_owned)
+        .or_else(|| entries.last().map(|e| e.id.clone()));
+    doc.set_provider_session(
+        harness.as_str(),
+        &zeron_doc::ProviderSessionMark {
+            session_id: session_id.to_owned(),
+            cwd: cwd.to_owned(),
+            seen,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    if !crate::orchestrator::transfer::status(doc).is_empty() {
+        crate::orchestrator::transfer::bind_provider_session(
+            doc,
+            harness.as_str(),
+            input_id,
+            session_id,
+        )?;
+    }
+    persist_transfer_doc(inner, chat)?;
+    end_transfer_operation(inner, chat, before, "BindProvider", serde_json::json!({
+        "harness":harness.as_str(),"input":input_id,"session":session_id,"seen":through,"validated_local":true
+    }), true)
+}
+
 async fn drive_run(
     inner: Arc<Inner>,
     chat_id: String,
@@ -4070,6 +4390,7 @@ async fn drive_run(
     let user_prompt = request.prompt.clone();
     let run_cwd = request.cwd.clone();
     let resumed_session = request.resume.clone();
+    let prior_context_usage = doc.context_usage().unwrap_or_default();
     if request.resume.is_none() {
         let _ = doc.clear_context_usage();
     }
@@ -4124,7 +4445,85 @@ async fn drive_run(
         None => ProviderSession::Fresh,
         resumed => ProviderSession::Continued(resumed),
     };
+    if inner.orch.get().is_some() && request.resume.is_some() {
+        controls.strict_resume = true;
+    }
+    let mut transfer_save_error = None;
+    let transfer_interrupt = controls.interrupt.clone();
     if !resume_state.idle
+        && inner.orch.get().is_some()
+        && !native_command(&request.prompt, harness_id)
+    {
+        let provider_mark = doc.provider_session(harness_id.as_str()).filter(|mark| {
+            request.resume.as_deref() == Some(mark.session_id.as_str())
+                && session_cwd_matches(&mark.cwd, &request.cwd)
+        });
+        let needs_history = doc.provider_switched()
+            || inner
+                .workspace()
+                .and_then(|ws| ws.chat(&chat_id).ok().flatten())
+                .is_some_and(|chat| chat.parent_chat_id.is_some());
+        let (transfer_images, transfer_attachments) =
+            crate::orchestrator::transfer::attachment_counts(&request.attachments);
+        let transfer_before = begin_transfer_operation(&inner, &chat_id).unwrap_or_else(|error| {
+            transfer_save_error = Some(error);
+            None
+        });
+        let transfer_args = if transfer_before.is_some() { serde_json::json!({"chat":chat_id,"harness":harness_id.as_str(),
+            "input":resume_state.user_message_id,"prompt_bytes":request.prompt.len(),
+            "provider_session":provider_mark.as_ref().map(|p|p.session_id.as_str()),
+            "provider_seen":provider_mark.as_ref().and_then(|p|p.seen.as_deref()),
+            "needs_history":needs_history,"images":transfer_images,"attachments":transfer_attachments,
+            "used_tokens":if request.resume.is_some(){prior_context_usage.tokens.unwrap_or(0)}else{0},
+            "window":prior_context_usage.window.or_else(||harness.context_window().map(|v|v as u64)).unwrap_or(32000),
+            "access":request.access,"source":crate::orchestrator::transfer::source_fact(&doc.read_entries().unwrap_or_default())}) } else { serde_json::Value::Null };
+        let prepared = crate::orchestrator::transfer::prepare_run(
+            &doc,
+            crate::orchestrator::transfer::RunContext {
+                chat_id: &chat_id,
+                harness: harness_id.as_str(),
+                input_id: &resume_state.user_message_id,
+                prompt: &request.prompt,
+                used_tokens: if request.resume.is_some() {
+                    usize::try_from(prior_context_usage.tokens.unwrap_or(0)).unwrap_or(usize::MAX)
+                } else {
+                    0
+                },
+                window: prior_context_usage
+                    .window
+                    .and_then(|w| usize::try_from(w).ok())
+                    .or_else(|| harness.context_window()),
+                images: transfer_images,
+                other_attachments: transfer_attachments,
+                provider: provider_mark.as_ref(),
+                needs_history,
+            },
+        );
+        let transfer_succeeded = prepared.is_ok();
+        let transfer_changed = !matches!(&prepared, Ok(None));
+        match prepared {
+            Ok(Some(prompt)) => {
+                request.prompt = prompt;
+                carried_history = true;
+                resume_state
+                    .fork_history_sent
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(chat = %chat_id, %error, "context transfer failed");
+                transfer_save_error = Some(error);
+            }
+        }
+        if transfer_changed || transfer_before.is_some() {
+            if let Err(error) = persist_transfer_doc(&inner, &chat_id).and_then(|()|
+                end_transfer_operation(&inner, &chat_id, transfer_before, "PrepareRun", transfer_args, transfer_succeeded)) {
+                transfer_save_error = Some(error);
+            }
+        }
+    }
+    if !resume_state.idle
+        && inner.orch.get().is_none()
         && let Some(prompt) = inner.fork_history_prompt(
             &chat_id,
             &doc,
@@ -4237,7 +4636,11 @@ async fn drive_run(
         }
         crate::runner::mark_setup_shown();
     }
-    let prepared = if harness_id == HarnessId::Cursor {
+    let prepared = if let Some(error) = transfer_save_error {
+        Err(zeron_harness::HarnessError::Protocol(format!(
+            "context transfer receipt save failed: {error}"
+        )))
+    } else if harness_id == HarnessId::Cursor {
         cursor_unstarted_history(
             &doc,
             &resume_state.user_message_id,
@@ -4951,7 +5354,10 @@ async fn drive_run(
             event: sub_event,
         } = &event
         {
-            inner.publish(&chat_id, &event);
+            let terminal = matches!(sub_event.as_ref(), AgentEvent::Done { .. });
+            if !terminal {
+                inner.publish(&chat_id, &event);
+            }
             last_subagent_activity = Some(tokio::time::Instant::now());
             // Background subagents can outlive the turn and be the only
             // traffic for minutes: keep the row (and its count) inside the
@@ -5106,19 +5512,51 @@ async fn drive_run(
                     // finished subagents never wake the doc's room; dropping
                     // the sink unpins the doc for the LRU and the room
                     // idles. The live doc remains the fallback.
-                    if let Some(json) = sink.finish(&device_id, status)
-                        && let Some(host) = inner.doc_host()
-                    {
-                        host.upload_tool_sidecar(
-                            &chat_id,
-                            zeron_doc::SidecarPayload {
-                                part_id: doc_id,
-                                output: Some(json),
-                                diff: None,
-                            },
-                        );
+                    let Some(json) = sink.finish(&device_id, status) else {
+                        continue;
+                    };
+                    let Some(host) = inner.doc_host() else {
+                        continue;
+                    };
+                    if let Some(wire) = inner.orch.get() {
+                        let staged = host.open(&doc_id).and_then(|handle| {
+                            let snapshot = handle.doc().export_snapshot()?;
+                            wire.stage_native_terminal(
+                                &chat_id,
+                                parent_tool_use_id,
+                                &doc_id,
+                                snapshot,
+                                matches!(
+                                    sub_event.as_ref(),
+                                    AgentEvent::Done { status, .. } if *status != DoneStatus::Completed
+                                ),
+                            )
+                            .map_err(|error| EngineError::Other(error.to_string()))
+                        });
+                        if let Err(error) = staged {
+                            tracing::error!(doc = %doc_id, %error, "native terminal staging failed");
+                            continue;
+                        }
                     }
+                    if let Err(error) = host
+                        .open(&doc_id)
+                        .and_then(|handle| host.persist_fork(&handle))
+                    {
+                        tracing::error!(doc = %doc_id, %error, "native result save failed; terminal fact withheld");
+                        continue;
+                    }
+                    host.upload_tool_sidecar(
+                        &chat_id,
+                        zeron_doc::SidecarPayload {
+                            part_id: doc_id,
+                            output: Some(json),
+                            diff: None,
+                        },
+                    );
                 }
+            }
+            if terminal {
+                inner.publish(&chat_id, &event);
             }
             continue;
         }
@@ -5369,6 +5807,21 @@ async fn drive_run(
         let event = if startup_crash && resume_state.orchestrated {
             if matches!(&event, AgentEvent::Done { error: Some(e), .. } if resume_rejected(e)) {
                 inner.reject_resume(&chat_id, resumed_session.as_deref(), harness_id, &run_cwd);
+                let replacement_before = begin_transfer_operation(&inner, &chat_id);
+                if let Err(error) = replacement_before.and_then(|before| crate::orchestrator::transfer::replace_provider_session(
+                    &doc,
+                    &chat_id,
+                    harness_id.as_str(),
+                    &resume_state.user_message_id,
+                )
+                .and_then(|()| persist_transfer_doc(&inner, &chat_id))
+                .and_then(|()| end_transfer_operation(&inner, &chat_id, before, "RejectResume", serde_json::json!({
+                    "harness":harness_id.as_str(),"input":resume_state.user_message_id,"rejected_session":resumed_session,
+                    "explicit_rejection":true,"source":crate::orchestrator::transfer::source_fact(&doc.read_entries().unwrap_or_default())
+                }), true)))
+                {
+                    tracing::warn!(chat = %chat_id, %error, "replacement context snapshot save failed");
+                }
             }
             retryable_done(event)
         } else {
@@ -5526,6 +5979,24 @@ async fn drive_run(
                         Some(&resume_state.user_message_id),
                     );
                 }
+                if inner.orch.get().is_some()
+                    && !resume_state.idle
+                    && session_cwd_matches(cwd, &run_cwd)
+                {
+                    if let Err(error) = bind_transfer_session(
+                        &inner,
+                        &doc,
+                        &chat_id,
+                        harness_id,
+                        &resume_state.user_message_id,
+                        session_id,
+                        cwd,
+                        Some(&resume_state.user_message_id),
+                    ) {
+                        tracing::warn!(chat = %chat_id, %error, "context transfer session receipt save failed");
+                        transfer_interrupt.cancel();
+                    }
+                }
                 run_session = Some((session_id.clone(), cwd.clone()));
             }
             AgentEvent::Done {
@@ -5623,6 +6094,23 @@ async fn drive_run(
             // The turn's session has now seen the transcript through its reply.
             if let Some((session_id, cwd)) = &run_session {
                 Inner::note_provider_session(&doc, harness_id, session_id, cwd, None);
+                if inner.orch.get().is_some()
+                    && !resume_state.idle
+                    && session_cwd_matches(cwd, &run_cwd)
+                {
+                    if let Err(error) = bind_transfer_session(
+                        &inner,
+                        &doc,
+                        &chat_id,
+                        harness_id,
+                        &resume_state.user_message_id,
+                        session_id,
+                        cwd,
+                        None,
+                    ) {
+                        tracing::warn!(chat = %chat_id, %error, "context transfer done receipt save failed");
+                    }
+                }
             }
             if *status == DoneStatus::Completed {
                 // A cleanly completed turn resets the auto-resume revival
@@ -5705,7 +6193,13 @@ async fn drive_run(
                         outcome,
                         grace: None,
                     });
-                    inner.set_status_with_completion(&chat_id, SessionStatus::Idle, false, None, None);
+                    inner.set_status_with_completion(
+                        &chat_id,
+                        SessionStatus::Idle,
+                        false,
+                        None,
+                        None,
+                    );
                     inner.set_waiting(&chat_id, Some(zeron_proto::SessionWaiting { since, on }));
                     continue;
                 }
@@ -6154,7 +6648,11 @@ mod tests {
         std::io::Write::write_all(&mut f, b"{\"seq\":3,\"event\":{\"type\":\"done\"").unwrap();
         assert_eq!(
             sessions.inner.journal_harness_session("started-only"),
-            Some(("s1".into(), "/a".into(), Some(zeron_proto::HarnessId::ClaudeCode)))
+            Some((
+                "s1".into(),
+                "/a".into(),
+                Some(zeron_proto::HarnessId::ClaudeCode)
+            ))
         );
     }
 
@@ -6278,9 +6776,12 @@ mod tests {
             .unwrap();
         let mut request = request();
         request.prompt.clear();
-        core.sessions
-            .inner
-            .remember_harness_session("idle", "old-native-thread", &request.cwd, HarnessId::Codex);
+        core.sessions.inner.remember_harness_session(
+            "idle",
+            "old-native-thread",
+            &request.cwd,
+            HarnessId::Codex,
+        );
         core.sessions.start_idle("idle", request).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -6324,7 +6825,10 @@ mod tests {
                 SessionStatus::Idle
             );
             assert_eq!(
-                core.workspace.chat_harness_session("idle").unwrap().session_id,
+                core.workspace
+                    .chat_harness_session("idle")
+                    .unwrap()
+                    .session_id,
                 "new-native-thread"
             );
             let events = core.sessions.inner.journal.replay("idle", 0).unwrap();
@@ -7007,8 +7511,17 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         };
         turn.set_wakes_on_background(wakes);
-        feed.send(AgentEvent::TextDelta { text: "on it".into() }).unwrap();
-        WakeRig { core, feed, turn, chat, _dir: dir }
+        feed.send(AgentEvent::TextDelta {
+            text: "on it".into(),
+        })
+        .unwrap();
+        WakeRig {
+            core,
+            feed,
+            turn,
+            chat,
+            _dir: dir,
+        }
     }
 
     fn waiting_agent(id: &str) -> zeron_proto::WaitingOn {
@@ -7031,7 +7544,10 @@ mod tests {
     /// The session as the rig's engine says it once things settle.
     async fn settled(rig: &WakeRig) -> Session {
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-        rig.core.sessions.session_status(rig.chat).expect("a session row")
+        rig.core
+            .sessions
+            .session_status(rig.chat)
+            .expect("a session row")
     }
 
     fn waits_on(session: &Session) -> Vec<String> {
@@ -7063,7 +7579,11 @@ mod tests {
         assert!(s.waiting.is_none());
 
         // The wake turn's own end is the one finish.
-        rig.feed.send(AgentEvent::TextDelta { text: "all done".into() }).unwrap();
+        rig.feed
+            .send(AgentEvent::TextDelta {
+                text: "all done".into(),
+            })
+            .unwrap();
         rig.feed.send(done(DoneStatus::Completed)).unwrap();
         let s = settled(&rig).await;
         assert_eq!(s.status, SessionStatus::Idle);
@@ -7094,7 +7614,8 @@ mod tests {
     #[tokio::test]
     async fn a_process_is_waited_on_only_once_the_agent_says_so_and_stop_waiting_ends_it() {
         let rig = wake_rig("chat-wait-mark", true).await;
-        rig.turn.set_background_processes(vec![bg_process("dev"), bg_process("tests")]);
+        rig.turn
+            .set_background_processes(vec![bg_process("dev"), bg_process("tests")]);
         let outcome = rig
             .core
             .sessions
@@ -7104,7 +7625,11 @@ mod tests {
         assert_eq!(outcome.unmatched, ["nope"]);
         rig.feed.send(done(DoneStatus::Completed)).unwrap();
         let s = settled(&rig).await;
-        assert_eq!(waits_on(&s), ["tests"], "the dev server left running is no wait");
+        assert_eq!(
+            waits_on(&s),
+            ["tests"],
+            "the dev server left running is no wait"
+        );
         // The person: Stop waiting.
         assert!(rig.core.sessions.stop_waiting(rig.chat));
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -7131,16 +7656,25 @@ mod tests {
         rig.turn.set_background_processes(vec![bg_process("build")]);
         rig.turn.set_background_agents(vec![waiting_agent("ag1")]);
         assert_eq!(
-            rig.core.sessions.await_background(rig.chat, &["build".into()], true).err(),
+            rig.core
+                .sessions
+                .await_background(rig.chat, &["build".into()], true)
+                .err(),
             Some(AwaitRefused::NoWake)
         );
         assert_eq!(
-            rig.core.sessions.await_background("chat-elsewhere", &["build".into()], true).err(),
+            rig.core
+                .sessions
+                .await_background("chat-elsewhere", &["build".into()], true)
+                .err(),
             Some(AwaitRefused::NoRun)
         );
         rig.feed.send(done(DoneStatus::Completed)).unwrap();
         let s = settled(&rig).await;
-        assert!(s.waiting.is_none(), "nothing wakes this agent: its end is the end");
+        assert!(
+            s.waiting.is_none(),
+            "nothing wakes this agent: its end is the end"
+        );
         assert!(s.last_completed_turn.is_some());
         rig.core.sessions.shutdown().await;
     }
@@ -7175,7 +7709,14 @@ mod tests {
         let s = rig.core.sessions.session_status(rig.chat).unwrap();
         assert!(s.waiting.is_none());
         assert_eq!(s.status, SessionStatus::Idle);
-        assert!(s.last_completed_turn.is_some(), "a wait never swallows the finish");
+        assert!(
+            s.last_completed_turn.is_some(),
+            "a wait never swallows the finish"
+        );
         rig.core.sessions.shutdown().await;
     }
 }
+
+#[cfg(test)]
+#[path = "sessions_transfer_tests.rs"]
+mod transfer_tests;

@@ -232,6 +232,7 @@ async fn exercise(prompt: &str, resume: Option<&str>) {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         request_input: Box::new(|_| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Vec::new());
@@ -328,6 +329,7 @@ async fn exercise_tree(prompt: &str, drop_stream: bool) {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         request_input: Box::new(|_| {
             let (_, rx) = oneshot::channel();
             rx
@@ -489,6 +491,7 @@ async fn batch_overrides_launch_through_cmd() {
         let controls = RunControls {
             realtime: None,
             execution_lease: None,
+            strict_resume: false,
             request_input: Box::new(|_| {
                 let (tx, rx) = oneshot::channel();
                 let _ = tx.send(Vec::new());

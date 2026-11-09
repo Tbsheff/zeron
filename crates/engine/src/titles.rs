@@ -290,6 +290,7 @@ async fn collect_text(
     let controls = RunControls {
         realtime: None,
         execution_lease,
+        strict_resume: false,
         request_input: Box::new(|_questions: Vec<UserInputQuestion>| {
             let (tx, rx) = tokio::sync::oneshot::channel::<Vec<UserInputAnswer>>();
             let _ = tx.send(Vec::new());

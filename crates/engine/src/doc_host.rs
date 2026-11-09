@@ -263,6 +263,8 @@ struct DocHostInner {
     /// run they start is registered — and Working — by then).
     dispatching: Arc<AtomicUsize>,
     workspace: OnceLock<WorkspaceHost>,
+    orch_receiver:
+        OnceLock<Arc<dyn Fn(zeron_doc::OrchMessage) -> Result<(), String> + Send + Sync>>,
     /// Worktree materialization for Run commands (see `set_repos`).
     repos: OnceLock<crate::repos::Repos>,
     project_action_runtime: OnceLock<(ProjectActionsStore, Terminals)>,
@@ -945,23 +947,30 @@ impl ChatDocHandle {
         // The send that switches wrote its message first: the seam goes
         // before it (and any other unanswered message), so it reads as the
         // new provider's question, not the old one's.
-        let unanswered = entries.iter().rev().take_while(|entry| entry.role == MessageRole::User).count();
-        self.doc.insert_message_before_last(unanswered, &SessionMessageEntry {
-            id: id.clone(),
-            role: MessageRole::System,
-            parts: vec![MessagePart::Switch {
-                id,
-                from: from.to_string(),
-                to: to.to_string(),
-                from_harness: Some(from_id.as_str().to_owned()),
-                to_harness: Some(to_id.as_str().to_owned()),
-            }],
-            created_at,
-            device_id: self.device_id.clone(),
-            status: Some(MessageStatus::Complete),
-            continuation_of: None,
-            duration_ms: None,
-        })?;
+        let unanswered = entries
+            .iter()
+            .rev()
+            .take_while(|entry| entry.role == MessageRole::User)
+            .count();
+        self.doc.insert_message_before_last(
+            unanswered,
+            &SessionMessageEntry {
+                id: id.clone(),
+                role: MessageRole::System,
+                parts: vec![MessagePart::Switch {
+                    id,
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    from_harness: Some(from_id.as_str().to_owned()),
+                    to_harness: Some(to_id.as_str().to_owned()),
+                }],
+                created_at,
+                device_id: self.device_id.clone(),
+                status: Some(MessageStatus::Complete),
+                continuation_of: None,
+                duration_ms: None,
+            },
+        )?;
         self.doc.mark_provider_switched()?;
         Ok(true)
     }
@@ -1079,6 +1088,7 @@ impl DocHost {
                 quiesce_generation: AtomicU64::new(0),
                 dispatching: Arc::new(AtomicUsize::new(0)),
                 workspace: OnceLock::new(),
+                orch_receiver: OnceLock::new(),
                 repos: OnceLock::new(),
                 project_action_runtime: OnceLock::new(),
                 shutdown: CancellationToken::new(),
@@ -1185,7 +1195,19 @@ impl DocHost {
         let running = self
             .sessions()
             .map_or(0, |sessions| sessions.active_count());
-        let busy = if running > 0 {
+        let unsynced = self
+            .inner
+            .store
+            .sync_work_counts()
+            .map(|(rows, _)| rows > 0)
+            .unwrap_or(true)
+            || lock(&self.inner.handles).values().any(|handle| {
+                !lock(&handle.chat2_pending_local).is_empty()
+                    || handle.publication_failed.load(Ordering::Acquire)
+            });
+        let busy = if unsynced {
+            Some("chat updates await room acknowledgement".to_string())
+        } else if running > 0 {
             Some(format!("{running} chat(s) have a turn in flight"))
         } else if self.has_waiting_commands() {
             Some("a message is waiting to run".to_string())
@@ -1225,6 +1247,7 @@ impl DocHost {
         for handle in handles {
             let host = self.clone();
             self.spawn_worker(async move {
+                host.ingest_orch_doc(&handle);
                 host.drain_commands(&handle).await;
                 host.drain_queue(&handle).await;
             });
@@ -1385,9 +1408,136 @@ impl DocHost {
     pub fn set_workspace(&self, workspace: WorkspaceHost) {
         let chats = workspace.watch_chats();
         if self.inner.workspace.set(workspace).is_ok() {
+            self.spawn_orch_rooms(chats.clone());
             self.spawn_cutover_watcher(chats);
             self.spawn_migration_sweep();
         }
+    }
+
+    pub fn set_orch_receiver(
+        &self,
+        receiver: Arc<dyn Fn(zeron_doc::OrchMessage) -> Result<(), String> + Send + Sync>,
+    ) {
+        let _ = self.inner.orch_receiver.set(receiver);
+    }
+
+    pub fn send_orch(&self, message: &zeron_doc::OrchMessage) -> Result<bool, String> {
+        let registry = self.workspace().ok_or("registry not ready")?;
+        let room = if message.upward() {
+            &message.sender_chat
+        } else {
+            &message.target_chat
+        };
+        let handle = self.open(room).map_err(|e| e.to_string())?;
+        let sent = crate::orchestrator::placement::send(
+            registry,
+            &self.inner.config.device_id,
+            handle.doc(),
+            message,
+        )
+        .map_err(|e| e.to_string())?;
+        if let Some(persistence) = &handle.persistence {
+            persistence.flush_sync();
+            if !persistence.is_clean() {
+                return Err("orchestrator document is not durable".into());
+            }
+        } else {
+            self.persist_fork(&handle)
+                .map_err(|error| error.to_string())?;
+        }
+        if handle.publication_failed.load(Ordering::Acquire) {
+            return Err("orchestrator publication awaits retry".into());
+        }
+        if !message.upward() {
+            self.nudge_remote_host(room);
+        }
+        Ok(sent)
+    }
+
+    fn apply_orch_message(
+        &self,
+        room: &str,
+        message: &zeron_doc::OrchMessage,
+    ) -> Result<(), EngineError> {
+        let registry = self
+            .workspace()
+            .ok_or_else(|| EngineError::Other("registry not ready".into()))?;
+        crate::orchestrator::placement::validate(
+            registry,
+            &self.inner.config.device_id,
+            room,
+            message,
+        )
+        .map_err(|e| EngineError::Other(e.to_string()))?;
+        let receive = self
+            .inner
+            .orch_receiver
+            .get()
+            .ok_or_else(|| EngineError::Other("orchestrator disabled".into()))?;
+        receive(message.clone()).map_err(EngineError::Other)
+    }
+
+    fn ingest_orch_doc(&self, handle: &ChatDocHandle) {
+        let (Some(registry), Some(receiver)) = (self.workspace(), self.inner.orch_receiver.get())
+        else {
+            return;
+        };
+        match crate::orchestrator::placement::scan(
+            registry,
+            &self.inner.config.device_id,
+            handle.doc(),
+        ) {
+            Ok(rows) => {
+                for row in rows {
+                    if let Err(error) = receiver(row) {
+                        tracing::debug!(%error, "orchestrator row remains for retry");
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(%error, "orchestrator doc scan failed"),
+        }
+    }
+
+    fn spawn_orch_rooms(&self, mut chats: watch::Receiver<Vec<zeron_proto::Chat>>) {
+        if !crate::orchestrator::flag_from_env() {
+            return;
+        }
+        let host = self.clone();
+        self.spawn_worker(async move {
+            let mut rooms: HashMap<String, Arc<ChatDocHandle>> = HashMap::new();
+            loop {
+                let rows = chats.borrow_and_update().clone();
+                let owned: HashSet<_> = rows
+                    .iter()
+                    .filter(|c| c.device_id == host.inner.config.device_id)
+                    .map(|c| c.id.clone())
+                    .collect();
+                let wanted: HashSet<_> = rows
+                    .iter()
+                    .filter(|c| {
+                        owned.contains(&c.id)
+                            || c.parent_chat_id.as_ref().is_some_and(|p| owned.contains(p))
+                    })
+                    .map(|c| c.id.clone())
+                    .collect();
+                rooms.retain(|id, _| wanted.contains(id));
+                for id in wanted {
+                    if !rooms.contains_key(&id) {
+                        if let Ok(handle) = host.open(&id) {
+                            rooms.insert(id, handle);
+                        }
+                    }
+                }
+                for handle in rooms.values() {
+                    host.activate_sync(handle);
+                    host.ingest_orch_doc(handle);
+                }
+                tokio::select! {
+                    changed = chats.changed() => if changed.is_err() { return; },
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
+                }
+            }
+        });
     }
 
     /// Host migration sweep: proactively seed this device's own s2 chats
@@ -4948,7 +5098,36 @@ impl DocHost {
         chat_id: &str,
         entry: SessionCommandEntry,
     ) -> Result<&'static str, EngineError> {
+        if self
+            .sessions()
+            .is_some_and(|sessions| sessions.orchestrator().is_some())
+            && !self.is_host(chat_id)
+        {
+            return Err(EngineError::Other(
+                "orchestrator requires a known local host row".into(),
+            ));
+        }
         let handle = self.open(chat_id)?;
+        if let SessionCommandPayload::Orch { message } = &entry.payload {
+            if entry.id != message.id
+                || entry.issued_by != message.sender_device
+                || !handle.doc.read_commands()?.iter().any(|row| {
+                    row.id == entry.id
+                        && row.payload == entry.payload
+                        && row.issued_by == entry.issued_by
+                })
+            {
+                return Err(EngineError::Other(
+                    "orchestrator command is not in the replica".into(),
+                ));
+            }
+            self.apply_orch_message(chat_id, message)?;
+            self.inner.store.mark_processed(&entry.id)?;
+            handle
+                .doc
+                .set_command_status(&entry.id, SessionCommandStatus::Applied, None)?;
+            return Ok("executed");
+        }
         // The sender sequences attachment transfers BEFORE the relay; refuse
         // (retryably) rather than run without the images.
         if !self.missing_attachments(&entry).is_empty() {
@@ -5225,6 +5404,14 @@ impl DocHost {
     /// wired workspace host (bare-DocHost tests) every open chat is ours — M2's
     /// behavior, now the degenerate case.
     fn is_host(&self, chat_id: &str) -> bool {
+        if self
+            .sessions()
+            .is_some_and(|sessions| sessions.orchestrator().is_some())
+        {
+            return self
+                .workspace()
+                .is_some_and(|ws| ws.is_host_strict(chat_id));
+        }
         self.workspace().is_none_or(|ws| ws.is_host(chat_id))
     }
 
@@ -5338,6 +5525,47 @@ impl DocHost {
                 }
                 return;
             };
+            if let SessionCommandPayload::Orch { message } = &entry.payload {
+                let invalid = entry.id != message.id
+                    || entry.issued_by != message.sender_device
+                    || self.workspace().is_some_and(|registry| {
+                        matches!(
+                            crate::orchestrator::placement::validate(
+                                registry,
+                                &self.inner.config.device_id,
+                                &handle.chat_id,
+                                message
+                            ),
+                            Err(crate::orchestrator::placement::RouteError::Spoofed)
+                        )
+                    });
+                if invalid {
+                    if let Err(error) = handle.doc.set_command_status(
+                        &entry.id,
+                        SessionCommandStatus::Rejected,
+                        Some("invalid orchestrator route"),
+                    ) {
+                        tracing::warn!(%error, "cannot reject invalid orchestrator row");
+                        return;
+                    }
+                    skipped.insert(entry.id.clone());
+                    continue;
+                }
+                if self.inner.orch_receiver.get().is_none() {
+                    skipped.insert(entry.id.clone());
+                    continue;
+                }
+                if let Err(error) = self.apply_orch_message(&handle.chat_id, message) {
+                    tracing::debug!(chat = %handle.chat_id, %error, "orchestrator command waits for retry");
+                    return;
+                }
+                if let Err(error) = self.inner.store.mark_processed(&entry.id) {
+                    tracing::warn!(%error, "orchestrator receipt saved; ledger mark will retry");
+                    return;
+                }
+                self.resolve_command(handle, &entry.id, SessionCommandStatus::Applied, None);
+                continue;
+            }
             let messages = handle.doc.read_entries().unwrap_or_default();
             let current_turn_id = messages.last().map(|m| m.id.clone());
             let turn_is_past = |turn_id: &str| messages.iter().any(|m| m.id == turn_id);
@@ -5719,6 +5947,10 @@ impl DocHost {
             ));
         }
         match &entry.payload {
+            SessionCommandPayload::Orch { message } => {
+                self.apply_orch_message(chat_id, message)?;
+                Ok((SessionCommandStatus::Applied, None))
+            }
             SessionCommandPayload::Run {
                 request,
                 message_id,
@@ -5807,8 +6039,11 @@ impl DocHost {
                 // A run on another provider than the live turn's (a stale
                 // client, another device's switch) waits for the turn: the
                 // provider never changes by killing a turn mid-flight.
-                let other_provider = sessions.live_harness(chat_id).is_some_and(|live| live != harness);
-                if other_provider || sessions.defers_to_turn_end(chat_id, Some((harness, &request))) {
+                let other_provider = sessions
+                    .live_harness(chat_id)
+                    .is_some_and(|live| live != harness);
+                if other_provider || sessions.defers_to_turn_end(chat_id, Some((harness, &request)))
+                {
                     self.hold_until_turn_end(
                         handle,
                         message_id,
@@ -6147,6 +6382,25 @@ impl DocHost {
         {
             tracing::warn!(chat = %chat_id, error = %err, "conversation source stamp failed");
         }
+    }
+
+    pub(crate) async fn prepare_task_worktree(
+        &self,
+        chat: &str,
+        message_id: &str,
+        spec: &zeron_proto::WorktreeSpec,
+    ) -> Result<String, EngineError> {
+        let (cwd, fresh) = self.materialize_worktree(chat, spec).await?;
+        if let Some(ws) = self.workspace() {
+            ws.set_chat_cwd(chat, &cwd)?;
+            if let Some(worktree) = &fresh {
+                ws.set_chat_branch(chat, &worktree.branch)?;
+            }
+        }
+        if spec.space_id.is_some() {
+            self.complete_worktree_setup_handoff(message_id, chat, spec, fresh.as_ref());
+        }
+        Ok(cwd)
     }
 
     async fn materialize_worktree(
@@ -6781,6 +7035,7 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
     // mirror stays lazy — it materializes on the first watch attach.
     {
         let Some(handle) = weak.upgrade() else { return };
+        host.ingest_orch_doc(&handle);
         host.drain_commands(&handle).await;
         host.drain_queue(&handle).await;
     }

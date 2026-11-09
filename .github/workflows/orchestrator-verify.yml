@@ -1,0 +1,60 @@
+name: Orchestrator verification
+on:
+  push:
+    branches: [feat/orchestrator-v2]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: orchestrator-verify-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  ORCH_DOGFOOD_DIR: ${{ vars.ORCH_DOGFOOD_DIR }}
+  ORCH_KANI_EVIDENCE_DIR: ${{ vars.ORCH_KANI_EVIDENCE_DIR }}
+jobs:
+  orchestrator-fast:
+    # No PR trigger: untrusted workflow edits must not run on this Mac.
+    if: github.ref == 'refs/heads/feat/orchestrator-v2' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: [self-hosted, macOS, orchestrator-verify]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install pinned model tools
+        run: scripts/orch-setup.sh
+      - name: Verify executable checks
+        run: python3 scripts/orch-verify.py fast
+      - name: Save fast receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: orchestrator-fast-${{ github.sha }}
+          path: |
+            target/orch-verify
+            !target/orch-verify/**/mechanism*.jsonl
+            !target/orch-verify/mechanism/**
+            !target/orch-verify/**/dogfood/**
+  orchestrator-verify:
+    # This separate acceptance check stays red while the dogfood week is open.
+    needs: orchestrator-fast
+    if: always() && github.ref == 'refs/heads/feat/orchestrator-v2' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: [self-hosted, macOS, orchestrator-verify]
+    timeout-minutes: 60
+    steps:
+      - name: Require fast pass
+        if: needs.orchestrator-fast.result != 'success'
+        run: exit 1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install pinned model tools
+        run: scripts/orch-setup.sh
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: orchestrator-fast-${{ github.sha }}
+          path: target/orch-verify
+      - name: Require release evidence
+        run: python3 scripts/orch-release-check.py
+      - name: Save release receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: orchestrator-release-${{ github.sha }}
+          path: target/orch-verify/release

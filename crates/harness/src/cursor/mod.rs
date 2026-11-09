@@ -674,6 +674,7 @@ async fn run_session(session: Session) {
     let RunControls {
         realtime: _,
         execution_lease: _execution_lease,
+        strict_resume: _,
         request_input: _request_input,
         mut steering,
         interrupt,

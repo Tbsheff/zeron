@@ -16,6 +16,7 @@ async fn live_run(cancel: bool) {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         steering,
         interrupt: interrupt.clone(),
         request_input: Box::new(|_| {

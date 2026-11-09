@@ -29,6 +29,7 @@ async fn main() -> anyhow::Result<()> {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         request_input: Box::new(|_| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             let _ = tx.send(Vec::new());

@@ -1056,9 +1056,12 @@ impl ClaudeHarness {
         }));
 
         Ok(futures::stream::unfold(event_rx, |mut rx| async move {
-            rx.recv()
-                .await
-                .map(|ev| (ev.map(|ev| crate::with_failure(HarnessId::ClaudeCode, ev)), rx))
+            rx.recv().await.map(|ev| {
+                (
+                    ev.map(|ev| crate::with_failure(HarnessId::ClaudeCode, ev)),
+                    rx,
+                )
+            })
         })
         .boxed())
     }
@@ -1283,6 +1286,7 @@ async fn run_session(session: Session) {
     let RunControls {
         realtime: _,
         execution_lease: _execution_lease,
+        strict_resume,
         request_input,
         mut steering,
         interrupt,
@@ -1375,6 +1379,19 @@ async fn run_session(session: Session) {
 
     'main: loop {
         if std::mem::take(&mut relaunch) {
+            if strict_resume {
+                let _ = event_tx
+                    .send(Ok(AgentEvent::Done {
+                        status: DoneStatus::Errored,
+                        result: None,
+                        error: Some("Session not found: strict Claude resume rejected".into()),
+                        session_id: launched.resume.clone(),
+                        failure: Some(zeron_proto::FailureClass::ProviderError),
+                    }))
+                    .await;
+                turn_open = false;
+                break 'main;
+            }
             // The CLI had no conversation for the session and exited
             // without starting one. Everything written to it goes to a fresh
             // process; its own init reports the new session id.
@@ -2347,13 +2364,22 @@ mod tests {
             name: "zeron".into(),
             command: "zeron-engine".into(),
             args: vec!["mcp".into()],
-            env: env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
         };
         let waits = (McpServer::WAITS_ON_BACKGROUND_ENV, "1");
         let chat = (McpServer::CHAT_ID_ENV, "c1");
         let full = appended(Some(server(&[chat, waits]))).unwrap();
-        assert!(full.contains("Ordinary coding tasks need no Zeron tools."), "{full}");
-        assert!(full.contains("call the Zeron tool `wait_on_background`"), "{full}");
+        assert!(
+            full.contains("Ordinary coding tasks need no Zeron tools."),
+            "{full}"
+        );
+        assert!(
+            full.contains("call the Zeron tool `wait_on_background`"),
+            "{full}"
+        );
         assert!(full.contains("`show_visual`"), "{full}");
         let in_chat = appended(Some(server(&[chat]))).unwrap();
         assert!(!in_chat.contains("wait_on_background") && in_chat.contains("`show_visual`"));

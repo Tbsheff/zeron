@@ -154,10 +154,12 @@ impl MuseHarness {
         let interrupt_grace = self.interrupt_grace;
         tokio::spawn(async move {
             let mut runner = session::Runner::new(host, tx, request, read_only);
+            runner.strict_resume = controls.strict_resume;
             // The lease lives through shutdown even if the consumer drops its stream.
             let RunControls {
                 realtime: _,
                 execution_lease: _lease,
+                strict_resume: _,
                 request_input,
                 mut steering,
                 interrupt,
@@ -191,14 +193,12 @@ impl MuseHarness {
             runner.host.shutdown(kill_grace).await;
             let _ = runner.finish().await;
         });
-        Ok(
-            futures::stream::unfold(rx, |mut rx| async move {
-                rx.recv()
-                    .await
-                    .map(|v| (v.map(|ev| crate::with_failure(HarnessId::Muse, ev)), rx))
-            })
-            .boxed(),
-        )
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv()
+                .await
+                .map(|v| (v.map(|ev| crate::with_failure(HarnessId::Muse, ev)), rx))
+        })
+        .boxed())
     }
 }
 

@@ -43,7 +43,7 @@ const RPC_LIMIT: Duration = Duration::from_secs(60);
 
 const DELEGATE_DESCRIPTION: &str = "Start one child agent on `task`. It gets only `task`, no history from this chat: put in what it needs, no secrets. isolation worktree: a separate checkout. Keep `taskId` for task_status and task_cancel. Default mode async: the result is pushed to you when the child ends, so end your turn. Mode wait only if this turn needs the answer. A child's question ends a wait; answer it with respond_to_input {chat: childThreadId}.";
 
-const STATUS_DESCRIPTION: &str = "Read one task you delegated. Do not call it on a running task before its completion wakes you. `summary` is the final result; reading it marks it delivered.";
+const STATUS_DESCRIPTION: &str = "List your app and native tasks when taskId is absent. With taskId, read one task you delegated. Do not call it on a running task before its completion wakes you. `summary` is the final result; reading it marks it delivered.";
 
 const CANCEL_DESCRIPTION: &str = "Stop one delegated task by `taskId`: its running and queued turns and its own delegates. A finished task keeps its result.";
 
@@ -53,6 +53,7 @@ fn task_output() -> Value {
         "properties": {
             "taskId": { "type": "string" }, "childThreadId": { "type": "string" },
             "status": { "type": "string", "enum": ["queued", "running", "waiting", "completed", "failed", "cancelled", "interrupted"] },
+            "origin": {"type":"string","enum":["app","native"]}, "background":{"type":["boolean","null"]},
             "summary": { "type": ["string", "null"] }, "hasPendingQuestion": { "type": "boolean" },
             "waitTimedOut": { "type": "boolean" }, "next": { "type": "string" }
         },
@@ -96,8 +97,10 @@ pub(super) fn catalog() -> Vec<ToolDef> {
             name: TASK_STATUS,
             title: "Get delegated task status",
             description: STATUS_DESCRIPTION,
-            input_schema: json!({ "type": "object", "properties": task_id(), "required": ["taskId"] }),
-            output_schema: Some(task_output()),
+            input_schema: json!({ "type": "object", "properties": task_id() }),
+            output_schema: Some(
+                json!({"oneOf":[task_output(),{"type":"object","properties":{"tasks":{"type":"array","items":task_output()}},"required":["tasks"]}]}),
+            ),
             hints: Hints::WRITE.idempotent(),
             always_load: false,
             example: r#"{"taskId":"task-1"}"#,
@@ -184,7 +187,7 @@ struct DelegateArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct StatusArgs {
-    task_id: String,
+    task_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -312,7 +315,7 @@ impl Tools {
 
     pub(super) async fn delegate(&self, name: &str, args: Value) -> Result<Value, ToolError> {
         match name {
-            DELEGATE_TASK => self.delegate_task(parse(args)?).await,
+            DELEGATE_TASK => self.delegate_task(parse(args.clone())?, args).await,
             TASK_STATUS => self.task_status(parse(args)?).await,
             _ => self.task_cancel(parse(args)?).await,
         }
@@ -327,11 +330,12 @@ impl Tools {
         })
     }
 
-    async fn delegate_task(&self, args: DelegateArgs) -> Result<Value, ToolError> {
+    async fn delegate_task(&self, args: DelegateArgs, observed: Value) -> Result<Value, ToolError> {
         check_delegate(&args)?;
         let origin = self.origin_chat()?;
         let child = self.delegate_child(&args.target, args.isolation).await?;
-        let params = delegate_params(&origin, &args, child);
+        let mut params = delegate_params(&origin, &args, child);
+        params["observedInput"] = observed;
         let limit = rpc_limit(&params);
         self.orch_call(methods::ORCH_DELEGATE, params, limit).await
     }
@@ -368,7 +372,9 @@ impl Tools {
     }
 
     async fn task_status(&self, args: StatusArgs) -> Result<Value, ToolError> {
-        check_task_id(&args.task_id)?;
+        if let Some(id) = args.task_id.as_deref() {
+            check_task_id(id)?;
+        }
         let params = json!({ "originChatId": self.origin_chat()?, "taskId": args.task_id });
         self.orch_call(methods::ORCH_TASK_STATUS, params, RPC_LIMIT)
             .await
@@ -393,7 +399,7 @@ impl Tools {
             .await
     }
 
-    async fn orch_call(
+    pub(super) async fn orch_call(
         &self,
         method: &str,
         params: Value,

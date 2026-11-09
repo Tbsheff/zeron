@@ -219,5 +219,42 @@ fn message_ok(s: &OrchState, m: Message) -> bool {
             .get(&parent)
             .is_some_and(|p| p.cohort(run).is_some()),
         Message::Stop { child, .. } => s.threads.get(&child).is_some_and(|c| c.parent.is_some()),
+        Message::QuestionUp {
+            child,
+            qid,
+            epoch,
+            to,
+        } => {
+            s.questions
+                .get(&(child, qid))
+                .is_some_and(|q| epoch <= q.epoch)
+                && to.is_none_or(|t| s.threads.contains_key(&t))
+        }
+        Message::AnswerDown {
+            child,
+            qid,
+            epoch,
+            via,
+            ..
+        } => {
+            s.questions
+                .get(&(child, qid))
+                .is_some_and(|q| epoch <= q.epoch)
+                && s.threads.contains_key(&via)
+        }
+        Message::QuestionRelease {
+            child, qid, via, ..
+        } => s.questions.contains_key(&(child, qid)) && s.threads.contains_key(&via),
+        Message::QuestionClosed {
+            child,
+            qid,
+            epoch,
+            to,
+        } => {
+            s.questions
+                .get(&(child, qid))
+                .is_some_and(|q| epoch <= q.epoch)
+                && s.threads.contains_key(&to)
+        }
     }
 }

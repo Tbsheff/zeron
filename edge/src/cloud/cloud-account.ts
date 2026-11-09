@@ -1048,9 +1048,17 @@ export class CloudAccount extends DurableObject<Env> {
     }
     const parent = this.sessions.get(parentChatId);
     if (!parent) return fail(404, "unknown_session", "No Cloud session for the parent chat.");
-    if (parent.parentChatId !== undefined) {
-      return fail(403, "too_deep", "A delegated chat can't start chats of its own.");
+    let depth = 0;
+    let ancestor: SessionRecord | undefined = parent;
+    const seen = new Set<string>();
+    while (ancestor?.parentChatId !== undefined) {
+      if (seen.has(ancestor.chatId)) return fail(403, "too_deep", "Invalid session ancestry.");
+      seen.add(ancestor.chatId);
+      depth++;
+      ancestor = this.sessions.get(ancestor.parentChatId);
+      if (!ancestor) return fail(403, "too_deep", "Unknown session ancestry.");
     }
+    if (depth >= 2) return fail(403, "too_deep", "Delegation depth limit is 2.");
     const existing = this.sessions.get(chatId);
     if (existing && existing.parentChatId !== parentChatId) {
       return fail(409, "conflict", "That chat already has a Cloud session.");

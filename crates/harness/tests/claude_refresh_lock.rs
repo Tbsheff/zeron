@@ -103,6 +103,7 @@ async fn a_run_is_torn_down_only_once_no_login_refresh_is_in_flight() {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         steering,
         interrupt: CancellationToken::new(),
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),

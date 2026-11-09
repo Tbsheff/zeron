@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 /// builds may share a semver with upstream while exposing a different RPC and
 /// document surface.
 pub mod capabilities {
+    pub const ORCH_V2: &str = "orch-v2";
     /// The host decodes durable composer references at the harness boundary.
     pub const COMPOSER_REFERENCES_V1: &str = "composer-references-v1";
     pub const MESSAGE_QUEUE_V1: &str = "message-queue-v1";

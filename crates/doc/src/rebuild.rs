@@ -77,6 +77,9 @@ pub fn rebuild_thin_doc(source: &SessionDoc) -> Result<ThinRebuild, DocError> {
             commands_copied += 1;
         }
     }
+    for message in source.read_orch_out()? {
+        thin.append_orch_out(&message)?;
+    }
     thin.doc().commit();
 
     Ok(ThinRebuild {

@@ -22,6 +22,7 @@ async fn turn(
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         steering,
         interrupt: token.clone(),
         request_input: Box::new(|_| {
@@ -147,6 +148,7 @@ async fn parked(harness: &CursorHarness, count: usize) {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         steering,
         interrupt: CancellationToken::new(),
         request_input: Box::new(|_| {
@@ -264,6 +266,7 @@ async fn burst(harness: &CursorHarness, count: usize, cancel: bool) {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         steering,
         interrupt: token.clone(),
         request_input: Box::new(|_| {
@@ -409,6 +412,7 @@ async fn history(harness: &CursorHarness, count: usize) {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         steering,
         interrupt: CancellationToken::new(),
         request_input: Box::new(|_| {

@@ -157,6 +157,9 @@ fn new_projectless_cwd(
 /// show the account's one Cloud device instead).
 fn device_capabilities() -> Vec<String> {
     let mut capabilities = zeron_proto::capabilities::current();
+    if crate::orchestrator::flag_from_env() {
+        capabilities.push(zeron_proto::capabilities::ORCH_V2.to_string());
+    }
     if crate::runner::session().is_some() {
         capabilities.push(zeron_proto::CLOUD_SESSION_CAPABILITY.to_string());
     }
@@ -1235,7 +1238,11 @@ impl WorkspaceHost {
         Ok(self.mutate(|doc| doc.rename_space(space_id, name))?)
     }
 
-    pub fn set_space_icon(&self, space_id: &str, icon: Option<&zeron_proto::SpaceIcon>) -> Result<bool, EngineError> {
+    pub fn set_space_icon(
+        &self,
+        space_id: &str,
+        icon: Option<&zeron_proto::SpaceIcon>,
+    ) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.set_space_icon(space_id, icon))?)
     }
 

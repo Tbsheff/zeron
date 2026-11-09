@@ -70,6 +70,8 @@ struct DocPartJson {
     id: String,
     kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    orchestration: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
@@ -158,6 +160,19 @@ struct DocPartJson {
 /// App parts → doc part json (mirror of `toDocParts`).
 fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
     Ok(match part {
+        MessagePart::TaskResults { id, .. }
+        | MessagePart::Handoff { id, .. }
+        | MessagePart::MergeBack { id, .. } => DocPartJson {
+            id: id.clone(),
+            kind: match part {
+                MessagePart::TaskResults { .. } => "taskResults",
+                MessagePart::Handoff { .. } => "handoff",
+                _ => "mergeBack",
+            }
+            .into(),
+            orchestration: Some(serde_json::to_value(part)?),
+            ..Default::default()
+        },
         MessagePart::Image {
             id,
             path,
@@ -288,6 +303,22 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
 /// Doc part json → app part (mirror of `fromDocParts`; malformed degrades to empty text).
 fn from_doc_part(p: DocPartJson) -> MessagePart {
     match p.kind.as_str() {
+        "taskResults" | "handoff" | "mergeBack" => {
+            let decoded = p
+                .orchestration
+                .and_then(|v| serde_json::from_value::<MessagePart>(v).ok());
+            match decoded {
+                Some(
+                    part @ (MessagePart::TaskResults { .. }
+                    | MessagePart::Handoff { .. }
+                    | MessagePart::MergeBack { .. }),
+                ) if part.id() == p.id => part,
+                _ => MessagePart::Text {
+                    id: p.id,
+                    text: String::new(),
+                },
+            }
+        }
         "image" => image_part(p.id, p.path, p.name, p.mime_type),
         "visual" => match p.path.filter(|path| !path.is_empty()) {
             Some(path) => MessagePart::Visual {
@@ -566,7 +597,11 @@ impl SessionDoc {
 
     /// [`push_message`](Self::push_message), but inserted before the last
     /// `from_end` entries of the messages list (clamped to its start).
-    pub fn insert_message_before_last(&self, from_end: usize, entry: &SessionMessageEntry) -> Result<(), DocError> {
+    pub fn insert_message_before_last(
+        &self,
+        from_end: usize,
+        entry: &SessionMessageEntry,
+    ) -> Result<(), DocError> {
         let messages = self.doc.get_list("messages");
         let at = messages.len().saturating_sub(from_end);
         let map = messages.insert_container(at, LoroMap::new())?;
@@ -657,6 +692,30 @@ impl SessionDoc {
             first.id = root;
         }
         Ok(join_continuation_entries(entries))
+    }
+
+    pub fn read_orch_out(&self) -> Result<Vec<crate::OrchMessage>, DocError> {
+        let raw = self
+            .doc
+            .get_list("orch_out")
+            .get_deep_value()
+            .to_json_value();
+        let rows: Vec<serde_json::Value> = serde_json::from_value(raw)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| serde_json::from_value(row).ok())
+            .collect())
+    }
+
+    pub fn append_orch_out(&self, message: &crate::OrchMessage) -> Result<bool, DocError> {
+        if self.read_orch_out()?.iter().any(|row| row.id == message.id) {
+            return Ok(false);
+        }
+        self.doc
+            .get_list("orch_out")
+            .push(loro_value_from_json(&serde_json::to_value(message)?))?;
+        self.doc.commit();
+        Ok(true)
     }
 
     /// Read the commands ledger.
@@ -1103,6 +1162,9 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     }
     if let Some(lines) = doc_part.output_lines {
         map.insert("outputLines", lines as i64)?;
+    }
+    if let Some(payload) = &doc_part.orchestration {
+        map.insert("orchestration", loro_value_from_json(payload))?;
     }
     Ok(())
 }
@@ -1590,6 +1652,9 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     if let Some(lines) = doc_part.output_lines {
         map.insert("outputLines", lines as i64)?;
     }
+    if let Some(payload) = &doc_part.orchestration {
+        map.insert("orchestration", loro_value_from_json(payload))?;
+    }
     if let Some(text) = &doc_part.text {
         // Defensive path only — the fold never rewrites earlier text.
         if let Some(loro::ValueOrContainer::Container(loro::Container::Text(t))) = map.get("text") {
@@ -1867,7 +1932,11 @@ mod tests {
         w.count_duration_from(now - 1_000);
         w.finish(&[], MessageStatus::Complete).unwrap();
         let entry = &doc.read_entries().unwrap()[0];
-        assert_eq!(entry.created_at, now - 5_000, "the entry's own time is kept");
+        assert_eq!(
+            entry.created_at,
+            now - 5_000,
+            "the entry's own time is kept"
+        );
         let duration = entry.duration_ms.unwrap();
         assert!((60_000..65_000).contains(&duration), "{duration}");
     }
@@ -2653,5 +2722,92 @@ mod context_usage_tests {
         assert_eq!(rebuilt.context_usage(), host.context_usage());
         rebuilt.clear_context_usage().unwrap();
         assert_eq!(rebuilt.context_usage(), None);
+    }
+}
+
+#[cfg(test)]
+mod orchestration_parts_tests {
+    use super::*;
+    use crate::{ContextCoverage, TaskResultPart};
+
+    fn coverage() -> ContextCoverage {
+        ContextCoverage {
+            transfer_id: "transfer-1".into(),
+            source_chat_id: "source".into(),
+            base_message_id: None,
+            point_message_id: "m2".into(),
+            selected_message_ids: vec!["m1".into(), "m2".into()],
+            omitted_count: 1,
+        }
+    }
+
+    #[test]
+    fn orchestration_parts_survive_document_export_and_import() {
+        let doc = SessionDoc::init("orchestration-roundtrip").unwrap();
+        let parts = vec![
+            MessagePart::Handoff {
+                id: "handoff-1".into(),
+                strategy: "portable_replay".into(),
+                coverage: coverage(),
+            },
+            MessagePart::MergeBack {
+                id: "merge-1".into(),
+                coverage: coverage(),
+            },
+            MessagePart::TaskResults {
+                id: "results-1".into(),
+                results: vec![TaskResultPart {
+                    task_id: "task-1".into(),
+                    chat_id: "child".into(),
+                    status: "completed".into(),
+                    text: "Finished the requested work.".into(),
+                    truncated: false,
+                }],
+            },
+        ];
+        doc.push_message(&SessionMessageEntry {
+            id: "message-1".into(),
+            role: MessageRole::System,
+            parts: parts.clone(),
+            created_at: 0,
+            device_id: "test-device".into(),
+            status: None,
+            continuation_of: None,
+            duration_ms: None,
+        })
+        .unwrap();
+        assert_eq!(doc.read_entries().unwrap()[0].parts, parts);
+        let bytes = doc.doc().export(loro::ExportMode::Snapshot).unwrap();
+        let peer = SessionDoc::init("orchestration-peer").unwrap();
+        peer.doc().import(&bytes).unwrap();
+        assert_eq!(peer.read_entries().unwrap()[0].parts, parts);
+    }
+
+    #[test]
+    fn orchestration_parts_degrade_without_content_for_old_readers() {
+        let part = MessagePart::Handoff {
+            id: "handoff-1".into(),
+            strategy: "portable_replay".into(),
+            coverage: coverage(),
+        };
+        let value = serde_json::to_value(to_doc_part(&part).unwrap()).unwrap();
+        assert_eq!(value["kind"], "handoff");
+        assert!(value.get("text").is_none());
+        assert_eq!(
+            value
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
+            ""
+        );
+        let malformed = DocPartJson {
+            id: "x".into(),
+            kind: "handoff".into(),
+            orchestration: Some(serde_json::json!({"kind":"text", "id":"x", "text":"bad"})),
+            ..Default::default()
+        };
+        assert!(
+            matches!(from_doc_part(malformed), MessagePart::Text { text, .. } if text.is_empty())
+        );
     }
 }

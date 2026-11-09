@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Rust replay plus the TLA durable receipt/replay projection, not full ZeronImpl.
+set -euo pipefail
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+OUT=${ORCH_TRACE_MERGED:-"$ROOT/target/orch-verify/merged.jsonl"}
+OUT=$(python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$OUT")
+python3 "$ROOT/scripts/orch-trace.py" --out "$OUT" "$@"
+cd "$ROOT"
+CARGO_BUILD_JOBS=3 cargo run --locked -p zeron-engine --example orch_trace -- "$OUT"
+MODEL="$(dirname "$OUT")/trace-model"
+python3 scripts/orch-trace-model.py "$OUT" --out "$MODEL"
+cp verification/orchestrator/tla/TraceLedger.tla "$MODEL/TraceLedger.tla"
+cd "$MODEL"
+"$ROOT/verification/orchestrator/node_modules/.bin/tla-ts" -workers 4 -config TraceReplay.cfg TraceReplay.tla

@@ -52,7 +52,9 @@ async fn the_flag_off_lists_todays_tools_and_refuses_the_delegate_tools() {
     let today: Vec<&str> = catalog()
         .iter()
         .map(|t| t.name)
-        .filter(|n| !delegate::NAMES.contains(n) && *n != WAIT_ON_BACKGROUND)
+        .filter(|n| {
+            !delegate::NAMES.contains(n) && *n != transfer::NAME && *n != WAIT_ON_BACKGROUND
+        })
         .collect();
     assert_eq!(names(&off), today);
     assert_eq!(today.len(), 15);
@@ -78,7 +80,7 @@ async fn the_flag_on_lists_the_three_tools_with_annotations_and_output_schemas()
     let on = tools(world(Ok(running())), orchestrating("chat-alpha-1"));
     assert!(on.guidance_features().delegation);
     let listed: Vec<ListedTool> = on.list().into_iter().map(ListedTool::from).collect();
-    assert_eq!(listed.len(), 18);
+    assert_eq!(listed.len(), 19);
     let hints = |name: &str| {
         let tool = listed.iter().find(|t| t.name == name).unwrap();
         assert_eq!(
@@ -140,6 +142,10 @@ async fn delegate_task_resolves_the_target_and_passes_the_engine_result_through(
     let expected = json!({
         "originChatId": "chat-alpha-1", "task": "Add tests.", "title": "Tests", "role": "test",
         "mode": "wait", "timeoutMs": 5000, "clientRequestId": "r1",
+        "observedInput": {
+            "task":"Add tests.","title":" Tests ","role":"test","mode":"wait","timeoutMs":5000,
+            "clientRequestId":"r1","target":{"project":"space-1","model":"opus"}
+        },
         "child": {
             "chatId": child["chatId"], "deviceId": "dev-local", "spaceId": "space-1",
             "config": { "harness": "claude-code", "model": "opus", "reasoning": null, "modelOptions": {}, "sandbox": "workspace-write" }
@@ -296,4 +302,70 @@ async fn task_status_and_task_cancel_send_their_params() {
         )
         .await;
     assert_eq!(long.unwrap_err().code, crate::error::INVALID_ARGUMENTS);
+}
+
+#[tokio::test]
+async fn context_transfer_actions_use_the_agent_source_and_stable_fork_target() {
+    let world = world(Ok(json!({"status":"pending"})));
+    let on = tools(world.clone(), orchestrating("chat-alpha-1"));
+    on.call(
+        "transfer_context",
+        json!({"action":"merge_back","clientRequestId":"merge-1"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        orch_writes(&world, "orch.transfer_context"),
+        [json!({"action":"merge_back","clientRequestId":"merge-1","originChatId":"chat-alpha-1"})]
+    );
+    on.call(
+        "transfer_context",
+        json!({"action":"fork","targetChatId":"fork-1"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        orch_writes(&world, methods::FORK_SIDE_CHAT),
+        [json!({"chatId":"fork-1","sourceChatId":"chat-alpha-1"})]
+    );
+    assert!(
+        on.call("transfer_context", json!({"action":"fork"}))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn messaging_an_owned_task_uses_the_followup_action_and_returns_task_id() {
+    let world = Arc::new(World {
+        orch_reply: Some(Ok(running())),
+        extra_chats: vec![json!({
+            "id":"managed-child","deviceId":"dev-local","title":"Managed","archived":false,
+            "parentChatId":"chat-alpha-1","childKind":"subagent",
+            "config":{"harness":"claude-code","sandbox":"workspace-write","access":"full-access"},
+            "createdAt":"2026-09-01T00:00:00Z"
+        })],
+        ..Default::default()
+    });
+    let out = tools(world.clone(), orchestrating("chat-alpha-1"))
+        .legacy(
+            "send_message",
+            json!({"chat":"Managed","text":"Next task","clientRequestId":"next-task"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(out["taskId"], "task-1");
+    let sent = orch_writes(&world, methods::ORCH_DELEGATE);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["followup"], true);
+    assert_eq!(sent[0]["child"]["chatId"], "managed-child");
+    assert_eq!(sent[0]["clientRequestId"], "next-task");
+    assert!(
+        world
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(m, _)| !matches!(m.as_str(), methods::QUEUE_MESSAGE | methods::QUEUE_COMMAND))
+    );
 }

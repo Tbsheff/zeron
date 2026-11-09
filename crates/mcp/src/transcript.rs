@@ -158,6 +158,13 @@ fn render_one(entry: &SessionMessageEntry, options: RenderOptions) -> RenderedMe
                     }
                 }
             }
+            MessagePart::TaskResults { .. }
+            | MessagePart::Handoff { .. }
+            | MessagePart::MergeBack { .. } => {
+                if let Some(text) = part.orchestration_text() {
+                    tools.push(text);
+                }
+            }
             MessagePart::Error { message, .. } => errors.push(message.clone()),
             // The fork seam is a transcript marker, not agent content: an
             // orchestrator reads the copied history as ordinary turns.

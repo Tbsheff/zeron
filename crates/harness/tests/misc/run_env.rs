@@ -59,6 +59,7 @@ fn controls() -> RunControls {
     RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         request_input: Box::new(|_: Vec<UserInputQuestion>| {
             let (tx, rx) = oneshot::channel::<Vec<UserInputAnswer>>();
             let _ = tx.send(Vec::new());

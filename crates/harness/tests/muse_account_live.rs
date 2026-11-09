@@ -93,6 +93,7 @@ async fn an_approved_device_login_runs_real_turns_and_signs_out() {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         steering,
         interrupt: CancellationToken::new(),
         request_input: Box::new(|_| {
@@ -180,6 +181,7 @@ async fn a_real_turn_reports_the_subscriptions_usage() {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         steering,
         interrupt: CancellationToken::new(),
         request_input: Box::new(|_| {

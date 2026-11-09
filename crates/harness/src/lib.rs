@@ -221,6 +221,7 @@ pub fn same_model_options(
 
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.
 pub struct RunControls {
+    pub strict_resume: bool,
     pub realtime: Option<codex::realtime::RealtimeControls>,
     /// Shared execution gate held until the harness has shut down and reaped
     /// its subprocess, including when the host drops the event stream. Each
@@ -343,6 +344,18 @@ pub trait Harness: Send + Sync {
     fn access_modes(&self) -> &[AccessMode] {
         &[AccessMode::FullAccess]
     }
+    fn native_resume(&self) -> bool {
+        false
+    }
+    fn native_fork(&self) -> bool {
+        false
+    }
+    fn inject_history(&self) -> bool {
+        true
+    }
+    fn context_window(&self) -> Option<usize> {
+        None
+    }
     /// Whether this driver honors [`RunRequest::plan`].
     fn supports_plan(&self) -> bool {
         false
@@ -420,16 +433,15 @@ mod background;
 pub use background::{MarkOutcome, MarkRefused, OutputSource};
 mod catalog;
 mod catalog_failure;
-mod failure;
 pub(crate) mod code_signature;
-/// Secret redaction, shared with the doc fold (command output tails).
-pub use zeron_proto::redact;
+mod failure;
 pub use catalog_failure::{CatalogFailure, CatalogFailureCode};
 pub use failure::{classify_failure, failure_of, with_failure};
 pub use zeron_proto::FailureClass;
+pub use zeron_proto::redact;
+pub mod agent_ports;
 pub mod claude;
 pub mod codex;
-pub mod agent_ports;
 pub mod cursor;
 pub(crate) mod executable;
 pub mod install;
@@ -437,8 +449,8 @@ pub(crate) mod jsonl_tail;
 pub(crate) mod jsonrpc;
 pub(crate) mod lossy_lines;
 pub mod mock;
-pub mod muse;
 mod model_context;
+pub mod muse;
 pub mod opencode;
 pub mod pi;
 pub mod process;
@@ -742,8 +754,8 @@ pub use acp::AcpHarness;
 pub use claude::ClaudeHarness;
 pub use codex::CodexHarness;
 pub use cursor::CursorHarness;
-pub use opencode::OpencodeHarness;
 pub use muse::MuseHarness;
+pub use opencode::OpencodeHarness;
 pub use pi::PiHarness;
 
 // ---------------------------------------------------------------------------

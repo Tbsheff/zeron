@@ -14,8 +14,8 @@ use zeron_harness::{
     CancellationToken, CodexHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use zeron_proto::{
-    AccessMode, AgentEvent, DoneStatus, FailureClass, HarnessId, ReasoningLevel, RunRequest, SandboxLevel,
-    TodoItem, TodoStatus, ToolCall, UserInputAnswer, UserInputQuestion,
+    AccessMode, AgentEvent, DoneStatus, FailureClass, HarnessId, ReasoningLevel, RunRequest,
+    SandboxLevel, TodoItem, TodoStatus, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
 fn fixture_path() -> PathBuf {
@@ -121,6 +121,7 @@ fn controls(
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -665,6 +666,7 @@ async fn approvals_round_trip_as_input_requests() {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         request_input: Box::new(move |questions| {
             seen.lock().unwrap().extend(questions.iter().cloned());
             let (tx, rx) = oneshot::channel();
@@ -788,7 +790,10 @@ async fn auto_accept_edits_applies_file_changes_and_asks_before_the_rest() {
     let asked = asked.lock().unwrap();
     let headers: Vec<&str> = asked.iter().map(|q| q.header.as_str()).collect();
     assert_eq!(headers, ["Approve command", "Approve permissions"]);
-    assert_eq!(asked[0].question, "Codex wants to run `git push`. Allow it?");
+    assert_eq!(
+        asked[0].question,
+        "Codex wants to run `git push`. Allow it?"
+    );
 }
 
 #[tokio::test]
@@ -2623,4 +2628,21 @@ async fn an_app_server_that_keeps_dying_reports_what_it_printed() {
         "4",
         "one launch + three relaunches"
     );
+}
+
+#[tokio::test]
+async fn strict_resume_never_starts_a_fresh_thread() {
+    let (mut controls, _steer, _token) = controls("Yes");
+    controls.strict_resume = true;
+    let mut req = request("scenario:resumed");
+    req.resume = Some("resume-fail".into());
+    let events = run_to_end(&harness(), req, controls).await;
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::SessionStarted { .. } | AgentEvent::TextDelta { .. }
+        )),
+        "{events:?}"
+    );
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::Done { status:DoneStatus::Errored, error:Some(error), .. } if error.contains("Session not found"))), "{events:?}");
 }

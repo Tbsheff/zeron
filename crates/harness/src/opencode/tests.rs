@@ -331,6 +331,7 @@ impl TurnWire {
             controls: RunControls {
                 realtime: None,
                 execution_lease: None,
+                strict_resume: overrides["strictResume"].as_bool().unwrap_or(false),
                 request_input: Box::new(move |questions| {
                     let answer = answer.expect("fixture must not ask for input");
                     questions_asked.lock().unwrap().extend(questions.clone());
@@ -3659,6 +3660,7 @@ http.createServer((req, res) => {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
         steering,
         interrupt: tokio_util::sync::CancellationToken::new(),
@@ -3820,6 +3822,7 @@ async fn scripted_run(
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
         steering,
         interrupt: tokio_util::sync::CancellationToken::new(),
@@ -4005,6 +4008,7 @@ async fn wedged_run(base: String, timeouts: BusTimeouts) -> (Option<String>, Don
         controls: RunControls {
             realtime: None,
             execution_lease: None,
+            strict_resume: false,
             request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
             steering,
             interrupt: tokio_util::sync::CancellationToken::new(),
@@ -4105,6 +4109,7 @@ async fn a_stopped_server_process_fails_the_turn_and_is_torn_down() {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        strict_resume: false,
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
         steering,
         interrupt: tokio_util::sync::CancellationToken::new(),
@@ -4149,4 +4154,50 @@ async fn a_stopped_server_process_fails_the_turn_and_is_torn_down() {
         .success();
     assert!(!alive, "the stopped server {pid} outlived its run");
     drop(steer_tx);
+}
+
+#[tokio::test]
+async fn strict_resume_never_creates_a_fresh_session() {
+    for v2 in [false, true] {
+        let mut wire = TurnWire::start_config(
+            false,
+            v2,
+            true,
+            None,
+            "2.0.11",
+            json!({"resume":"missing", "strictResume":true}),
+            false,
+        )
+        .await;
+        let events = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut events = vec![];
+            while let Some(event) = wire.events.recv().await {
+                let event = event.unwrap();
+                let done = matches!(event, AgentEvent::Done { .. });
+                events.push(event);
+                if done {
+                    break;
+                }
+            }
+            events
+        })
+        .await
+        .unwrap();
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                AgentEvent::SessionStarted { .. } | AgentEvent::TextDelta { .. }
+            )),
+            "{events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Done { status:DoneStatus::Errored, error:Some(error), .. } if error.contains("Session not found"))), "{events:?}");
+        assert!(
+            !wire
+                .posts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(path, _)| path == "/session" || path == "/api/session")
+        );
+    }
 }
