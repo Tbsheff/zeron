@@ -1,7 +1,9 @@
 pub mod driver;
 pub mod fake;
+mod sink;
 pub mod store;
 pub mod trace;
+pub mod wire;
 
 #[cfg(test)]
 mod faults_tests;
@@ -11,6 +13,7 @@ mod trace_tests;
 pub use driver::{ApplyResult, Driver, EffectSink, FaultPoint, SinkError, effect_id};
 pub use fake::RecordingSink;
 pub use store::{Applied, OutboxRow};
+pub use wire::{OrchOptions, OrchWire, flag_from_env};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DriverError {

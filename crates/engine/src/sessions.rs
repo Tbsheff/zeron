@@ -35,6 +35,7 @@ use zeron_proto::{
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
+use crate::orchestrator::wire::{OrchWire, Pending, Ran, SendKind, Via};
 
 #[path = "session_activity.rs"]
 mod activity;
@@ -356,6 +357,7 @@ struct Inner {
     turn_listener: OnceLock<TurnListener>,
     /// Plugins whose native MCP servers local runs get (absent in bare tests).
     plugins: OnceLock<crate::plugins::Plugins>,
+    orch: OnceLock<Arc<OrchWire>>,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -406,7 +408,101 @@ impl SessionsEngine {
                 scratch_root: OnceLock::new(),
                 turn_listener: OnceLock::new(),
                 plugins: OnceLock::new(),
+                orch: OnceLock::new(),
             }),
+        }
+    }
+
+    pub fn enable_orchestrator(&self, wire: Arc<OrchWire>) -> bool {
+        if self.inner.orch.set(wire.clone()).is_err() {
+            return false;
+        }
+        wire.attach(Arc::new(self.clone()));
+        true
+    }
+
+    pub fn orchestrator(&self) -> Option<Arc<OrchWire>> {
+        self.inner.orch.get().cloned()
+    }
+
+    fn orch_for(&self, chat_id: &str) -> Option<Arc<OrchWire>> {
+        let wire = self.inner.orch.get()?;
+        self.inner
+            .workspace()
+            .is_some_and(|ws| ws.is_host_strict(chat_id))
+            .then(|| wire.clone())
+    }
+
+    pub(crate) fn orch_holds_queue(&self, chat_id: &str) -> bool {
+        self.orch_for(chat_id)
+            .is_some_and(|wire| wire.holds_queue(chat_id))
+    }
+
+    pub(crate) fn orchestrates(&self, chat_id: &str) -> bool {
+        self.orch_for(chat_id).is_some()
+    }
+
+    pub(crate) fn host(&self) -> Option<DocHost> {
+        self.inner.doc_host()
+    }
+
+    pub(crate) fn reviving_any(&self, chat_id: &str) -> bool {
+        lock(&self.inner.revivals).contains_key(chat_id)
+    }
+
+    pub(crate) fn journal_last_done(
+        &self,
+        chat_id: &str,
+    ) -> Option<(DoneStatus, Option<zeron_proto::FailureClass>)> {
+        match self.inner.journal.last_event(chat_id).ok()?? {
+            (
+                _,
+                AgentEvent::Done {
+                    status, failure, ..
+                },
+            ) => Some((status, failure)),
+            _ => None,
+        }
+    }
+
+    fn orch_send<'a>(
+        &'a self,
+        wire: &'a OrchWire,
+        pending: Pending,
+        kind: SendKind,
+    ) -> futures::future::BoxFuture<'a, Result<Ran, EngineError>> {
+        let steerable = self.live_run_steerable(&pending.chat);
+        Box::pin(wire.send(self, pending, kind, steerable))
+    }
+
+    pub(crate) async fn send_now(
+        &self,
+        chat_id: &str,
+        harness_id: HarnessId,
+        request: RunRequest,
+        message_id: Option<String>,
+    ) -> Result<String, EngineError> {
+        let Some(wire) = self.orch_for(chat_id) else {
+            self.stop_turn(chat_id).await?;
+            return self
+                .dispatch(chat_id, harness_id, request, message_id)
+                .await;
+        };
+        let pending = Pending {
+            chat: chat_id.to_owned(),
+            message_id: message_id.clone().unwrap_or_default(),
+            via: Via::Dispatch {
+                harness: harness_id,
+                request: Box::new(request.clone()),
+            },
+        };
+        match self.orch_send(&wire, pending, SendKind::SendNow).await? {
+            Ran::Started(id) => Ok(id),
+            Ran::Bypass => {
+                self.dispatch_with(chat_id, harness_id, request, message_id, false, 0, None)
+                    .await
+            }
+            _ => Ok(String::new()),
         }
     }
 
@@ -796,6 +892,24 @@ impl SessionsEngine {
         request: RunRequest,
         message_id: Option<String>,
     ) -> Result<String, EngineError> {
+        let revival = message_id
+            .as_deref()
+            .is_some_and(|id| self.inner.reviving(chat_id, id));
+        if let Some(wire) = self.orch_for(chat_id).filter(|_| !revival) {
+            let pending = Pending {
+                chat: chat_id.to_owned(),
+                message_id: message_id.clone().unwrap_or_default(),
+                via: Via::Dispatch {
+                    harness: harness_id,
+                    request: Box::new(request.clone()),
+                },
+            };
+            match self.orch_send(&wire, pending, SendKind::Person).await? {
+                Ran::Started(id) => return Ok(id),
+                Ran::Bypass => {}
+                _ => return Ok(String::new()),
+            }
+        }
         self.dispatch_with(chat_id, harness_id, request, message_id, false, 0, None)
             .await
     }
@@ -810,7 +924,7 @@ impl SessionsEngine {
     /// Boxed future: `drive_run` re-enters this for those retries, and the
     /// erasure breaks the opaque-type cycle the recursion would otherwise form.
     #[allow(clippy::too_many_arguments)]
-    fn dispatch_with<'a>(
+    pub(crate) fn dispatch_with<'a>(
         &'a self,
         chat_id: &'a str,
         harness_id: HarnessId,
@@ -1553,6 +1667,34 @@ impl SessionsEngine {
         message_id: Option<String>,
         issued_at: i64,
     ) -> Result<SteerOutcome, EngineError> {
+        let Some(wire) = self.orch_for(chat_id) else {
+            return self
+                .steer_now_direct(chat_id, prompt, attachments, message_id, issued_at)
+                .await;
+        };
+        let pending = Pending {
+            chat: chat_id.to_owned(),
+            message_id: message_id.unwrap_or_default(),
+            via: Via::Steer {
+                prompt: prompt.to_owned(),
+                attachments,
+                issued_at,
+            },
+        };
+        match self.orch_send(&wire, pending, SendKind::Person).await? {
+            Ran::Steered(outcome) => Ok(outcome),
+            _ => Ok(SteerOutcome::Accepted),
+        }
+    }
+
+    pub(crate) async fn steer_now_direct(
+        &self,
+        chat_id: &str,
+        prompt: &str,
+        attachments: Vec<String>,
+        message_id: Option<String>,
+        issued_at: i64,
+    ) -> Result<SteerOutcome, EngineError> {
         if self.steer_stops_tool(chat_id) && self.stop_turn_keeping_runtime(chat_id).await {
             let earlier = lock(&self.inner.runs)
                 .get(chat_id)
@@ -1647,6 +1789,11 @@ impl SessionsEngine {
     /// models never come here: they keep the runtime and its work.)
     pub async fn interrupt(&self, chat_id: &str) -> Result<bool, EngineError> {
         self.note_user_stop(chat_id);
+        if let Some(wire) = self.orch_for(chat_id)
+            && let Some(done) = Box::pin(wire.interrupt(self, chat_id)).await?
+        {
+            return Ok(done);
+        }
         self.terminate(chat_id).await
     }
 
@@ -2088,6 +2235,9 @@ impl SessionsEngine {
         self.inner
             .shutting_down
             .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(wire) = self.inner.orch.get() {
+            wire.detach();
+        }
         self.inner.voice.retire();
         if self
             .inner
@@ -2247,6 +2397,16 @@ impl Inner {
         // `SessionsEngine::note_user_stop`).
         if matches!(event, AgentEvent::Done { .. }) {
             self.journal.clear_user_stop(chat_id);
+        }
+        if let AgentEvent::Done {
+            status, failure, ..
+        } = event
+            && !self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+            && let Some(wire) = self.orch.get()
+        {
+            wire.provider_done(chat_id, *status, *failure);
         }
         if let Some(hub) = lock(&self.hubs).get(chat_id) {
             let _ = hub.send(JournaledEvent {
@@ -5607,6 +5767,9 @@ async fn drive_run(
                     tracing::warn!(chat = %chat, "orphaned steer lost: doc host unavailable");
                     break;
                 };
+                if let Some(wire) = engine.inner.orch.get() {
+                    wire.allow_redelivery(&chat, &steer.message_id);
+                }
                 if let Err(err) = host
                     .dispatch_with_source_context(
                         &engine,

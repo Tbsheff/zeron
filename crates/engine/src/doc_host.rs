@@ -1347,6 +1347,10 @@ impl DocHost {
     /// upload commit lands bytes on this device: a Run or queued row deferred
     /// on those bytes (`pending://` refs not yet on disk) becomes executable
     /// the moment its transfer completes — event-driven, not timer luck.
+    pub(crate) fn docs_store(&self) -> Arc<DocsStore> {
+        self.inner.store.clone()
+    }
+
     pub fn kick_drains(&self) {
         let handles: Vec<Arc<ChatDocHandle>> =
             lock(&self.inner.handles).values().cloned().collect();
@@ -4309,6 +4313,9 @@ impl DocHost {
             if sessions.turn_in_flight(&handle.chat_id) {
                 return; // All queued messages wait, including rows from older clients.
             }
+            if sessions.orch_holds_queue(&handle.chat_id) {
+                return;
+            }
             // A row from another device names its images by `pending://` ref
             // while the bytes chase it over the peer link. Hold it (in order)
             // until they land — UploadCommit re-drains — rather than handing
@@ -4531,7 +4538,8 @@ impl DocHost {
         // still a turn, and it has to be stopped before this one starts.
         // The message replaces the turn, not the agent: its background work
         // keeps running (only the user's Stop tears that down).
-        if send == QueueSend::Interrupt && sessions.turn_in_flight(chat_id) {
+        let send_now = send == QueueSend::Interrupt && sessions.orchestrates(chat_id);
+        if send == QueueSend::Interrupt && sessions.turn_in_flight(chat_id) && !send_now {
             sessions.stop_turn(chat_id).await?;
         }
         let previous = sessions.last_request(chat_id);
@@ -4556,6 +4564,13 @@ impl DocHost {
         request.resume = None; // dispatch re-derives the harness session
         request.attachments = attachments;
         let harness = self.harness_for_request(chat_id, &request);
+        if send_now {
+            self.stamp_source_context(chat_id, &request.cwd).await;
+            sessions
+                .send_now(chat_id, harness, request, Some(message_id))
+                .await?;
+            return Ok(());
+        }
         self.dispatch_with_source_context(&sessions, chat_id, harness, request, Some(message_id))
             .await?;
         Ok(())
@@ -5580,6 +5595,30 @@ impl DocHost {
         (at < stop_at).then_some(message_id)
     }
 
+    fn landed_before_dispatch(
+        &self,
+        sessions: &SessionsEngine,
+        handle: &Arc<ChatDocHandle>,
+        entry: &SessionCommandEntry,
+    ) -> Option<String> {
+        let message_id = match &entry.payload {
+            SessionCommandPayload::Run { message_id, .. } => message_id.clone(),
+            SessionCommandPayload::Steer {
+                message_id: Some(id),
+                ..
+            } => id.clone(),
+            _ => return None,
+        };
+        if !sessions.orchestrates(&handle.chat_id) {
+            return None;
+        }
+        let entries = handle.doc.read_entries().ok()?;
+        entries
+            .iter()
+            .any(|m| m.id == message_id)
+            .then_some(message_id)
+    }
+
     async fn execute(
         &self,
         sessions: &SessionsEngine,
@@ -5603,6 +5642,14 @@ impl DocHost {
             return Ok((
                 SessionCommandStatus::Applied,
                 Some("cancelled by the Stop sent after it".into()),
+            ));
+        }
+        if let Some(message_id) = self.landed_before_dispatch(sessions, handle, entry) {
+            tracing::info!(chat = %chat_id, message = %message_id,
+                "message already in the transcript: not run again (R18)");
+            return Ok((
+                SessionCommandStatus::Applied,
+                Some("already delivered".into()),
             ));
         }
         match &entry.payload {
@@ -6021,15 +6068,19 @@ impl DocHost {
         request: zeron_proto::RunRequest,
         message_id: Option<String>,
     ) -> Result<String, EngineError> {
+        self.stamp_source_context(chat_id, &request.cwd).await;
+        sessions
+            .dispatch(chat_id, harness, request, message_id)
+            .await
+    }
+
+    async fn stamp_source_context(&self, chat_id: &str, cwd: &str) {
         if let Some(workspace) = self.workspace()
-            && let Some(context) = self.capture_source_context(&request.cwd).await
+            && let Some(context) = self.capture_source_context(cwd).await
             && let Err(err) = workspace.set_chat_source_context(chat_id, &context)
         {
             tracing::warn!(chat = %chat_id, error = %err, "conversation source stamp failed");
         }
-        sessions
-            .dispatch(chat_id, harness, request, message_id)
-            .await
     }
 
     async fn materialize_worktree(

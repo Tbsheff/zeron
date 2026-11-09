@@ -842,6 +842,13 @@ impl WorkspaceHost {
         }
     }
 
+    pub fn is_host_strict(&self, chat_id: &str) -> bool {
+        matches!(
+            self.read(|doc| doc.chat(chat_id)),
+            Ok(Some(chat)) if chat.device_id == self.inner.config.device_id
+        )
+    }
+
     /// Claim-on-first-command: create the chat row under OUR device id when a run
     /// command arrives for a chat with no row yet. No-op when the row exists.
     ///

@@ -142,6 +142,28 @@ pub(crate) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+fn wire_orchestrator(
+    sessions: &SessionsEngine,
+    doc_host: &DocHost,
+    device_id: &str,
+    opts: orchestrator::OrchOptions,
+) -> Result<Arc<orchestrator::OrchWire>, EngineError> {
+    let wire = orchestrator::OrchWire::open(doc_host.docs_store(), device_id, opts)
+        .map_err(|e| EngineError::Other(format!("orchestrator: {e}")))?;
+    if !sessions.enable_orchestrator(wire.clone()) {
+        return Err(EngineError::Other("orchestrator already enabled".into()));
+    }
+    Ok(wire)
+}
+
+fn spawn_orchestrator_recovery(wire: Arc<orchestrator::OrchWire>, sessions: SessionsEngine) {
+    tokio::spawn(async move {
+        if let Err(err) = wire.recover(&sessions).await {
+            tracing::error!(error = %err, "orchestrator outbox replay failed");
+        }
+    });
+}
+
 pub(crate) fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -224,6 +246,15 @@ impl EngineCore {
         let user_id = env_or("ZERON_USER_ID", DEFAULT_USER_ID);
         let profile = EngineProfile::development(data_dir, &org_id, &user_id);
         Self::assemble_with_profile(profile, registry, default_harness, edge)
+    }
+
+    pub fn enable_orchestrator_v2(
+        &self,
+        opts: orchestrator::OrchOptions,
+    ) -> Result<Arc<orchestrator::OrchWire>, EngineError> {
+        let wire = wire_orchestrator(&self.sessions, &self.doc_host, &self.device_id, opts)?;
+        spawn_orchestrator_recovery(wire.clone(), self.sessions.clone());
+        Ok(wire)
     }
 
     pub fn assemble_with_identity(
@@ -337,6 +368,12 @@ impl EngineCore {
         }
         sessions.set_plugins(plugins.clone());
         sessions.set_doc_host(doc_host.clone());
+        let orch = orchestrator::flag_from_env()
+            .then(|| wire_orchestrator(&sessions, &doc_host, &device_id, Default::default()))
+            .and_then(|r| {
+                r.inspect_err(|err| tracing::error!(error = %err, "orchestrator v2 not enabled"))
+                    .ok()
+            });
         // A new version on trial may yet be undone, and recovering clears the
         // journals' marks of what to resume, which a rollback doesn't restore.
         // It waits for the commit (`update_trial`), with all other new work.
@@ -348,6 +385,9 @@ impl EngineCore {
                 Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
                 Err(err) => tracing::error!(error = %err, "stale-session recovery failed"),
             }
+        }
+        if let Some(wire) = orch {
+            spawn_orchestrator_recovery(wire, sessions.clone());
         }
         doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
         let repos = Repos::new(data_dir, &device_id);
