@@ -104,6 +104,69 @@ impl Driver {
         self.apply_cmd(key, None, event)
     }
 
+    pub fn apply_if(
+        &self,
+        key: &str,
+        event: Event,
+        enabled: &dyn Fn(&OrchState) -> bool,
+    ) -> Result<Option<ApplyResult>, DriverError> {
+        let out = self.store.transact(|tx| {
+            if store::receipt(tx, key)?.is_none() && !enabled(&loaded(tx)?) {
+                return Ok(None);
+            }
+            self.apply_tx(tx, key, None, &event).map(Some)
+        })?;
+        if out.as_ref().is_some_and(|o| !o.duplicate) {
+            self.faults.hit(FaultPoint::Fp1StepCommittedEffectNotRun)?;
+        }
+        Ok(out)
+    }
+
+    pub fn meta(&self, key: &str) -> Result<Option<String>, DriverError> {
+        self.store.transact(|tx| store::meta(tx, key))
+    }
+
+    pub fn put_meta(&self, key: &str, value: &str) -> Result<(), DriverError> {
+        self.store.transact(|tx| store::put_meta(tx, key, value))
+    }
+
+    pub fn delete_meta(&self, key: &str) -> Result<(), DriverError> {
+        self.store.transact(|tx| store::delete_meta(tx, key))
+    }
+
+    pub fn intern(&self, key: &str, counter: &str) -> Result<(u64, bool), DriverError> {
+        self.store.transact(|tx| {
+            if let Some(v) = store::meta(tx, key)? {
+                return parse_meta(key, &v).map(|n| (n, false));
+            }
+            let last = match store::meta(tx, counter)? {
+                Some(v) => parse_meta(counter, &v)?,
+                None => 0,
+            };
+            let n = last + 1;
+            store::put_meta(tx, counter, &n.to_string())?;
+            store::put_meta(tx, key, &n.to_string())?;
+            Ok((n, true))
+        })
+    }
+
+    pub fn bump(&self, counter: &str) -> Result<u64, DriverError> {
+        self.store.transact(|tx| {
+            let n = match store::meta(tx, counter)? {
+                Some(v) => parse_meta(counter, &v)? + 1,
+                None => 1,
+            };
+            store::put_meta(tx, counter, &n.to_string())?;
+            Ok(n)
+        })
+    }
+
+    pub fn complete(&self, effect_id: &str) -> Result<(), DriverError> {
+        self.faults.hit(FaultPoint::Fp2EffectRunNotMarked)?;
+        self.store.transact(|tx| store::mark_done(tx, effect_id))?;
+        Ok(())
+    }
+
     fn apply_cmd(
         &self,
         key: &str,
@@ -225,6 +288,11 @@ fn init(tx: &Transaction<'_>, device: &str, config: Config) -> Result<(), Driver
     store::save_state(tx, seq, &s)?;
     let line = serde_json::to_string(&trace::init_line(device, &s)?)?;
     store::put_trace(tx, seq, device, "Init", true, &line)
+}
+
+fn parse_meta(key: &str, v: &str) -> Result<u64, DriverError> {
+    v.parse()
+        .map_err(|_| DriverError::Corrupt(format!("orch_meta {key} = {v:?}")))
 }
 
 fn loaded(tx: &Transaction<'_>) -> Result<OrchState, DriverError> {

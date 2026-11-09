@@ -49,6 +49,11 @@ pub fn put_meta(tx: &Transaction<'_>, key: &str, value: &str) -> Result<(), Driv
     Ok(())
 }
 
+pub fn delete_meta(tx: &Transaction<'_>, key: &str) -> Result<(), DriverError> {
+    tx.execute("DELETE FROM orch_meta WHERE key = ?1", params![key])?;
+    Ok(())
+}
+
 pub fn last_seq(tx: &Transaction<'_>) -> Result<Option<u64>, DriverError> {
     let Some(v) = meta(tx, "seq")? else {
         return Ok(None);
