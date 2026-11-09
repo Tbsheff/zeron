@@ -14,6 +14,8 @@ const CODEX_ENTRY_MAX: usize = 4_000;
 const SHOW_VISUAL_MAX: usize = 3_072;
 const DESCRIPTION_MAX: usize = 1_024;
 const OPENCODE_UPFRONT_MAX: usize = 12_700;
+const OPENCODE_UPFRONT_ORCH_MAX: usize = 14_600;
+const DELEGATE_TOOLS: [&str; 3] = ["delegate_task", "task_status", "task_cancel"];
 
 fn bytes(value: &Value) -> usize {
     match value {
@@ -45,25 +47,44 @@ fn upfront_bytes(tool: &ListedTool) -> usize {
     tool.name.len() + tool.description.len() + bytes(&tool.input_schema)
 }
 
-fn in_chat(waits: bool) -> Origin {
+fn in_chat(waits: bool, orchestrator: bool) -> Origin {
     Origin {
         chat_id: Some("budget-chat".into()),
         waits_on_background: waits,
+        orchestrator,
         ..Default::default()
     }
 }
 
 async fn measure() -> Value {
-    let all = listed(in_chat(true)).await;
-    let opencode_tools = listed(in_chat(false)).await;
+    let mut out = measure_with(false).await;
+    let on = measure_with(true).await;
+    let only = |key: &str| -> BTreeMap<String, Value> {
+        on[key].as_object().unwrap().iter().filter(|(name, _)| DELEGATE_TOOLS.contains(&name.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+    out["orchestrator"] = json!({
+        "tools": only("tools"),
+        "descriptions": only("descriptions"),
+        "totals": on["totals"],
+        "instructions": on["instructions"],
+        "opencodeUpfront": on["opencodeUpfront"],
+    });
+    out
+}
+
+async fn measure_with(orchestrator: bool) -> Value {
+    let all = listed(in_chat(true, orchestrator)).await;
+    let opencode_tools = listed(in_chat(false, orchestrator)).await;
     let opencode_features = Features {
         visuals: true,
         waits: false,
         side_chats_only: true,
+        delegation: orchestrator,
     };
     let per_tool: BTreeMap<String, usize> = all.iter().map(|t| (t.name.clone(), tool_bytes(t))).collect();
     let descriptions: BTreeMap<String, usize> = all.iter().map(|t| (t.name.clone(), t.description.len())).collect();
-    let codex = agent_guidance::codex_entries(Features { waits: false, ..Features::all() }, None);
+    let claude_features = Features { delegation: orchestrator, ..Features::all() };
+    let codex = agent_guidance::codex_entries(Features { waits: false, ..claude_features }, None);
     json!({
         "tools": per_tool,
         "descriptions": descriptions,
@@ -77,11 +98,11 @@ async fn measure() -> Value {
         "instructions": {
             "mcpInstructionsChars": MCP_INSTRUCTIONS.chars().count(),
             "core": CORE.text.len(),
-            "claudeSystemPrompt": agent_guidance::text(Features::all()).len(),
+            "claudeSystemPrompt": agent_guidance::text(claude_features).len(),
             "codexLargestEntry": codex.iter().map(|(_, v)| v.len()).max().unwrap_or(0),
             "codexTotal": codex.iter().map(|(_, v)| v.len()).sum::<usize>(),
             "opencodeSystem": agent_guidance::text(opencode_features).len(),
-            "mcpFallback": MCP_INSTRUCTIONS.len() + 2 + agent_guidance::text(Features::all()).len(),
+            "mcpFallback": MCP_INSTRUCTIONS.len() + 2 + agent_guidance::text(claude_features).len(),
         },
         "opencodeUpfront": opencode_tools.iter().map(upfront_bytes).sum::<usize>()
             + agent_guidance::text(opencode_features).len(),
@@ -113,16 +134,21 @@ async fn agent_context_stays_inside_its_budget() {
         std::fs::write(BUDGET_FILE, serde_json::to_string_pretty(&now).unwrap() + "\n").unwrap();
     }
     let instructions = &now["instructions"];
+    let orchestrator = &now["orchestrator"];
     let hard = [
         ("MCP instructions chars", instructions["mcpInstructionsChars"].as_u64(), MCP_INSTRUCTIONS_MAX_CHARS),
         ("core guidance", instructions["core"].as_u64(), CORE_MAX),
         ("largest Codex entry", instructions["codexLargestEntry"].as_u64(), CODEX_ENTRY_MAX - 1),
         ("OpenCode upfront", now["opencodeUpfront"].as_u64(), OPENCODE_UPFRONT_MAX),
+        ("largest Codex entry, orchestrator on", orchestrator["instructions"]["codexLargestEntry"].as_u64(), CODEX_ENTRY_MAX - 1),
+        ("OpenCode upfront, orchestrator on", orchestrator["opencodeUpfront"].as_u64(), OPENCODE_UPFRONT_ORCH_MAX),
     ];
     for (what, measured, cap) in hard {
         assert!(measured.unwrap() as usize <= cap, "{what}: {measured:?} > {cap}");
     }
-    for (name, size) in now["descriptions"].as_object().unwrap() {
+    assert_eq!(orchestrator["descriptions"].as_object().unwrap().len(), DELEGATE_TOOLS.len());
+    let descriptions = now["descriptions"].as_object().unwrap().iter().chain(orchestrator["descriptions"].as_object().unwrap());
+    for (name, size) in descriptions {
         let cap = if name == "show_visual" { SHOW_VISUAL_MAX } else { DESCRIPTION_MAX };
         assert!(size.as_u64().unwrap() as usize <= cap, "{name} description: {size} > {cap}");
     }

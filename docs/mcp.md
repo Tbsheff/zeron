@@ -139,8 +139,9 @@ prompt, not in the MCP `instructions` (Claude Code cuts those at 4 KB, Codex
 shows only the first ~233 chars). `zeron_proto::agent_guidance` builds it from
 sections that match the run: core (always; opens "Ordinary coding tasks need
 no Zeron tools.", then a task → tool map and five rules), waits
-(`wait_on_background` offered), side chats (own subagents off), visuals (in a
-chat). Plugin instructions follow it.
+(`wait_on_background` offered), delegated tasks (`ZERON_ORCH_V2` on, in a
+chat), side chats (own subagents off), visuals (in a chat). Plugin instructions
+follow it.
 
 | Harness | Where the guidance goes |
 | ------- | ----------------------- |
@@ -228,6 +229,36 @@ example call), `not_found` (with "Did you mean …" for chats), `ambiguous`,
 (`list_chats {parent: "me"}`). A `clientRequestId` on a create or send request
 returns the first result again on retry (per server connection) instead of a
 second write.
+
+### Delegated tasks (`ZERON_ORCH_V2`)
+
+With `ZERON_ORCH_V2=1` (`true`, `on`) in the server's env and an origin chat,
+three more tools follow T3 Code's orchestrator shapes. With the flag off the
+list is the tools above, byte for byte.
+
+| Tool | Input | Engine call |
+| ---- | ----- | ----------- |
+| `delegate_task` | `task` (≤ 120,000 B), `target? {harness, model, project, device}`, `title?` (≤ 512), `role?` (implementation, research, review, design, test, general), `isolation?` (shared, worktree), `mode?` (async, wait), `timeoutMs?` (wait only; default 600,000, max 3,600,000), `clientRequestId?` (≤ 256) | `OrchDelegate {originChatId, task, title?, role?, mode, timeoutMs?, clientRequestId?, child: {chatId, deviceId, spaceId?, config, cwd?, worktree?}}` |
+| `task_status` | `taskId` | `OrchTaskStatus {originChatId, taskId}` |
+| `task_cancel` | `taskId`, `reason?` (≤ 2,000), `clientRequestId?` | `OrchTaskCancel {originChatId, taskId, reason?, clientRequestId?}` |
+
+`delegate_task` resolves `target` like `create_chats` (project and device,
+default and available harness, listed model, access and sandbox no more than
+the origin chat's, a scratch cwd for a projectless child) but writes no chat:
+the engine creates the child row (parent = origin, kind subagent). The
+one-level rule of `create_chats` does not apply; the engine caps depth at 2 and
+unsettled children at 8. `isolation: "worktree"` sends `child.worktree
+{repoPath, base: "HEAD", spaceId}` and needs a git project; the child's first
+run creates the checkout.
+
+`delegate_task` and `task_status` return the engine's task object unchanged:
+`{taskId, childThreadId, status, summary, hasPendingQuestion, waitTimedOut,
+next?}`. `next`, on a running task whose completion wakes the parent, says to
+end the turn. `task_cancel` returns `{taskId, status}` (`cancel_requested` or
+the settled status). An engine failure `"<code>: <message>"` becomes the tool
+error `{code, message}` with T3's code (`capability_denied`,
+`parent_not_active`, `task_not_found`, `task_not_cancellable`,
+`invalid_request`, …; anything else `orchestration_error`) and a one-line fix.
 
 Watch streams are the engine's only read surface (there is no one-shot "get
 transcript" RPC); a snapshot is "subscribe, take the first item, drop" — drop

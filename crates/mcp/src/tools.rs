@@ -24,6 +24,7 @@ use crate::transcript::{RenderOptions, RenderedMessage, render_entries};
 use crate::zeron::{HarnessInfo, TurnOutcome, Zeron, session_for, short};
 
 mod defs;
+mod delegate;
 mod plugins;
 mod themes;
 mod visual;
@@ -136,6 +137,7 @@ pub fn renamed(old: &str) -> Option<&'static str> {
 fn catalog() -> Vec<ToolDef> {
     let mut tools = defs::catalog();
     tools.extend(visual::catalog());
+    tools.extend(delegate::catalog());
     tools.extend(plugins::catalog());
     tools.extend(themes::catalog());
     tools
@@ -231,6 +233,27 @@ struct CreateChatArgs {
     timeout_secs: Option<u64>,
     #[serde(rename = "clientRequestId")]
     client_request_id: Option<String>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct ChildAsk<'a> {
+    project: Option<&'a str>,
+    device: Option<&'a str>,
+    harness: Option<&'a str>,
+    model: Option<&'a str>,
+    reasoning: Option<&'a str>,
+    sandbox: Option<&'a str>,
+    access: Option<&'a str>,
+    plan: bool,
+    cloud: bool,
+}
+
+struct ResolvedChild {
+    space: Option<Space>,
+    device_id: String,
+    harnesses: Vec<HarnessInfo>,
+    config: ChatConfig,
+    capped: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -416,6 +439,7 @@ impl Tools {
             visuals: self.zeron.origin().chat_id.is_some(),
             waits: self.waits_on_background(),
             side_chats_only: self.side_chats_only(),
+            delegation: self.delegates(),
         }
     }
 
@@ -435,6 +459,7 @@ impl Tools {
             .filter(|tool| match tool.name {
                 SHOW_VISUAL | SHOW_IMAGE | VISUAL_REFERENCE => in_chat,
                 WAIT_ON_BACKGROUND => waits,
+                name if delegate::NAMES.contains(&name) => self.delegates(),
                 _ => true,
             })
             .collect()
@@ -478,6 +503,9 @@ impl Tools {
             SHOW_IMAGE => self.show_image(parse(args)?).await,
             VISUAL_REFERENCE => return visual::reference(parse(args)?),
             WAIT_ON_BACKGROUND => self.wait_on_background(parse(args)?).await,
+            name if delegate::NAMES.contains(&name) && self.delegates() => {
+                return Box::pin(self.delegate(name, args)).await;
+            }
             plugin if plugins::NAMES.contains(&plugin) => return self.plugins(plugin, args).await,
             theme if themes::NAMES.contains(&theme) => return self.themes(theme, args).await,
             plugin if is_plugin_tool_name(plugin) => return self.call_plugin_tool(plugin, args).await,
@@ -783,26 +811,7 @@ impl Tools {
             (_, true) => ChatKind::Subagent,
         };
 
-        // Delegation is one level deep: a chat that has a parent never
-        // creates chats, and a new chat's parent is a top-level chat.
-        // The calling chat's sandbox and access cap the new one's: a
-        // supervised or sandboxed agent must not hand its work to one that
-        // asks nothing (the engine caps it again: rpc/agent_gate.rs).
-        let mut ceiling = AccessMode::FullAccess;
-        let mut sandbox_ceiling = SandboxLevel::DangerFullAccess;
-        if let Some(origin) = self.zeron.origin().chat_id.as_deref()
-            && !zeron_proto::voice::is_orchestrator_chat(origin)
-        {
-            let origin = self.zeron.resolve_chat(origin).await?;
-            anyhow::ensure!(
-                origin.parent_chat_id.is_none(),
-                "A delegated chat can't create chats of its own. Do the work in this chat, or ask the chat that started you."
-            );
-            if let Some(config) = origin.config {
-                ceiling = config.access;
-                sandbox_ceiling = config.sandbox;
-            }
-        }
+        let ceiling = self.access_ceiling(true).await?;
         if let Some(parent) = parent_chat_id.as_deref() {
             let parent = self.zeron.resolve_chat(parent).await?;
             anyhow::ensure!(
@@ -811,95 +820,26 @@ impl Tools {
                 parent.title.as_deref().unwrap_or(&parent.id)
             );
         }
-        let (space, device_id) = self
-            .zeron
-            .resolve_target(args.project.as_deref(), args.device.as_deref())
-            .await?;
-        let harnesses = self.zeron.harnesses_on(Some(&device_id)).await?;
-        let harness = match args.harness.as_deref() {
-            // Cloud runs its own agents, with your Cloud accounts.
-            Some(raw) if args.cloud => {
-                let id: HarnessId = parse_enum("harness", raw)?;
-                anyhow::ensure!(
-                    CLOUD_HARNESSES.contains(&id),
-                    "Cloud runs Codex and Claude Code only"
-                );
-                id
-            }
-            None if args.cloud => CLOUD_HARNESSES[0],
-            Some(raw) => {
-                let id: HarnessId = parse_enum("harness", raw)?;
-                anyhow::ensure!(
-                    harnesses.iter().any(|h| h.id == id && h.available()),
-                    "harness {raw} is not available on device {device_id} (catalog {{kind: \"harnesses\", device}})"
-                );
-                id
-            }
-            None => default_harness(&harnesses).with_context(|| format!("device {device_id}"))?,
-        };
-        // A Cloud machine's catalog is checked when it runs, not here.
-        if let Some(model) = args.model.as_deref().filter(|_| !args.cloud) {
-            let models = self.zeron.models_on(harness, Some(&device_id)).await?;
-            anyhow::ensure!(
-                models.iter().any(|m| m.id == model),
-                "model {model:?} is not offered by {harness:?} on device {device_id}; available: {}",
-                models
-                    .iter()
-                    .map(|m| m.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-        let reasoning: Option<ReasoningLevel> = match args.reasoning.as_deref() {
-            Some(raw) => Some(parse_enum("reasoning level", raw)?),
-            None => None,
-        };
-        let asked_sandbox: SandboxLevel = match args.sandbox.as_deref() {
-            Some(raw) => parse_enum("sandbox", raw)?,
-            None => SandboxLevel::WorkspaceWrite,
-        };
-        let asked_access: AccessMode = match args.access.as_deref() {
-            Some(raw) => parse_enum("access", raw)?,
-            None => ceiling,
-        };
-        // Never more than this chat's own: lowered, and the reply says so.
-        let (sandbox, access, capped) =
-            zeron_proto::cap_access((asked_sandbox, asked_access), (sandbox_ceiling, ceiling));
-        let capped = capped.then(|| {
-            format!(
-                "This chat runs {} in a {} sandbox, so the new chat runs with no more: {}, {} sandbox (asked {}, {}).",
-                ceiling.label(),
-                sandbox_ceiling.label(),
-                access.label(),
-                sandbox.label(),
-                asked_access.label(),
-                asked_sandbox.label(),
-            )
-        });
-        // A Cloud machine's catalog is checked when it runs, not here; an
-        // engine predating modes lists none and runs with full access.
-        if let Some(info) = harnesses.iter().find(|h| h.id == harness).filter(|_| !args.cloud) {
-            let modes = &info.access_modes;
-            anyhow::ensure!(
-                access.is_full_access() || modes.contains(&access),
-                "{harness:?} on device {device_id} cannot run {} (accessModes: {})",
-                access.label(),
-                modes.iter().map(|m| m.label()).collect::<Vec<_>>().join(", ")
-            );
-            anyhow::ensure!(
-                !args.plan || info.supports_plan,
-                "{harness:?} on device {device_id} has no plan mode"
-            );
-        }
-        let config = ChatConfig {
-            harness,
-            model: args.model.clone(),
-            reasoning,
-            model_options: Default::default(),
-            sandbox,
-            access,
+        let ask = ChildAsk {
+            project: args.project.as_deref(),
+            device: args.device.as_deref(),
+            harness: args.harness.as_deref(),
+            model: args.model.as_deref(),
+            reasoning: args.reasoning.as_deref(),
+            sandbox: args.sandbox.as_deref(),
+            access: args.access.as_deref(),
             plan: args.plan,
+            cloud: args.cloud,
         };
+        let ResolvedChild {
+            space,
+            device_id,
+            harnesses,
+            config,
+            capped,
+        } = Box::pin(self.resolve_child(ask, ceiling)).await?;
+        let harness = config.harness;
+        let reasoning = config.reasoning;
 
         let chat_id = uuid::Uuid::new_v4().to_string();
         let mut mutate = json!({
@@ -932,23 +872,8 @@ impl Tools {
             .map(str::trim)
             .filter(|c| !c.is_empty())
             .map(str::to_owned);
-        // A projectless chat runs in its own scratch folder on a host that
-        // creates them; naming it here keeps createChat and the first run
-        // in agreement.
-        if space.is_none()
-            && cwd.is_none()
-            && !args.cloud
-            && self.zeron.devices().await?.iter().any(|d| {
-                d.id == device_id
-                    && d.capabilities
-                        .iter()
-                        .any(|c| c == zeron_proto::capabilities::PROJECTLESS_SCRATCH_V1)
-            })
-        {
-            cwd = Some(zeron_proto::projectless::scratch_cwd(
-                &chat_id,
-                chrono::Utc::now(),
-            ));
+        if cwd.is_none() && !args.cloud {
+            cwd = self.scratch_cwd(space.as_ref(), &device_id, &chat_id).await?;
         }
         if let Some(cwd) = &cwd {
             mutate["cwd"] = json!(cwd);
@@ -1053,6 +978,122 @@ impl Tools {
             }
         }
         Ok(result)
+    }
+
+    async fn access_ceiling(&self, one_level: bool) -> anyhow::Result<(SandboxLevel, AccessMode)> {
+        let mut ceiling = (SandboxLevel::DangerFullAccess, AccessMode::FullAccess);
+        let Some(origin) = self
+            .zeron
+            .origin()
+            .chat_id
+            .as_deref()
+            .filter(|origin| !zeron_proto::voice::is_orchestrator_chat(origin))
+        else {
+            return Ok(ceiling);
+        };
+        let origin = self.zeron.resolve_chat(origin).await?;
+        anyhow::ensure!(
+            !one_level || origin.parent_chat_id.is_none(),
+            "A delegated chat can't create chats of its own. Do the work in this chat, or ask the chat that started you."
+        );
+        if let Some(config) = origin.config {
+            ceiling = (config.sandbox, config.access);
+        }
+        Ok(ceiling)
+    }
+
+    async fn resolve_child(
+        &self,
+        ask: ChildAsk<'_>,
+        ceiling: (SandboxLevel, AccessMode),
+    ) -> anyhow::Result<ResolvedChild> {
+        let (space, device_id) = self.zeron.resolve_target(ask.project, ask.device).await?;
+        let harnesses = self.zeron.harnesses_on(Some(&device_id)).await?;
+        let harness = pick_harness(ask, &harnesses, &device_id)?;
+        if let Some(model) = ask.model.filter(|_| !ask.cloud) {
+            self.check_model(harness, model, &device_id).await?;
+        }
+        let reasoning: Option<ReasoningLevel> = match ask.reasoning {
+            Some(raw) => Some(parse_enum("reasoning level", raw)?),
+            None => None,
+        };
+        let asked_sandbox: SandboxLevel = match ask.sandbox {
+            Some(raw) => parse_enum("sandbox", raw)?,
+            None => SandboxLevel::WorkspaceWrite,
+        };
+        let asked_access: AccessMode = match ask.access {
+            Some(raw) => parse_enum("access", raw)?,
+            None => ceiling.1,
+        };
+        let (sandbox, access, capped) =
+            zeron_proto::cap_access((asked_sandbox, asked_access), ceiling);
+        let capped = capped.then(|| {
+            format!(
+                "This chat runs {} in a {} sandbox, so the new chat runs with no more: {}, {} sandbox (asked {}, {}).",
+                ceiling.1.label(),
+                ceiling.0.label(),
+                access.label(),
+                sandbox.label(),
+                asked_access.label(),
+                asked_sandbox.label(),
+            )
+        });
+        if !ask.cloud {
+            check_modes(&harnesses, harness, access, ask.plan, &device_id)?;
+        }
+        let config = ChatConfig {
+            harness,
+            model: ask.model.map(str::to_owned),
+            reasoning,
+            model_options: Default::default(),
+            sandbox,
+            access,
+            plan: ask.plan,
+        };
+        Ok(ResolvedChild {
+            space,
+            device_id,
+            harnesses,
+            config,
+            capped,
+        })
+    }
+
+    async fn check_model(
+        &self,
+        harness: HarnessId,
+        model: &str,
+        device_id: &str,
+    ) -> anyhow::Result<()> {
+        let models = self.zeron.models_on(harness, Some(device_id)).await?;
+        anyhow::ensure!(
+            models.iter().any(|m| m.id == model),
+            "model {model:?} is not offered by {harness:?} on device {device_id}; available: {}",
+            models
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        Ok(())
+    }
+
+    async fn scratch_cwd(
+        &self,
+        space: Option<&Space>,
+        device_id: &str,
+        chat_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        if space.is_some() {
+            return Ok(None);
+        }
+        let scratch = self.zeron.devices().await?.iter().any(|d| {
+            d.id == device_id
+                && d.capabilities
+                    .iter()
+                    .any(|c| c == zeron_proto::capabilities::PROJECTLESS_SCRATCH_V1)
+        });
+        Ok(scratch.then(|| zeron_proto::projectless::scratch_cwd(chat_id, chrono::Utc::now())))
     }
 
     async fn read_chat(&self, args: ReadChatArgs) -> anyhow::Result<Value> {
@@ -1461,6 +1502,57 @@ impl Tools {
 
 /// claude-code when it is ready here, else the first ready harness — a
 /// provider that is installed but signed out only when nothing else is.
+fn pick_harness(ask: ChildAsk<'_>, harnesses: &[HarnessInfo], device_id: &str) -> anyhow::Result<HarnessId> {
+    let Some(raw) = ask.harness else {
+        return if ask.cloud {
+            Ok(CLOUD_HARNESSES[0])
+        } else {
+            default_harness(harnesses).with_context(|| format!("device {device_id}"))
+        };
+    };
+    let id: HarnessId = parse_enum("harness", raw)?;
+    if ask.cloud {
+        anyhow::ensure!(
+            CLOUD_HARNESSES.contains(&id),
+            "Cloud runs Codex and Claude Code only"
+        );
+    } else {
+        anyhow::ensure!(
+            harnesses.iter().any(|h| h.id == id && h.available()),
+            "harness {raw} is not available on device {device_id} (catalog {{kind: \"harnesses\", device}})"
+        );
+    }
+    Ok(id)
+}
+
+fn check_modes(
+    harnesses: &[HarnessInfo],
+    harness: HarnessId,
+    access: AccessMode,
+    plan: bool,
+    device_id: &str,
+) -> anyhow::Result<()> {
+    let Some(info) = harnesses.iter().find(|h| h.id == harness) else {
+        return Ok(());
+    };
+    let modes = &info.access_modes;
+    anyhow::ensure!(
+        access.is_full_access() || modes.contains(&access),
+        "{harness:?} on device {device_id} cannot run {} (accessModes: {})",
+        access.label(),
+        modes
+            .iter()
+            .map(|m| m.label())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    anyhow::ensure!(
+        !plan || info.supports_plan,
+        "{harness:?} on device {device_id} has no plan mode"
+    );
+    Ok(())
+}
+
 fn default_harness(harnesses: &[HarnessInfo]) -> anyhow::Result<HarnessId> {
     let real = |h: &&HarnessInfo| h.id != HarnessId::Mock;
     harnesses
@@ -1503,7 +1595,7 @@ mod tests {
                     };
                     let mut call = args.clone();
                     call["kind"] = json!(kind);
-                    let out = self.call(defs::CATALOG, call).await?;
+                    let out = Box::pin(self.call(defs::CATALOG, call)).await?;
                     let items = out["items"].clone();
                     return Ok(match kind {
                         "self" => items[0].clone(),
@@ -1512,7 +1604,7 @@ mod tests {
                     });
                 }
             };
-            let out = self.call(tool, call).await?;
+            let out = Box::pin(self.call(tool, call)).await?;
             let row = out["results"][0].clone();
             if row["ok"] == true {
                 let mut row = row;
@@ -1535,6 +1627,8 @@ mod tests {
     use std::sync::Mutex;
     use zeron_rpc::{RpcError, RpcReply, RpcService, memory_client, methods};
 
+    mod delegation;
+
     /// Two devices with distinct catalogs and repeated project paths, plus
     /// two chats with a two-message transcript. Writes are recorded for assertions.
     #[derive(Default)]
@@ -1551,6 +1645,7 @@ mod tests {
         extra_chats: Vec<Value>,
         catalog_error: Option<&'static str>,
         reads: Mutex<Vec<(String, Value)>>,
+        orch_reply: Option<Result<Value, &'static str>>,
     }
 
     fn stream(item: Value) -> RpcReply {
@@ -1692,6 +1787,16 @@ mod tests {
                         barrier.wait().await;
                     }
                     RpcReply::Value(json!({ "commandId": "cmd-1", "id": "q-1" }))
+                }
+                methods::ORCH_DELEGATE | methods::ORCH_TASK_STATUS | methods::ORCH_TASK_CANCEL => {
+                    self.writes
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params));
+                    return match self.orch_reply.clone().unwrap_or_else(|| Ok(json!({}))) {
+                        Ok(reply) => Ok(RpcReply::Value(reply)),
+                        Err(message) => Err(RpcError::Failed(message.into())),
+                    };
                 }
                 other => return Err(RpcError::UnknownMethod(other.into())),
             })

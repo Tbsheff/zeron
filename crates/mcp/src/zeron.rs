@@ -43,6 +43,7 @@ pub struct Origin {
     pub waits_on_background: bool,
     pub plugin_instructions: Option<std::path::PathBuf>,
     pub guidance_in_prompt: bool,
+    pub orchestrator: bool,
 }
 
 impl Origin {
@@ -65,6 +66,9 @@ impl Origin {
                 .map(std::path::PathBuf::from),
             guidance_in_prompt: read(zeron_proto::McpServer::GUIDANCE_ENV).as_deref()
                 == Some("prompt"),
+            orchestrator: zeron_proto::agent_guidance::orchestrator_on(
+                read(zeron_proto::McpServer::ORCHESTRATOR_ENV).as_deref(),
+            ),
         }
     }
 }

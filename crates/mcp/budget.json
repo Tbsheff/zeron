@@ -27,6 +27,35 @@
     "opencodeSystem": 1457
   },
   "opencodeUpfront": 12642,
+  "orchestrator": {
+    "descriptions": {
+      "delegate_task": 397,
+      "task_cancel": 122,
+      "task_status": 156
+    },
+    "instructions": {
+      "claudeSystemPrompt": 2205,
+      "codexLargestEntry": 1053,
+      "codexTotal": 1835,
+      "core": 1053,
+      "mcpFallback": 2407,
+      "mcpInstructionsChars": 200,
+      "opencodeSystem": 1841
+    },
+    "opencodeUpfront": 14567,
+    "tools": {
+      "delegate_task": 1037,
+      "task_cancel": 298,
+      "task_status": 273
+    },
+    "totals": {
+      "descriptions": 7413,
+      "inputSchemas": 5659,
+      "outputSchemas": 2488,
+      "toolCount": 19,
+      "tools": 13569
+    }
+  },
   "tools": {
     "archive_chat": 286,
     "catalog": 470,
