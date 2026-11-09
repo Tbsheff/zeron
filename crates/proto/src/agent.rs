@@ -1050,14 +1050,74 @@ pub enum DoneStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(from = "FailureWire", into = "FailureWire")]
 pub enum FailureClass {
+    UsageLimit { reset_at: Option<i64> },
+    ProviderError,
+    TransportError,
+    PermissionError,
+    ValidationError,
+    Unknown,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum FailureWire {
+    Bare(FailureName),
+    Limit { usage_limit: LimitWire },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FailureName {
     UsageLimit,
     ProviderError,
     TransportError,
     PermissionError,
     ValidationError,
     Unknown,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LimitWire {
+    #[serde(default)]
+    reset_at: Option<i64>,
+}
+
+impl From<FailureWire> for FailureClass {
+    fn from(wire: FailureWire) -> Self {
+        match wire {
+            FailureWire::Limit { usage_limit } => Self::UsageLimit {
+                reset_at: usage_limit.reset_at,
+            },
+            FailureWire::Bare(FailureName::UsageLimit) => Self::UsageLimit { reset_at: None },
+            FailureWire::Bare(FailureName::ProviderError) => Self::ProviderError,
+            FailureWire::Bare(FailureName::TransportError) => Self::TransportError,
+            FailureWire::Bare(FailureName::PermissionError) => Self::PermissionError,
+            FailureWire::Bare(FailureName::ValidationError) => Self::ValidationError,
+            FailureWire::Bare(FailureName::Unknown) => Self::Unknown,
+        }
+    }
+}
+
+impl From<FailureClass> for FailureWire {
+    fn from(class: FailureClass) -> Self {
+        let name = match class {
+            FailureClass::UsageLimit { reset_at: Some(at) } => {
+                return Self::Limit {
+                    usage_limit: LimitWire { reset_at: Some(at) },
+                };
+            }
+            FailureClass::UsageLimit { reset_at: None } => FailureName::UsageLimit,
+            FailureClass::ProviderError => FailureName::ProviderError,
+            FailureClass::TransportError => FailureName::TransportError,
+            FailureClass::PermissionError => FailureName::PermissionError,
+            FailureClass::ValidationError => FailureName::ValidationError,
+            FailureClass::Unknown => FailureName::Unknown,
+        };
+        Self::Bare(name)
+    }
 }
 
 /// The normalized streaming event every harness emits.
@@ -1249,11 +1309,55 @@ mod tests {
             result: None,
             error: Some("limit".into()),
             session_id: None,
-            failure: Some(FailureClass::UsageLimit),
+            failure: Some(FailureClass::UsageLimit { reset_at: None }),
         };
         let json = serde_json::to_string(&classed).unwrap();
         assert!(json.contains(r#""failure":"usage_limit""#), "{json}");
         assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), classed);
+    }
+
+    #[test]
+    fn usage_limit_reset_rides_done_and_old_classes_still_parse() {
+        let timed = AgentEvent::Done {
+            status: DoneStatus::Errored,
+            result: None,
+            error: Some("limit".into()),
+            session_id: None,
+            failure: Some(FailureClass::UsageLimit {
+                reset_at: Some(1_791_000_000_000),
+            }),
+        };
+        let json = serde_json::to_string(&timed).unwrap();
+        assert!(
+            json.contains(r#""failure":{"usage_limit":{"resetAt":1791000000000}}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), timed);
+        for (raw, class) in [
+            (
+                r#""usage_limit""#,
+                FailureClass::UsageLimit { reset_at: None },
+            ),
+            (
+                r#"{"usage_limit":{}}"#,
+                FailureClass::UsageLimit { reset_at: None },
+            ),
+            (r#""provider_error""#, FailureClass::ProviderError),
+            (r#""transport_error""#, FailureClass::TransportError),
+            (r#""permission_error""#, FailureClass::PermissionError),
+            (r#""validation_error""#, FailureClass::ValidationError),
+            (r#""unknown""#, FailureClass::Unknown),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<FailureClass>(raw).unwrap(),
+                class,
+                "{raw}"
+            );
+            if raw.starts_with('"') {
+                assert_eq!(serde_json::to_string(&class).unwrap(), raw);
+            }
+        }
+        assert!(serde_json::from_str::<FailureClass>(r#""usage_limits""#).is_err());
     }
 
     /// Drivers spell the key differently; the chip must not care which one

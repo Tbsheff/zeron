@@ -4,7 +4,7 @@ type Rules = &'static [(FailureClass, &'static [&'static str])];
 
 const CLAUDE: Rules = &[
     (
-        FailureClass::UsageLimit,
+        FailureClass::UsageLimit { reset_at: None },
         &["limit reached", "rate_limit_error"],
     ),
     (
@@ -45,7 +45,7 @@ const CLAUDE: Rules = &[
 
 const CODEX: Rules = &[
     (
-        FailureClass::UsageLimit,
+        FailureClass::UsageLimit { reset_at: None },
         &[
             "codex usage limit reached",
             "codex rate limit reached",
@@ -80,16 +80,73 @@ const CODEX: Rules = &[
 ];
 
 pub fn classify_failure(harness: HarnessId, message: &str) -> FailureClass {
+    classify_at(harness, message, now_ms())
+}
+
+fn classify_at(harness: HarnessId, message: &str, now: i64) -> FailureClass {
     let rules = match harness {
         HarnessId::ClaudeCode => CLAUDE,
         HarnessId::Codex => CODEX,
         _ => return FailureClass::Unknown,
     };
     let text = message.to_ascii_lowercase();
-    rules
+    let class = rules
         .iter()
         .find(|(_, needles)| needles.iter().any(|needle| text.contains(needle)))
-        .map_or(FailureClass::Unknown, |(class, _)| *class)
+        .map_or(FailureClass::Unknown, |(class, _)| *class);
+    match class {
+        FailureClass::UsageLimit { .. } => FailureClass::UsageLimit {
+            reset_at: wait_ms(&text).map(|ms| now.saturating_add(ms)),
+        },
+        other => other,
+    }
+}
+
+fn wait_ms(text: &str) -> Option<i64> {
+    let (_, rest) = text.split_once("resets in ")?;
+    let phrase = rest.split(['.', ',', ';', ')', '\n']).next()?.trim();
+    if phrase.starts_with("under a minute") {
+        return Some(60_000);
+    }
+    let parts: Vec<i64> = phrase.split_whitespace().map_while(token_ms).collect();
+    (!parts.is_empty()).then(|| parts.into_iter().fold(0, i64::saturating_add))
+}
+
+fn token_ms(token: &str) -> Option<i64> {
+    let digits = token.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let unit_ms = match &token[digits.len()..] {
+        "d" => 86_400_000,
+        "h" => 3_600_000,
+        "m" => 60_000,
+        _ => return None,
+    };
+    digits
+        .parse::<i64>()
+        .ok()
+        .map(|n| n.saturating_mul(unit_ms))
+}
+
+pub(crate) fn describe_wait(secs: i64) -> String {
+    let minutes = (secs.max(0) + 59) / 60;
+    let (days, hours, minutes) = (minutes / 1440, minutes / 60 % 24, minutes % 60);
+    match (days, hours, minutes) {
+        (0, 0, 0) => "under a minute".into(),
+        (0, 0, m) => format!("{m}m"),
+        (0, h, 0) => format!("{h}h"),
+        (0, h, m) => format!("{h}h {m}m"),
+        (d, 0, _) => format!("{d}d"),
+        (d, h, _) => format!("{d}d {h}h"),
+    }
+}
+
+pub(crate) fn now_secs() -> i64 {
+    now_ms() / 1000
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 pub fn failure_of(harness: HarnessId, error: Option<&str>) -> Option<FailureClass> {
@@ -130,8 +187,76 @@ mod tests {
             "Claude 5-hour limit reached — the turn was blocked. Try again after it resets.",
             "Claude rate limit reached — try again after it resets. API Error: 429 rate_limit_error (resets 3pm)",
         ] {
-            assert_eq!(claude(message), FailureClass::UsageLimit, "{message}");
+            assert_eq!(claude(message), UNTIMED, "{message}");
         }
+    }
+
+    const UNTIMED: FailureClass = FailureClass::UsageLimit { reset_at: None };
+
+    fn reset_at(harness: HarnessId, message: &str) -> Option<i64> {
+        match classify_at(harness, message, 1_000) {
+            FailureClass::UsageLimit { reset_at } => reset_at,
+            other => panic!("{message}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_limit_reset_comes_from_every_resets_in_wording() {
+        const M: i64 = 60_000;
+        const H: i64 = 60 * M;
+        const D: i64 = 24 * H;
+        for (wait, ms) in [
+            ("under a minute", M),
+            ("7m", 7 * M),
+            ("3h", 3 * H),
+            ("2h 14m", 2 * H + 14 * M),
+            ("2d", 2 * D),
+            ("3d 5h", 3 * D + 5 * H),
+        ] {
+            let codex = format!("Codex usage limit reached — it resets in {wait}.");
+            assert_eq!(
+                reset_at(HarnessId::Codex, &codex),
+                Some(1_000 + ms),
+                "{codex}"
+            );
+            let claude =
+                format!("Claude 5-hour limit reached — the turn was blocked. It resets in {wait}.");
+            assert_eq!(
+                reset_at(HarnessId::ClaudeCode, &claude),
+                Some(1_000 + ms),
+                "{claude}"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_limit_without_a_parsable_wait_has_no_reset() {
+        for message in [
+            "Claude rate limit reached — try again after it resets. API Error: 429 rate_limit_error (resets 3pm)",
+            "Claude usage limit reached — try again after the limit resets.",
+            "Claude 5-hour limit reached — it resets in a while.",
+            "Claude 5-hour limit reached — it resets in 3pm.",
+        ] {
+            assert_eq!(reset_at(HarnessId::ClaudeCode, message), None, "{message}");
+        }
+        assert_eq!(
+            classify_at(HarnessId::Codex, "upstream 502, resets in 5m", 1_000),
+            FailureClass::ProviderError
+        );
+    }
+
+    #[test]
+    fn describe_wait_round_trips_through_the_parser() {
+        for secs in [0, 59, 61, 3599, 3600, 3660, 86_399] {
+            let message = format!(
+                "Codex usage limit reached — it resets in {}.",
+                describe_wait(secs)
+            );
+            let late = reset_at(HarnessId::Codex, &message).expect("parsed") - 1_000 - secs * 1000;
+            assert!((0..=60_000).contains(&late), "{message}: {late}");
+        }
+        assert_eq!(describe_wait(-5), "under a minute");
+        assert_eq!(describe_wait(3660), "1h 1m");
     }
 
     #[test]
@@ -202,7 +327,10 @@ mod tests {
             "You've hit your usage limit.",
             "You have hit your usage limit.",
         ] {
-            assert_eq!(codex(message), FailureClass::UsageLimit, "{message}");
+            assert!(
+                matches!(codex(message), FailureClass::UsageLimit { .. }),
+                "{message}"
+            );
         }
     }
 
@@ -275,7 +403,7 @@ mod tests {
     #[test]
     fn serializes_snake_case() {
         assert_eq!(
-            serde_json::to_value(FailureClass::UsageLimit).unwrap(),
+            serde_json::to_value(UNTIMED).unwrap(),
             serde_json::json!("usage_limit")
         );
         assert_eq!(

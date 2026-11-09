@@ -643,7 +643,7 @@ async fn error_codes_map_to_readable_messages() {
             result: None,
             error: Some("The run hit the maximum number of turns.".into()),
             session_id: Some("sess-err".into()),
-            failure: Some(FailureClass::UsageLimit),
+            failure: Some(FailureClass::UsageLimit { reset_at: None }),
         })
     );
 }

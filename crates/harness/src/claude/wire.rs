@@ -241,6 +241,8 @@ pub(crate) struct RateLimitInfo {
     pub is_using_overage: bool,
     #[serde(rename = "overageInUse", default)]
     pub overage_in_use: bool,
+    #[serde(rename = "resetsAt", default)]
+    pub resets_at: Option<f64>,
 }
 
 impl RateLimitInfo {

@@ -1091,7 +1091,14 @@ async fn retry_notices_stay_out_of_the_transcript_and_the_final_error_lands_once
     assert_eq!(dones.len(), 1, "{events:?}");
     let (status, error, failure) = &dones[0];
     assert_eq!(*status, DoneStatus::Errored);
-    assert_eq!(*failure, Some(FailureClass::UsageLimit));
+    let Some(FailureClass::UsageLimit {
+        reset_at: Some(reset_at),
+    }) = *failure
+    else {
+        panic!("{failure:?}");
+    };
+    let wait = reset_at - chrono::Utc::now().timestamp_millis();
+    assert!((2 * 3_600_000..3 * 3_600_000).contains(&wait), "{wait}");
     let error = error.as_deref().unwrap();
     assert!(
         error.starts_with("Codex usage limit reached — it resets in 2h 1"),

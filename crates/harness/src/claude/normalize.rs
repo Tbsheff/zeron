@@ -6,7 +6,8 @@ use zeron_proto::{
     AgentEvent, DoneStatus, FailureClass, HarnessId, TodoItem, TodoStatus, ToolCall,
 };
 
-use super::wire::{ContentBlock, Frame, MessageFrame, ResultFrame};
+use super::wire::{ContentBlock, Frame, MessageFrame, RateLimitInfo, ResultFrame};
+use crate::failure::{describe_wait, now_secs};
 
 /// Human-readable text for the CLI's assistant-level error codes. These arrive
 /// as a terse `error` field on an `assistant` frame — usually with NO text
@@ -37,6 +38,29 @@ fn rate_window_label(kind: &str) -> &'static str {
         "seven_day_sonnet" => "weekly (Sonnet)",
         "overage" => "overage",
         _ => "usage",
+    }
+}
+
+fn blocked_turn_message(info: &RateLimitInfo) -> String {
+    let window = rate_window_label(info.rate_limit_type.as_deref().unwrap_or(""));
+    match info.resets_at {
+        Some(at) => format!(
+            "Claude {window} limit reached — the turn was blocked. It resets in {}.",
+            describe_wait(at as i64 - now_secs())
+        ),
+        None => format!(
+            "Claude {window} limit reached — the turn was blocked. Try again after it resets."
+        ),
+    }
+}
+
+fn keep_reset(class: FailureClass, earlier: Option<FailureClass>) -> FailureClass {
+    match (class, earlier) {
+        (
+            FailureClass::UsageLimit { reset_at: None },
+            Some(timed @ FailureClass::UsageLimit { reset_at: Some(_) }),
+        ) => timed,
+        _ => class,
     }
 }
 
@@ -165,7 +189,7 @@ fn set_failure(done: &mut AgentEvent, shown: Option<FailureClass>) {
         (None | Some(FailureClass::Unknown), Some(shown)) if *status == DoneStatus::Errored => {
             Some(shown)
         }
-        (from_error, _) => from_error,
+        (from_error, _) => from_error.map(|class| keep_reset(class, shown)),
     };
 }
 
@@ -1184,7 +1208,8 @@ impl Normalizer {
                 // and no `result` error — so surface it visibly.
                 if let Some(code) = &f.error {
                     let message = assistant_error_text(code);
-                    self.turn_error_shown = Some(classify(&message));
+                    self.turn_error_shown =
+                        Some(keep_reset(classify(&message), self.turn_error_shown));
                     out.push(AgentEvent::Error { message });
                 }
                 // The enclosing assistant frame closes the streamed message
@@ -1254,12 +1279,8 @@ impl Normalizer {
                 if !f.rate_limit_info.blocks() {
                     return Vec::new();
                 }
-                let window =
-                    rate_window_label(f.rate_limit_info.rate_limit_type.as_deref().unwrap_or(""));
-                let message = format!(
-                    "Claude {window} limit reached — the turn was blocked. Try again after it resets."
-                );
-                self.turn_error_shown = Some(classify(&message));
+                let message = blocked_turn_message(&f.rate_limit_info);
+                self.turn_error_shown = Some(keep_reset(classify(&message), self.turn_error_shown));
                 vec![AgentEvent::Error { message }]
             }
 
@@ -2880,7 +2901,41 @@ mod tests {
             r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":[]}"#,
         );
         assert_eq!(done_of(&done), (DoneStatus::Errored, None));
-        assert_eq!(failure_in(&done), Some(FailureClass::UsageLimit));
+        assert_eq!(
+            failure_in(&done),
+            Some(FailureClass::UsageLimit { reset_at: None })
+        );
+    }
+
+    #[test]
+    fn a_blocked_window_with_resets_at_carries_the_reset_to_done() {
+        let resets_at = crate::failure::now_secs() + 7170;
+        let mut norm = Normalizer::new();
+        let shown = feed(
+            &mut norm,
+            &format!(
+                r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","rateLimitType":"five_hour","overageStatus":"rejected","resetsAt":{resets_at}}}}}"#
+            ),
+        );
+        let [AgentEvent::Error { message }] = shown.as_slice() else {
+            panic!("{shown:?}");
+        };
+        assert_eq!(
+            message,
+            "Claude 5-hour limit reached — the turn was blocked. It resets in 2h."
+        );
+        let done = feed(
+            &mut norm,
+            r#"{"type":"result","subtype":"success","is_error":true,"result":"API Error: 429 rate_limit_error (resets 3pm)","api_error_status":429}"#,
+        );
+        let Some(FailureClass::UsageLimit { reset_at: Some(at) }) = failure_in(&done) else {
+            panic!("{done:?}");
+        };
+        let expected = (resets_at + 30) * 1000;
+        assert!(
+            (expected - 5_000..=expected + 5_000).contains(&at),
+            "{at} vs {expected}"
+        );
     }
 
     #[test]
@@ -2888,7 +2943,7 @@ mod tests {
         for (raw, expected) in [
             (
                 r#"{"type":"result","subtype":"success","is_error":true,"result":"API Error: 429 rate_limit_error (resets 3pm)","api_error_status":429}"#,
-                FailureClass::UsageLimit,
+                FailureClass::UsageLimit { reset_at: None },
             ),
             (
                 r#"{"type":"result","subtype":"success","is_error":true,"result":"API Error: 529","api_error_status":529}"#,

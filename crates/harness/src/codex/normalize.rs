@@ -8,6 +8,8 @@
 use serde_json::Value;
 use zeron_proto::{AgentEvent, DoneStatus, TodoItem, TodoStatus, ToolCall};
 
+use crate::failure::describe_wait;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
     Started,
@@ -196,19 +198,6 @@ fn limit_reset_in(limits: &Value, now: i64) -> Option<i64> {
         .filter_map(|window| window.get("resetsAt").and_then(Value::as_i64))
         .max()
         .map(|at| (at - now).max(0))
-}
-
-fn describe_wait(secs: i64) -> String {
-    let minutes = (secs + 59) / 60;
-    let (days, hours, minutes) = (minutes / 1440, minutes / 60 % 24, minutes % 60);
-    match (days, hours, minutes) {
-        (0, 0, 0) => "under a minute".into(),
-        (0, 0, m) => format!("{m}m"),
-        (0, h, 0) => format!("{h}h"),
-        (0, h, m) => format!("{h}h {m}m"),
-        (d, 0, _) => format!("{d}d"),
-        (d, h, _) => format!("{d}d {h}h"),
-    }
 }
 
 /// Fold a sparse `account/rateLimits/updated` snapshot into the last one:
