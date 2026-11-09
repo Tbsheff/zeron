@@ -41,7 +41,7 @@ const REASON_MAX: usize = 2_000;
 const RPC_MARGIN: Duration = Duration::from_secs(30);
 const RPC_LIMIT: Duration = Duration::from_secs(60);
 
-const DELEGATE_DESCRIPTION: &str = "Start one child agent on `task`. It gets only `task`, no history from this chat, so put in what it needs and no secrets. isolation worktree: a separate checkout of the project. Keep `taskId` for task_status and task_cancel. Default mode async: the result is pushed to you when the child ends, so end your turn. Mode wait only if this turn needs the answer; a question from the child ends the wait.";
+const DELEGATE_DESCRIPTION: &str = "Start one child agent on `task`. It gets only `task`, no history from this chat: put in what it needs, no secrets. isolation worktree: a separate checkout. Keep `taskId` for task_status and task_cancel. Default mode async: the result is pushed to you when the child ends, so end your turn. Mode wait only if this turn needs the answer. A child's question ends a wait; answer it with respond_to_input {chat: childThreadId}.";
 
 const STATUS_DESCRIPTION: &str = "Read one task you delegated. Do not call it on a running task before its completion wakes you. `summary` is the final result; reading it marks it delivered.";
 
@@ -82,7 +82,7 @@ pub(super) fn catalog() -> Vec<ToolDef> {
                     "role": { "type": "string", "enum": ["implementation", "research", "review", "design", "test", "general"] },
                     "isolation": { "type": "string", "enum": ["shared", "worktree"] },
                     "mode": { "type": "string", "enum": ["async", "wait"] },
-                    "timeoutMs": { "type": "integer", "description": "wait only. Default 600000. A timeout does not cancel the child." },
+                    "timeoutMs": { "type": "integer", "description": "wait only; default 600000. A timeout does not cancel the child." },
                     "clientRequestId": { "type": "string" }
                 },
                 "required": ["task"]

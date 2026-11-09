@@ -113,6 +113,8 @@ async fn the_flag_on_lists_the_three_tools_with_annotations_and_output_schemas()
         hints("task_cancel"),
         (json!("Cancel delegated task"), [false, true, false, false])
     );
+    let delegate = listed.iter().find(|t| t.name == "delegate_task").unwrap();
+    assert!(delegate.description.contains("respond_to_input"));
 }
 
 #[tokio::test]
