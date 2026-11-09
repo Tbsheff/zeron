@@ -72,19 +72,120 @@ pub const CAP: usize = 4;
 #[cfg(kani)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Slots<T> {
-    items: [Option<T>; CAP],
+    items: [T; CAP],
     len: usize,
 }
 
 #[cfg(kani)]
-pub type Iter<'a, T> =
-    std::iter::FilterMap<std::slice::Iter<'a, Option<T>>, fn(&'a Option<T>) -> Option<&'a T>>;
+pub struct Iter<'a, T> {
+    items: &'a [T; CAP],
+    len: usize,
+    at: usize,
+}
+
+#[cfg(kani)]
+impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
+    fn next_back(&mut self) -> Option<&'a T> {
+        if self.at < self.len {
+            self.len -= 1;
+            Some(cell(self.items, self.len))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(kani)]
+impl<'a, T> Iterator for Iter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<&'a T> {
+        if self.at < self.len {
+            let x = cell(self.items, self.at);
+            self.at += 1;
+            Some(x)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(kani)]
+macro_rules! each {
+    ($k:ident => $body:expr) => {{
+        {
+            let $k: usize = 0;
+            $body;
+        }
+        {
+            let $k: usize = 1;
+            $body;
+        }
+        {
+            let $k: usize = 2;
+            $body;
+        }
+        {
+            let $k: usize = 3;
+            $body;
+        }
+    }};
+}
+
+#[cfg(kani)]
+struct IterMut<'a, T> {
+    refs: [Option<&'a mut T>; CAP],
+    len: usize,
+    at: usize,
+}
+
+#[cfg(kani)]
+impl<'a, T> Iterator for IterMut<'a, T> {
+    type Item = &'a mut T;
+
+    fn next(&mut self) -> Option<&'a mut T> {
+        if self.at < self.len {
+            let x = self.refs[self.at].take();
+            self.at += 1;
+            x
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(kani)]
+fn blank<T>() -> T {
+    unsafe { std::mem::zeroed() }
+}
+
+#[cfg(kani)]
+fn cell<T>(items: &[T; CAP], i: usize) -> &T {
+    let [a, b, c, d] = items;
+    match i {
+        0 => a,
+        1 => b,
+        2 => c,
+        _ => d,
+    }
+}
+
+#[cfg(kani)]
+fn cell_mut<T>(items: &mut [T; CAP], i: usize) -> &mut T {
+    let [a, b, c, d] = items;
+    match i {
+        0 => a,
+        1 => b,
+        2 => c,
+        _ => d,
+    }
+}
 
 #[cfg(kani)]
 impl<T> Slots<T> {
     pub fn new() -> Self {
         Self {
-            items: [const { None }; CAP],
+            items: blank(),
             len: 0,
         }
     }
@@ -95,7 +196,7 @@ impl<T> Slots<T> {
 
     pub fn get(&self, i: usize) -> Option<&T> {
         if i < self.len {
-            self.items[i].as_ref()
+            Some(cell(&self.items, i))
         } else {
             None
         }
@@ -103,33 +204,49 @@ impl<T> Slots<T> {
 
     pub fn get_mut(&mut self, i: usize) -> Option<&mut T> {
         if i < self.len {
-            self.items[i].as_mut()
+            Some(cell_mut(&mut self.items, i))
         } else {
             None
         }
     }
 
+    fn shift_up(&mut self, j: usize, i: usize) {
+        if j > i && j <= self.len {
+            let v = std::mem::replace(&mut self.items[j - 1], blank());
+            self.items[j] = v;
+        }
+    }
+
+    fn shift_down(&mut self, j: usize, i: usize) {
+        if j >= i && j + 1 < self.len {
+            let v = std::mem::replace(&mut self.items[j + 1], blank());
+            self.items[j] = v;
+        }
+    }
+
     pub fn insert(&mut self, i: usize, x: T) {
         assert!(self.len < CAP && i <= self.len);
-        let mut j = self.len;
-        while j > i {
-            self.items[j] = self.items[j - 1].take();
-            j -= 1;
-        }
-        self.items[i] = Some(x);
+        self.shift_up(3, i);
+        self.shift_up(2, i);
+        self.shift_up(1, i);
+        let mut x = x;
+        each!(k => if k == i {
+            self.items[k] = std::mem::replace(&mut x, blank());
+        });
         self.len += 1;
     }
 
     pub fn remove(&mut self, i: usize) -> T {
         assert!(i < self.len);
-        let x = self.items[i].take();
-        let mut j = i;
-        while j + 1 < self.len {
-            self.items[j] = self.items[j + 1].take();
-            j += 1;
-        }
+        let mut x = blank();
+        each!(k => if k == i {
+            x = std::mem::replace(&mut self.items[k], blank());
+        });
+        self.shift_down(0, i);
+        self.shift_down(1, i);
+        self.shift_down(2, i);
         self.len -= 1;
-        x.expect("slot in range")
+        x
     }
 
     pub fn push(&mut self, x: T) {
@@ -138,43 +255,78 @@ impl<T> Slots<T> {
     }
 
     pub fn clear(&mut self) {
-        for slot in self.items[..self.len].iter_mut() {
-            *slot = None;
-        }
+        self.items = blank();
         self.len = 0;
     }
 
     pub fn retain(&mut self, mut f: impl FnMut(&T) -> bool) {
+        let mut out: [T; CAP] = blank();
         let mut w = 0;
-        let mut r = 0;
-        while r < self.len {
-            if let Some(x) = self.items[r].take() {
-                if f(&x) {
-                    self.items[w] = Some(x);
-                    w += 1;
-                }
+        each!(r => if r < self.len {
+            let mut x = std::mem::replace(&mut self.items[r], blank());
+            if f(&x) {
+                each!(k => if k == w {
+                    out[k] = std::mem::replace(&mut x, blank());
+                });
+                w += 1;
             }
-            r += 1;
-        }
+        });
+        self.items = out;
         self.len = w;
     }
 
     pub fn iter(&self) -> Iter<'_, T> {
-        self.items[..self.len].iter().filter_map(Option::as_ref)
+        Iter {
+            items: &self.items,
+            len: self.len,
+            at: 0,
+        }
     }
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
-        self.items[..self.len].iter_mut().filter_map(Option::as_mut)
+        let len = self.len;
+        let [a, b, c, d] = &mut self.items;
+        IterMut {
+            refs: [Some(a), Some(b), Some(c), Some(d)],
+            len,
+            at: 0,
+        }
+    }
+}
+
+#[cfg(kani)]
+pub struct IntoIter<T> {
+    items: [T; CAP],
+    len: usize,
+    at: usize,
+}
+
+#[cfg(kani)]
+impl<T> Iterator for IntoIter<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        if self.at < self.len {
+            let x = std::mem::replace(cell_mut(&mut self.items, self.at), blank());
+            self.at += 1;
+            Some(x)
+        } else {
+            None
+        }
     }
 }
 
 #[cfg(kani)]
 impl<T> IntoIterator for Slots<T> {
     type Item = T;
-    type IntoIter = std::iter::Flatten<std::iter::Take<std::array::IntoIter<Option<T>, CAP>>>;
+    type IntoIter = IntoIter<T>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.items.into_iter().take(self.len).flatten()
+        IntoIter {
+            items: self.items,
+            len: self.len,
+            at: 0,
+        }
     }
 }
 
