@@ -26,6 +26,21 @@ pub fn check_invariants(s: &OrchState) -> Result<(), Violation> {
     Ok(())
 }
 
+pub fn all_violations(s: &OrchState) -> Vec<Violation> {
+    let mut out = Vec::new();
+    for th in s.threads.values() {
+        out.extend(s1(th).err());
+        out.extend(s5a(s, th).err());
+        if let Some(task) = th.task {
+            out.extend(s3(th.id, task).err());
+            out.extend(s4(s, th, task).err());
+            out.extend(s6(s, th).err());
+            out.extend(s7(th.id, task).err());
+        }
+    }
+    out
+}
+
 fn fail(ok: bool, v: Violation) -> Result<(), Violation> {
     if ok { Ok(()) } else { Err(v) }
 }
