@@ -1,7 +1,5 @@
 use crate::ids::ThreadId;
-use crate::state::{
-    Delivery, Message, Msg, OrchState, RunStatus, Task, TaskSt, Thread, WakeRule,
-};
+use crate::state::{Delivery, Message, Msg, OrchState, RunStatus, Task, TaskSt, Thread, WakeRule};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Violation {
@@ -47,11 +45,11 @@ fn fail(ok: bool, v: Violation) -> Result<(), Violation> {
     if ok { Ok(()) } else { Err(v) }
 }
 
-fn s1(th: &Thread) -> Result<(), Violation> {
+pub(crate) fn s1(th: &Thread) -> Result<(), Violation> {
     fail(th.live_count() <= 1, Violation::S1AtMostOneActiveRun(th.id))
 }
 
-fn s3(c: ThreadId, task: Task) -> Result<(), Violation> {
+pub(crate) fn s3(c: ThreadId, task: Task) -> Result<(), Violation> {
     let reached = matches!(task.delivery, Delivery::Delivered | Delivery::Acknowledged);
     fail(
         task.pushes <= 1 && (task.pushes != 1 || reached),
@@ -68,7 +66,7 @@ fn s4(s: &OrchState, th: &Thread, task: Task) -> Result<(), Violation> {
     )
 }
 
-fn s5a(s: &OrchState, th: &Thread) -> Result<(), Violation> {
+pub(crate) fn s5a(s: &OrchState, th: &Thread) -> Result<(), Violation> {
     fail(th.depth <= s.config.max_depth, Violation::S5aDepth(th.id))?;
     fail(
         s.unsettled_kids(th.id) <= s.config.max_fanout,
@@ -76,7 +74,7 @@ fn s5a(s: &OrchState, th: &Thread) -> Result<(), Violation> {
     )
 }
 
-fn s6(s: &OrchState, th: &Thread) -> Result<(), Violation> {
+pub(crate) fn s6(s: &OrchState, th: &Thread) -> Result<(), Violation> {
     let parent = th.parent.and_then(|p| s.threads.get(&p));
     fail(
         parent.is_none_or(|p| th.access <= p.access),

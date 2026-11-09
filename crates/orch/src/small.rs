@@ -1,14 +1,16 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::slots::{Iter, Slots};
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VecMap<K, V> {
-    entries: Vec<(K, V)>,
+    entries: Slots<(K, V)>,
 }
 
 impl<K, V> Default for VecMap<K, V> {
     fn default() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: Slots::new(),
         }
     }
 }
@@ -20,8 +22,8 @@ impl<K: Ord, V> VecMap<K, V> {
 
     fn slot(&self, k: &K) -> Result<usize, usize> {
         let mut i = 0;
-        while i < self.entries.len() {
-            match self.entries[i].0.cmp(k) {
+        while let Some(e) = self.entries.get(i) {
+            match e.0.cmp(k) {
                 std::cmp::Ordering::Less => i += 1,
                 std::cmp::Ordering::Equal => return Ok(i),
                 std::cmp::Ordering::Greater => return Err(i),
@@ -40,12 +42,12 @@ impl<K: Ord, V> VecMap<K, V> {
 
     pub fn get(&self, k: &K) -> Option<&V> {
         let i = self.slot(k).ok()?;
-        Some(&self.entries[i].1)
+        self.entries.get(i).map(|e| &e.1)
     }
 
     pub fn get_mut(&mut self, k: &K) -> Option<&mut V> {
         let i = self.slot(k).ok()?;
-        Some(&mut self.entries[i].1)
+        self.entries.get_mut(i).map(|e| &mut e.1)
     }
 
     pub fn contains_key(&self, k: &K) -> bool {
@@ -54,7 +56,10 @@ impl<K: Ord, V> VecMap<K, V> {
 
     pub fn insert(&mut self, k: K, v: V) -> Option<V> {
         match self.slot(&k) {
-            Ok(i) => Some(std::mem::replace(&mut self.entries[i].1, v)),
+            Ok(i) => self
+                .entries
+                .get_mut(i)
+                .map(|e| std::mem::replace(&mut e.1, v)),
             Err(i) => {
                 self.entries.insert(i, (k, v));
                 None
@@ -86,7 +91,7 @@ impl<K: Ord, V> VecMap<K, V> {
 
 impl<'a, K: Ord, V> IntoIterator for &'a VecMap<K, V> {
     type Item = (&'a K, &'a V);
-    type IntoIter = std::iter::Map<std::slice::Iter<'a, (K, V)>, fn(&'a (K, V)) -> (&'a K, &'a V)>;
+    type IntoIter = std::iter::Map<Iter<'a, (K, V)>, fn(&'a (K, V)) -> (&'a K, &'a V)>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.entries.iter().map(|(k, v)| (k, v))
@@ -95,12 +100,14 @@ impl<'a, K: Ord, V> IntoIterator for &'a VecMap<K, V> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VecSet<T> {
-    items: Vec<T>,
+    items: Slots<T>,
 }
 
 impl<T> Default for VecSet<T> {
     fn default() -> Self {
-        Self { items: Vec::new() }
+        Self {
+            items: Slots::new(),
+        }
     }
 }
 
@@ -111,8 +118,8 @@ impl<T: Ord> VecSet<T> {
 
     fn slot(&self, x: &T) -> Result<usize, usize> {
         let mut i = 0;
-        while i < self.items.len() {
-            match self.items[i].cmp(x) {
+        while let Some(e) = self.items.get(i) {
+            match e.cmp(x) {
                 std::cmp::Ordering::Less => i += 1,
                 std::cmp::Ordering::Equal => return Ok(i),
                 std::cmp::Ordering::Greater => return Err(i),
@@ -157,7 +164,7 @@ impl<T: Ord> VecSet<T> {
         self.items.clear();
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, T> {
+    pub fn iter(&self) -> Iter<'_, T> {
         self.items.iter()
     }
 
@@ -184,7 +191,7 @@ impl<T: Ord> FromIterator<T> for VecSet<T> {
 
 impl<'a, T: Ord> IntoIterator for &'a VecSet<T> {
     type Item = &'a T;
-    type IntoIter = std::slice::Iter<'a, T>;
+    type IntoIter = Iter<'a, T>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.items.iter()

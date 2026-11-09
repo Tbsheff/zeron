@@ -1,6 +1,7 @@
 use crate::delegation::{plan, thread_stop};
 use crate::event::{Effect, How, OutboxEvent, Reject};
 use crate::ids::ThreadId;
+use crate::slots::Slots;
 use crate::state::{CohortSt, Delivery, Message, Msg, OrchState, TaskSt, ensure};
 
 pub(crate) fn apply(s: &mut OrchState, e: OutboxEvent, fx: &mut Vec<Effect>) -> Result<(), Reject> {
@@ -42,11 +43,10 @@ fn do_notice(
     }
     let p = s.thread(c)?.parent.ok_or(Reject::Corrupt)?;
     s.task_mut(c)?.st = TaskSt::Settled;
-    let set = if task.delivery == Delivery::Pending {
-        vec![c]
-    } else {
-        Vec::new()
-    };
+    let mut set = Slots::new();
+    if task.delivery == Delivery::Pending {
+        set.push(c);
+    }
     let live_now = s.cohort_live(p, task.cohort);
     plan(s, p, task.cohort, &set, live_now, fx)
 }

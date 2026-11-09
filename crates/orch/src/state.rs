@@ -1,9 +1,8 @@
-use std::collections::VecDeque;
-
 use serde::{Deserialize, Serialize};
 
 use crate::event::{Effect, Reject};
 use crate::ids::{AttemptId, RunId, TaskId, ThreadId};
+use crate::slots::Slots;
 use crate::small::{VecMap, VecSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -246,10 +245,10 @@ pub struct Thread {
     pub depth: u8,
     pub access: u8,
     pub reconfigure: bool,
-    pub queue: VecDeque<Msg>,
+    pub queue: Slots<Msg>,
     pub held: Hold,
     pub run_base: u32,
-    pub runs: Vec<Run>,
+    pub runs: Slots<Run>,
     pub int_req: bool,
     pub attempt: Attempt,
     pub inbox: VecSet<ProviderEvent>,
@@ -273,10 +272,10 @@ impl Thread {
             depth,
             access,
             reconfigure,
-            queue: VecDeque::new(),
+            queue: Slots::new(),
             held: Hold::None,
             run_base: 0,
-            runs: Vec::new(),
+            runs: Slots::new(),
             int_req: false,
             attempt: Attempt::default(),
             inbox: VecSet::new(),
@@ -458,7 +457,7 @@ impl OrchState {
         self.thread_mut(c)?.task.as_mut().ok_or(Reject::NotKid)
     }
 
-    pub fn kids(&self, t: ThreadId) -> Vec<ThreadId> {
+    pub fn kids(&self, t: ThreadId) -> Slots<ThreadId> {
         self.threads
             .values()
             .filter(|c| c.parent == Some(t))
@@ -473,9 +472,10 @@ impl OrchState {
             .count()
     }
 
-    pub fn desc(&self, t: ThreadId) -> Vec<ThreadId> {
-        let mut out = Vec::new();
-        let mut frontier = vec![t];
+    pub fn desc(&self, t: ThreadId) -> Slots<ThreadId> {
+        let mut out = Slots::new();
+        let mut frontier = Slots::new();
+        frontier.push(t);
         while let Some(x) = frontier.pop() {
             for k in self.kids(x) {
                 if k != t && !out.contains(&k) {
@@ -487,7 +487,7 @@ impl OrchState {
         out
     }
 
-    pub fn cohort_kids(&self, p: ThreadId, r: u32) -> Vec<ThreadId> {
+    pub fn cohort_kids(&self, p: ThreadId, r: u32) -> Slots<ThreadId> {
         self.threads
             .values()
             .filter(|c| c.parent == Some(p) && c.task.is_some_and(|k| k.cohort == r))
@@ -495,7 +495,7 @@ impl OrchState {
             .collect()
     }
 
-    pub fn cohort_pending(&self, p: ThreadId, r: u32) -> Vec<ThreadId> {
+    pub fn cohort_pending(&self, p: ThreadId, r: u32) -> Slots<ThreadId> {
         self.cohort_kids(p, r)
             .into_iter()
             .filter(|c| {
@@ -541,7 +541,7 @@ impl OrchState {
 
     pub(crate) fn retire_runs(&mut self) {
         let window = self.config.run_window.max(1);
-        let long: Vec<ThreadId> = self
+        let long: Slots<ThreadId> = self
             .threads
             .values()
             .filter(|th| th.runs.len() > window)

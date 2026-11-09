@@ -1,6 +1,7 @@
 use crate::event::{DelEvent, DelegateMode, Effect, Reject, WaitOutcome};
 use crate::ids::{TaskId, ThreadId};
 use crate::run::{begin_run, restart_attempt};
+use crate::slots::Slots;
 use crate::state::{
     CohortSt, Delivery, Disp, Hold, Message, Msg, OrchState, Reason, Start, Task, TaskSt, Thread,
     WakeRule, ensure,
@@ -94,8 +95,11 @@ fn narrow_access(
     fx: &mut Vec<Effect>,
 ) -> Result<(), Reject> {
     ensure(access < s.thread(t)?.access, Reject::NotNarrower)?;
-    let mut targets = vec![t];
-    targets.extend(s.desc(t));
+    let mut targets = Slots::new();
+    targets.push(t);
+    for d in s.desc(t) {
+        targets.push(d);
+    }
     for d in targets {
         let th = s.thread_mut(d)?;
         let level = th.access.min(access);
@@ -291,7 +295,7 @@ fn start_from_queue_wake(
     let (head, r, _) = queued_wake(th)?;
     let co = th.cohort(r).ok_or(Reject::Corrupt)?;
     let open = co.disp == Disp::Open;
-    let claimed: Vec<ThreadId> = co
+    let claimed: Slots<ThreadId> = co
         .del
         .iter()
         .copied()
@@ -329,7 +333,7 @@ fn reoffer(
     s: &mut OrchState,
     t: ThreadId,
     r: u32,
-    pending: &[ThreadId],
+    pending: &Slots<ThreadId>,
     fx: &mut Vec<Effect>,
 ) -> Result<(), Reject> {
     for c in pending {
@@ -355,7 +359,7 @@ pub(crate) fn plan(
     s: &mut OrchState,
     p: ThreadId,
     r: u32,
-    set: &[ThreadId],
+    set: &Slots<ThreadId>,
     live_now: bool,
     fx: &mut Vec<Effect>,
 ) -> Result<(), Reject> {
@@ -366,7 +370,7 @@ pub(crate) fn plan(
         }
         return Ok(());
     }
-    let mut claim = Vec::new();
+    let mut claim = Slots::new();
     for c in set {
         if !(s.task(*c)?.wake == WakeRule::SettledOnly && live_now) {
             claim.push(*c);
@@ -385,7 +389,7 @@ fn offer_claimed(
     s: &mut OrchState,
     p: ThreadId,
     r: u32,
-    claim: &[ThreadId],
+    claim: &Slots<ThreadId>,
     fx: &mut Vec<Effect>,
 ) -> Result<(), Reject> {
     let co = s.thread_mut(p)?.cohort_mut(r).ok_or(Reject::Corrupt)?;

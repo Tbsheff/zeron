@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
 use crate::ids::{AttemptId, RunId, TaskId, ThreadId};
 use crate::state::{Message, Outcome, ProviderEvent, Reason, Start};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Mode {
