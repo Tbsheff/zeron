@@ -48,7 +48,7 @@ def version(command):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['begin', 'built', 'app', 'finish'])
+    parser.add_argument('action', choices=['begin', 'built', 'app', 'finish', 'context', 'validate'])
     parser.add_argument('--receipt', type=Path, required=True)
     parser.add_argument('--model-root', type=Path, default=ROOT/'verification/orchestrator')
     parser.add_argument('--build-log', type=Path)
@@ -120,8 +120,8 @@ def main():
         for binary in data['build']['binaries']:
             if sha(Path(binary['path'])) != binary['sha256']:
                 raise ValueError('test executable changed during capture')
-        if not args.test_receipt or not args.jar or not args.capture_root or not args.context:
-            parser.error('finish requires --test-receipt, --jar, --context and --capture-root')
+        if not args.test_receipt or not args.jar or not args.capture_root:
+            parser.error('finish requires --test-receipt, --jar and --capture-root')
         groups = []
         for root in args.capture_root:
             for sidecar in sorted(root.rglob('capture.json')):
@@ -140,12 +140,39 @@ def main():
                 groups.append(dict(sidecar_sha256=sha(sidecar), files=files,
                                    test_name=meta['test_name'], scope=meta.get('scope','engine-integration'),
                                    synthetic=meta.get('synthetic', True)))
-        data.update(mapping_context_sha256=sha(args.context), source_after=source_hashes(), models_after=model_hashes(args.model_root), captures=groups,
+        data.update(source_after=source_hashes(), models_after=model_hashes(args.model_root), captures=groups,
                     test_receipt_path=str(args.test_receipt.resolve()), test_receipt_sha256=sha(args.test_receipt),
                     tools=dict(tla_jar_sha256=sha(args.jar), java_version=version(['java','-version']), python_version=sys.version))
+    if args.action == 'finish' and args.context:
+        data['mapping_context_sha256'] = sha(args.context)
+    if args.action == 'context':
+        if data.get('scope') != 'runtime-conformance' or not args.context or 'captures' not in data:
+            raise ValueError('context requires finished runtime capture provenance')
+        for binary in data['build']['binaries']:
+            if sha(Path(binary['path'])) != binary['sha256']:
+                raise ValueError('test executable changed after capture')
+        if sha(Path(data['test_receipt_path'])) != data['test_receipt_sha256']:
+            raise ValueError('test receipt changed after capture')
+        data['mapping_context_sha256'] = sha(args.context)
+    if args.action == 'validate':
+        if data.get('scope') != 'runtime-conformance' or not args.jar or not args.capture_root:
+            raise ValueError('validate requires runtime captures and tool identity')
+        captures = []
+        for root in args.capture_root:
+            for sidecar in root.rglob('capture.json'):
+                meta = json.loads(sidecar.read_text())
+                captures.extend((sidecar.parent/name).resolve() for name in meta['filenames'])
+        sys.path.insert(0, str(args.model_root/'runtime'))
+        from runtime_provenance import validate
+        validate(args.receipt, captures, args.jar, ROOT, args.model_root)
+        return
     args.receipt.parent.mkdir(parents=True, exist_ok=True)
     args.receipt.write_text(json.dumps(data, indent=2)+'\n')
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except (ValueError, KeyError, OSError, subprocess.SubprocessError):
+        print(json.dumps(dict(check='runtime-provenance', status='fail', field='input_identity')))
+        raise SystemExit(1)

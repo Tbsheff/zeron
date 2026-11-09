@@ -1,0 +1,56 @@
+{
+  "module": "RuntimeOperationalCompositionSpec",
+  "variables": [
+    "CoreImage",
+    "ReportingImage",
+    "TransferImage"
+  ],
+  "observed_module": "RuntimeOperationalFullObserved",
+  "image_keys": [
+    "images",
+    "reporting_images",
+    "transfer_images"
+  ],
+  "action_keys": [
+    "actions",
+    "reporting_actions",
+    "transfer_actions"
+  ],
+  "constant_keys": [
+    "constants",
+    "reporting_constants",
+    "transfer_constants"
+  ],
+  "source_map_keys": [
+    "source_map",
+    "reporting_source_map",
+    "transfer_source_map"
+  ],
+  "alignment": "All arrays use one expanded index; each product names Stutter when unchanged. Each source-map item binds raw_row and macro_substep.",
+  "required_flags": {
+    "UseReporting": true,
+    "UseTransferReporting": true,
+    "UseNS": false,
+    "UseCT": false
+  },
+  "required_properties": [
+    "MappedSpec",
+    "NamedPath",
+    "MappedType",
+    "ReportingTransitionSafety",
+    "TransferSafety",
+    "OnlyRootEndsRun",
+    "OrphansClosed",
+    "NoFalseProcessDeath",
+    "LossClosesOnlySource",
+    "BackgroundSurvivesTurn",
+    "AncestorTerminalClosesForeground",
+    "NativeLayerEnabled",
+    "TransferLayerEnabled"
+  ],
+  "fair_properties": [
+    "ReportingFairClosure"
+  ],
+  "scope": "New operational reporting targets; no unchanged legacy process or CT refinement claim.",
+  "status": "finite_actual_path_passed_current_source_gate_blocked"
+}

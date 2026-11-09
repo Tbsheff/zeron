@@ -717,7 +717,7 @@ DoStop(e, how) ==
 (* "S11_outbox" keeps effects in memory: only what startup recovery can    *)
 (* re-derive survives (Orchestrator.ts:14255), not stop cascades.          *)
 Recoverable ==
-  (UNION {{OfferE(p, r, cGen[p][r]) : r \in {r3 \in Ords : cSt[p][r3] = "offered"}} : p \in Threads})
+  UNION {{OfferE(p, r, cGen[p][r]) : r \in {r3 \in Ords : cSt[p][r3] = "offered"}} : p \in Threads}
   \cup {NoticeE(c, rord[c]) : c \in {x \in Children : created[x] /\ rtask[x] /\ ~Live(x)
                                      /\ rord[x] >= 1 /\ tSt[x] = "running"}}
 

@@ -12,7 +12,7 @@ spec.loader.exec_module(handoff)
 class HandoffTests(unittest.TestCase):
     def test_restores_raw_and_binary_after_checkout_clean(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp)/'repo';root.mkdir()
+            root=(Path(tmp)/'repo').resolve();root.mkdir()
             handoff.ROOT=root
             evidence=root/'target/orch-verify';evidence.mkdir(parents=True)
             raw=evidence/'mechanism-unit/device-a.jsonl';raw.parent.mkdir()

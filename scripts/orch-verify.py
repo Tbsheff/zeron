@@ -45,13 +45,13 @@ def run(name, command, out, receipts, cwd=ROOT, cap=300, env=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('tier', choices=['fast', 'nightly', 'traces', 'integration'])
+    parser.add_argument('tier', choices=['fast', 'nightly', 'traces', 'integration', 'capture'])
     parser.add_argument('--out', type=Path, default=ROOT / 'target/orch-verify')
     args = parser.parse_args()
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
     receipts = []
-    if args.tier in ('fast', 'integration'):
+    if args.tier in ('fast', 'integration', 'capture'):
         sources = sorted((ROOT/'crates').rglob('*.rs')) + [ROOT/'Cargo.lock', ROOT/'rust-toolchain.toml']
         (out/'rust-source-sha256.json').write_text(json.dumps({str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sources if p.is_file()}, indent=2)+'\n')
     env = dict(os.environ, CARGO_BUILD_JOBS='3', FAST_WORKERS='4', WORKERS='4',
@@ -66,35 +66,47 @@ def main():
         ok = passed and ok
         return passed
 
-    if args.tier in ('fast', 'traces', 'integration'):
-        if args.tier in ('fast', 'integration'):
+    if args.tier in ('fast', 'traces', 'integration', 'capture'):
+        if args.tier in ('fast', 'integration', 'capture'):
             shutil.rmtree(out / 'traces', ignore_errors=True)
             shutil.rmtree(out / 'mechanism', ignore_errors=True)
             shutil.rmtree(out / 'mechanism-unit', ignore_errors=True)
             shutil.rmtree(out / 'mechanism-driver', ignore_errors=True)
             check('provenance-source-tests', [sys.executable, 'scripts/orch-provenance-test.py'])
+            check('full-wrapper-tests', [sys.executable, 'scripts/orch-trace-full-test.py'])
             check('private-handoff-tests', [sys.executable, 'scripts/orch-ci-private-test.py'])
             check('dogfood-tests', [sys.executable, 'scripts/orch-dogfood-test.py'])
             check('trace-merge-tests', [sys.executable, '-m', 'unittest', 'discover', '-s', 'scripts/tests', '-p', 'test_orch_trace.py'])
-            check('core', ['cargo', 'test', '--locked', '-p', 'zeron-orch'], cap=1800)
-            check('engine', ['cargo', 'test', '--locked', '-p', 'zeron-engine', '--lib', 'orchestrator::'], cap=1800, env=dict(env, ORCH_MECHANISM_OUT=str(out/'mechanism-unit')))
-            for name, scope in [('engine-stop', 'sessions::stop_tests'),
-                                ('engine-update-lifecycle', 'update_trial::'),
-                                ('engine-native-path', 'native_paths_keep_reused_local_ids_distinct'),
-                                ('engine-question-issuance', 'retained_input_issuance_cannot_cross_attempt_rebind'),
-                                ('engine-source-steer', 'source_steer_pins_callbacks_before_drive_consumes_boundaries'),
-                                ('engine-transfer', 'transfer'), ('engine-exact-save', 'exact_save')]:
-                check(name, ['cargo', 'test', '--locked', '-p', 'zeron-engine', '--lib', scope,
-                             '--', '--test-threads=3'], cap=1800,
-                      env=dict(env, ORCH_MECHANISM_OUT=str(out/'mechanism-unit')))
-            check('harness-all-targets', ['cargo', 'check', '--locked', '-p', 'zeron-harness', '--all-targets'], cap=1800)
-            check('harness-all-lib', ['cargo', 'test', '--locked', '-p', 'zeron-harness', '--lib', '--', '--test-threads=3'], cap=1800)
-            check('harness-strict-resume', ['cargo', 'test', '--locked', '-p', 'zeron-harness', 'strict_resume', '--', '--test-threads=3'], cap=1800)
+            provenance = out/'integration-provenance.json'
+            check('provenance-begin', [sys.executable, 'scripts/orch-provenance.py', 'begin', '--receipt', str(provenance)])
+            build = ['cargo', 'test', '--locked', '-p', 'zeron-engine', '--lib', '--test', 'orch_v2', '--test', 'orch_v2_env', '--test', 'orch_remote', '--test', 'orch_questions_native', '--test', 'orch_host_gate', '--test', 'orch_run_delegation_capture', '--no-run', '--message-format=json']
+            check('engine-build', build, cap=1800)
+            check('provenance-built', [sys.executable, 'scripts/orch-provenance.py', 'built', '--receipt', str(provenance), '--build-log', str(out/'engine-build.log'), '--command', *build])
+            if args.tier != 'capture':
+                check('core', ['cargo', 'test', '--locked', '-p', 'zeron-orch'], cap=1800)
+                check('engine', ['cargo', 'test', '--locked', '-p', 'zeron-engine', '--lib', 'orchestrator::'], cap=1800, env=dict(env, ORCH_MECHANISM_OUT=str(out/'mechanism-unit')))
+                for name, scope in [('engine-stop', 'sessions::stop_tests'),
+                                    ('engine-update-lifecycle', 'update_trial::'),
+                                    ('engine-native-path', 'native_paths_keep_reused_local_ids_distinct'),
+                                    ('engine-question-issuance', 'retained_input_issuance_cannot_cross_attempt_rebind'),
+                                    ('engine-source-steer', 'source_steer_pins_callbacks_before_drive_consumes_boundaries'),
+                                    ('engine-transfer', 'transfer'), ('engine-exact-save', 'exact_save')]:
+                    check(name, ['cargo', 'test', '--locked', '-p', 'zeron-engine', '--lib', scope,
+                                 '--', '--test-threads=3'], cap=1800,
+                          env=dict(env, ORCH_MECHANISM_OUT=str(out/'mechanism-unit')))
+                check('harness-all-targets', ['cargo', 'check', '--locked', '-p', 'zeron-harness', '--all-targets'], cap=1800)
+                check('harness-all-lib', ['cargo', 'test', '--locked', '-p', 'zeron-harness', '--lib', '--', '--test-threads=3'], cap=1800)
+                check('harness-strict-resume', ['cargo', 'test', '--locked', '-p', 'zeron-harness', 'strict_resume', '--', '--test-threads=3'], cap=1800)
             integration = ['cargo', 'test', '--locked', '-p', 'zeron-engine', '--test', 'orch_v2', '--test', 'orch_v2_env', '--test', 'orch_remote', '--test', 'orch_questions_native', '--test', 'orch_host_gate']
-            check('driver-components', ['cargo', 'test', '--locked', '-p', 'zeron-engine', '--test', 'orch_run_delegation_capture'], cap=1800, env=dict(env, ORCH_MECHANISM_OUT=str(out/'mechanism-driver')))
+            if args.tier != 'capture':
+                check('driver-components', ['cargo', 'test', '--locked', '-p', 'zeron-engine', '--test', 'orch_run_delegation_capture'], cap=1800, env=dict(env, ORCH_MECHANISM_OUT=str(out/'mechanism-driver')))
             check('capture-test-list', integration + ['--', '--list'], cap=1800)
             check('engine-integration', integration + ['--no-fail-fast', '--', '--test-threads=3'], cap=1800)
             check('capture-inventory', [sys.executable, 'scripts/orch-capture-inventory.py', '--test-log', str(out/'engine-integration.log'), '--test-list', str(out/'capture-test-list.log'), '--root', str(out/'mechanism'), '--out', str(out/'capture-inventory.json')])
+            check('provenance-finish', [sys.executable, 'scripts/orch-provenance.py', 'finish', '--receipt', str(provenance), '--capture-root', str(out/'mechanism'), '--test-receipt', str(out/'engine-integration.log'), '--jar', env['TLC_JAR']])
+            if args.tier == 'capture':
+                (out/'summary.md').write_text('\n'.join(f'- {r["result"]}: {r["name"]}' for r in receipts)+'\n')
+                return 0 if ok else 1
             check('trace-runner-build', ['cargo', 'build', '--locked', '-p', 'zeron-engine', '--example', 'orch_trace'], cap=1800)
         if args.tier == 'fast':
             check('formal-fast', ['node', 'Fast_run.mjs'], cwd=FORMAL, cap=7200)

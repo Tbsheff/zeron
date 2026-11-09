@@ -59,9 +59,8 @@ def main():
                             cwd=proof_out) and ok
     if full_checker.is_file():
         ok = verify.run('full-conformance', [sys.executable, str(full_checker),
-                        '--integration', str(ROOT/'target/orch-verify/mechanism'),
-                        '--dogfood', str(dogfood)], out, rows) and ok
-    ok = verify.run('dogfood-week', [sys.executable, str(ROOT/'scripts/orch-dogfood.py'), 'status'], out, rows) and ok
+                        '--integration', str(ROOT/'target/orch-verify/mechanism')], out, rows, cap=915) and ok
+    ok = verify.run('dogfood-week', [sys.executable, str(ROOT/'scripts/orch-dogfood.py'), 'status', '--out', str(dogfood)], out, rows) and ok
     (out/'receipts.json').write_text(json.dumps(rows, indent=2)+'\n')
     return 0 if ok else 1
 

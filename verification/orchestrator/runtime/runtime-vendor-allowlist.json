@@ -1,0 +1,370 @@
+{
+  "v": 1,
+  "scope": "third package Python COMMENT-token whitespace normalization only; AST and noncomment tokens unchanged; no old receipt relabelled",
+  "files": [
+    {
+      "path": "RuntimeCaptureFrames.tla",
+      "sha256": "0446000627f230ce93ab27f2f540243523c37a18112a5fcf58721ba667162668"
+    },
+    {
+      "path": "RuntimeComposition.tla",
+      "sha256": "f5ef7f654b453aaf4e6b967ab4451cada65c9afbe0ebb25dda5828e53f05dfb7"
+    },
+    {
+      "path": "RuntimeCompositionSpec.tla",
+      "sha256": "18d57e8b1b428514414173ac8915335b3f06572b79205ca58435030916917901"
+    },
+    {
+      "path": "RuntimeContextTransferSpec.tla",
+      "sha256": "b5762dfa2b91254c292a589b4158a5dd961e5ed6a6734c04eca2c0db7c8b2ec6"
+    },
+    {
+      "path": "RuntimeDelegationSpec.tla",
+      "sha256": "4822ab68b81316645e4e8327e4ad86a02331b850aae16318a7d0028d20807fbf"
+    },
+    {
+      "path": "RuntimeForestCompositionSpec.tla",
+      "sha256": "762b6f07d3f26c0edf443836fdd712dd1fd70c23727a1eeb6fd34eec481f636a"
+    },
+    {
+      "path": "RuntimeFullForestObserved.tla",
+      "sha256": "f344c49997a961043b48022d76d6f71344741f37449d4c23fa3aa9e8ea27aeb8"
+    },
+    {
+      "path": "RuntimeFullObserved.tla",
+      "sha256": "e3f026df1cc699994087497fc6029005cc6d5f69571658f1f0a54c9f559fee83"
+    },
+    {
+      "path": "RuntimeGlobalRefinement.tla",
+      "sha256": "108a480ab232e7790916830a60d1496c285c3394387d3116260fb9d465372920"
+    },
+    {
+      "path": "RuntimeNativeQuestionSeams.tla",
+      "sha256": "633f25c0ff00b0361911ba46c1cc10821f7ce5af92e770a9318ef96640cf3322"
+    },
+    {
+      "path": "RuntimeNativeReportingSpec.tla",
+      "sha256": "3eb8303e834bfdcb7e059975aa3cc3f5c947001a7f4d2b7234e08e100c612316"
+    },
+    {
+      "path": "RuntimeNativeSpec.tla",
+      "sha256": "5db42f5d93f35774ac56cdc7cc692499b11b59ff3711321b701225cb6a5086de"
+    },
+    {
+      "path": "RuntimeOperationalCompositionSpec.tla",
+      "sha256": "98ab961b7cd03fc64b12fffbb8e4b70d2c1c0768c8a5edade899743dba9cc4ce"
+    },
+    {
+      "path": "RuntimeOperationalCoreSpec.tla",
+      "sha256": "d37e20d2d013425a90b80105af1a268616b1976768bc3e54ee75b4b976eabe1e"
+    },
+    {
+      "path": "RuntimeOperationalFullObserved.tla",
+      "sha256": "6e93ea09dc1e8ec76157dc3c1f9aed9ef523e8e6a8581c89d8c2155bb5bb52c0"
+    },
+    {
+      "path": "RuntimePlanDispatchKernel.tla",
+      "sha256": "713dcd769a5a6a51f0e60a2da6918feb3d6a321e63c760e8bca0b0d8a954ed98"
+    },
+    {
+      "path": "RuntimePlanImage.tla",
+      "sha256": "d475dc8b569f744940666a96aeda96cbcfdffd11c4653c3f956ca6b7253d4e96"
+    },
+    {
+      "path": "RuntimePlanJoint.tla",
+      "sha256": "c5936f0110e597d4b3086fedcc1baca708ae4a2c330123c679663e1f7f00a1c2"
+    },
+    {
+      "path": "RuntimePlanNativeKernel.tla",
+      "sha256": "6857dfb2465bc7cd0301f77a2e87e2481facad37c7e8642bee7d6789d16329b2"
+    },
+    {
+      "path": "RuntimePlanOperational.tla",
+      "sha256": "2a3a31b4ee5b6bdce9af7c1ec10408099c3365d65db9247b7eda005ce71aaa9b"
+    },
+    {
+      "path": "RuntimePlanOperationalTransferKernel.tla",
+      "sha256": "f47195e2cc17f443eb773434c3d17c218077b6a590d4983c979a594f0de7d6d5"
+    },
+    {
+      "path": "RuntimePlanReportingKernel.tla",
+      "sha256": "696d42b3ffaae146a884e5bbe404ec650dd0d2891c8d7e5941bc7a8dce29caa0"
+    },
+    {
+      "path": "RuntimePlanRetainedTransferKernel.tla",
+      "sha256": "fa2fe73d2c64df176a0f4930e5a29ade23fb4bee4a55bdb0b47147ac4ef7038a"
+    },
+    {
+      "path": "RuntimePlanTransferKernel.tla",
+      "sha256": "2232498cb136811c9cdea516de0b81eaf8215a3fdefec01d585156ee4356ed0d"
+    },
+    {
+      "path": "RuntimeRefinement.tla",
+      "sha256": "bd94d397c028d38576158add766982fe2ddfdecc667a48bfe60d08a826d3ee39"
+    },
+    {
+      "path": "RuntimeRemoteSeams.tla",
+      "sha256": "4bb64141a4a01508b4c444e6d69d8d92f4ed29910761cc14fbcab8f830bde072"
+    },
+    {
+      "path": "RuntimeRunDelegationSeams.tla",
+      "sha256": "f4e9adb6d2adf1fe9ec76b1dccb840d29b74522be356c8384c812ac0c307c7f5"
+    },
+    {
+      "path": "RuntimeRunLifecycleSpec.tla",
+      "sha256": "068d356f42bb1798f99c040c1b1dbbce2e93a917ed36e5a29d5b3a235c319164"
+    },
+    {
+      "path": "RuntimeSpecRunBase.tla",
+      "sha256": "d3ceaa563ef96224235d35800dda2c0b5da484ad4a513bd9f2ea99b45110dc4e"
+    },
+    {
+      "path": "RuntimeState.tla",
+      "sha256": "db3396767eaec813267a5e9f968ba7cc38270eb4044554cced0bef6e8ac2f09e"
+    },
+    {
+      "path": "RuntimeTransferReportingSpec.tla",
+      "sha256": "eaa28a1f5c5a52d3a4a5d9d740a0a5d7e57a1aedd36f4ad66c35f9173897f161"
+    },
+    {
+      "path": "RuntimeTransferSeams.tla",
+      "sha256": "d8b427be922ee6bdf411502d0b451bf15b595e2be640f276a92d9f3bb1d80658"
+    },
+    {
+      "path": "build_full_spec_stage.py",
+      "sha256": "f53a4a725a2bad7dd83a089833d8561ca5eda2b1fd27e935e32013d1c2d99920"
+    },
+    {
+      "path": "build_full_spec_wrapper.py",
+      "sha256": "c8d89b9346a85ffeec8705022ed35d7c711c78d90a348e50c54b355ad01fd92a"
+    },
+    {
+      "path": "build_operational_wrapper.py",
+      "sha256": "ab752744a9c92cb38be82781ff59ee12a27bc0650281dfeb61559c50ba948be7"
+    },
+    {
+      "path": "build_runtime_context.py",
+      "sha256": "399f42f932c52483848978ce83e4e5df2e15fbab0bb03e5ab1115a07cb5ebca3"
+    },
+    {
+      "path": "capture_projection.py",
+      "sha256": "4f35b023dfdbbcaa5781bdd15f215d82ee067f88db17a69225802fa3e1a2246d"
+    },
+    {
+      "path": "check_full_runtime.py",
+      "sha256": "8f960b3c551c43d71c549ac898d678a4061d79e763a6cfe10acee3645f39d303"
+    },
+    {
+      "path": "check_global_runtime.py",
+      "sha256": "e1b2a6e72f45238f6d91f50d6513c6e3c805eba6ace2cae11e68939ada820dd5"
+    },
+    {
+      "path": "check_native_reporting_capture.py",
+      "sha256": "8ffabb247115d0a8b7a77d644f094d9dd453a1a70e8d849c508aad61d95905cd"
+    },
+    {
+      "path": "check_remote_seams.py",
+      "sha256": "e835be2fa15852bc8648c26142c77d2100c4e18af7eb8f3466557bc15c6a0ca3"
+    },
+    {
+      "path": "check_runtime.py",
+      "sha256": "37b7b9306d58c10803ce7189dd9fee12f644db69d9044d4d9bc5c1476e12662a"
+    },
+    {
+      "path": "check_runtime_groups.py",
+      "sha256": "ea46f52534d52c8b9c03a61334f4d1adb1c85bb85bc2580ed2f24c6be0d57433"
+    },
+    {
+      "path": "check_seams.py",
+      "sha256": "012a046231bab997a1ebd6535a84930db095b1d4f228f5f2c958b15eae4a4ff7"
+    },
+    {
+      "path": "check_trace.py",
+      "sha256": "229601ca4f3779cf5524b23a637513d5764e7573c5990a61657e525ac2913169"
+    },
+    {
+      "path": "composition_history_projection.py",
+      "sha256": "566fda6a835a1e7be420f6c649092c71a422a0194415ab6b1045241029af8514"
+    },
+    {
+      "path": "composition_transfer_projection.py",
+      "sha256": "9c736c09ac332a643122836c17cc29ae7361a9b9b76b15fdbaf1a1653187c19f"
+    },
+    {
+      "path": "emit_operational_full_projection.py",
+      "sha256": "0bda2618b7c5e5ad81f4a1d24f88e25f7691599f98e2b55142b2311c710ca3d6"
+    },
+    {
+      "path": "full-spec-interface.json",
+      "sha256": "92ad8b4c8784bcb49c163f8d03119a266cc0f0f3f4fe4f36651719d4b9ea30bc"
+    },
+    {
+      "path": "full-spec-source-manifest.json",
+      "sha256": "8f14df8588da2cad228e314f6257cc65df8b46b2d453d7686045c6eda700c1aa"
+    },
+    {
+      "path": "inventory_full_runtime_groups.py",
+      "sha256": "f02c01cbdfb78359dafb4a2691e997c0a1275869775c511ef1e3f88ee9fd27f4"
+    },
+    {
+      "path": "inventory_runtime_captures.py",
+      "sha256": "f4d18bdd9c3cb644df4f33b2aeefa255331499498ae4e8165ac2f0c1b0a1244d"
+    },
+    {
+      "path": "inventory_runtime_groups.py",
+      "sha256": "c7d442b74ff6710fce0a244b2ece5742d8bece7af92ef9ad6bc7715c1b1060aa"
+    },
+    {
+      "path": "make_global_fixture.py",
+      "sha256": "7a90056a4b65e71a037d42a92d1b96ea441972888d273343c3bd5da267d4a002"
+    },
+    {
+      "path": "make_joint_fixture.py",
+      "sha256": "f1774daa76e1024c54801206eb60e5e7568d10a31ed4ad373b0b36f8f8efc30f"
+    },
+    {
+      "path": "merge_runtime.py",
+      "sha256": "a6abffe5ea3d46b243136f8d4405161c02984e9ee02cd1b85dea7c78c700e0f5"
+    },
+    {
+      "path": "native_question_projection.py",
+      "sha256": "b4b169cecf21f9cf8955c82020182facb2c205371e22430f9cf79d1554fee990"
+    },
+    {
+      "path": "native_reporting_projection.py",
+      "sha256": "69c162978d5f45aafb2cb62ada92b2c3ef11bea651a09d3ea76116ced74fcf15"
+    },
+    {
+      "path": "operational-product-api.json",
+      "sha256": "1bbcbea26085d5c9bfa4a4341b374bb25714f4dd557a67b7bebdc7f9cb4ac700"
+    },
+    {
+      "path": "preflight_runtime_groups.py",
+      "sha256": "8188398615fa7f147d98dab89fbc18890a633bbb2cb249c5b3cdc7268372f2b4"
+    },
+    {
+      "path": "private_runner.py",
+      "sha256": "38f6fa5aaa0f00e4151c383b62fbfca6a922945676e0b20fcb8b5224f6728623"
+    },
+    {
+      "path": "remote_projection.py",
+      "sha256": "7964a5c8e32ef4014056c48bf65100fd80f4fe32e21577cee66b0c7444f2c4ae"
+    },
+    {
+      "path": "run_delegation_projection.py",
+      "sha256": "6b66e05e5b702d149d30b1e6872c294cb256b2c8b9e0fc8d6f991bdf13058718"
+    },
+    {
+      "path": "runtime-question-issuance-contract.md",
+      "sha256": "3f4fc382115db5f51423163098a8de53560ca4d4c552fb57dfd5c79939383699"
+    },
+    {
+      "path": "runtime-transaction-contract.md",
+      "sha256": "073f8ab7808a3621e51d17c5a301de3c8fdb006d89030c78e1c24c263ba1602a"
+    },
+    {
+      "path": "runtime_action_projection.py",
+      "sha256": "3a1c957003caa3944cfb5364a02377998ddcd37079b364f14942f16dbbed98ef"
+    },
+    {
+      "path": "runtime_full_projection.py",
+      "sha256": "fd3b0f8793fe74971405a9227f3c57bb109cfd8985f6e2c16cfe0f436ef7bd98"
+    },
+    {
+      "path": "runtime_operational_projection.py",
+      "sha256": "77daba522c73f0191395600780c36334d41344bbfd662b563f0195382ca4e697"
+    },
+    {
+      "path": "runtime_projection.py",
+      "sha256": "f9a3966fa97e331816b6826ad9b53a2545e98ec0b63aa79452e35ab462459fc5"
+    },
+    {
+      "path": "runtime_provenance.py",
+      "sha256": "ff95d1f14d11460a6543b9784349e2f45d4fcc3b9664a0c3c28e402f5ec5a0c2"
+    },
+    {
+      "path": "runtime_question_issuance.py",
+      "sha256": "5eb8629c6b809ac737fdb777febc8a0913d06c11cb0d8088d64085273f746da8"
+    },
+    {
+      "path": "runtime_reporting_actions.py",
+      "sha256": "36ecc342ab5d76ae16277302156646b0c93fceef37fa3572b680088675ce5e44"
+    },
+    {
+      "path": "runtime_transfer_reporting_projection.py",
+      "sha256": "4606367870f652995529203623c3265ae51d4a7542b3f79e5ba877d310721db5"
+    },
+    {
+      "path": "test_build_runtime_context.py",
+      "sha256": "4bd5c4d46ec4b0480d8d04b5dc384b79bf1e3ad7aa4603b087b5bd2c69b69921"
+    },
+    {
+      "path": "test_capture_projection.py",
+      "sha256": "c275f893708a7eeff2c56e7c0485b4bdc7e505b9fe8b3d1c9996a351720f7c78"
+    },
+    {
+      "path": "test_check_full_runtime.py",
+      "sha256": "f77779be5748c9f708fdf67a219fbd03fa9d53f3530f5daecfc2c288384774a6"
+    },
+    {
+      "path": "test_inventory_full_runtime_groups.py",
+      "sha256": "d597e72e1507cbb22785b695fc321e759b82c578037d818e8a54374bd3334884"
+    },
+    {
+      "path": "test_inventory_runtime_captures.py",
+      "sha256": "dd409d5d0daf7cf2a55b5fb608520bbb75bb348a24f4d26153e33c1e5657e357"
+    },
+    {
+      "path": "test_inventory_runtime_groups.py",
+      "sha256": "430f4d75eea689d061aa9200d9eed5f12eefa6c3dd23ff03d4a337359a3562a5"
+    },
+    {
+      "path": "test_merge_runtime.py",
+      "sha256": "a56f0f22629804db9994d140347e2802c4bc4446eb3ca34f93f5dead9f839be7"
+    },
+    {
+      "path": "test_native_question.py",
+      "sha256": "8bbe2ae23772774a38981f61191440d0964d1b593492d3110e3bef81a452ccf1"
+    },
+    {
+      "path": "test_native_reporting_projection.py",
+      "sha256": "2a37f0b3a2c1dd409c2b30f8a5e092129d150ab7d926414de525e2b4811651a0"
+    },
+    {
+      "path": "test_runtime_action_projection.py",
+      "sha256": "8b1cbad7b7972a986e75cae81dbe92472517710b64dfbeaf4e6ccaaf0c62fa4d"
+    },
+    {
+      "path": "test_runtime_operational_projection.py",
+      "sha256": "365a2e5824ba69549e1a7a916fb7920f7552fbcff07b0e64d7938ce223abf203"
+    },
+    {
+      "path": "test_runtime_product_alignment.py",
+      "sha256": "ec6c5a688063b48bb8f6e8ba50316cc5723d5d3a1a968af8d52277ea2447dcba"
+    },
+    {
+      "path": "test_runtime_provenance.py",
+      "sha256": "f08fcec16f180379d9302f5682b6851202921d8ca022659b4e5a2bbe940f5230"
+    },
+    {
+      "path": "test_runtime_question_issuance.py",
+      "sha256": "6a96b61dc84541d5a47e299662711f36b0b5d5bf9090597d7c9109329b5c1727"
+    },
+    {
+      "path": "test_runtime_reporting_actions.py",
+      "sha256": "94f63e6d318678e46eaf32a287586b1aec4c525f19ef71db306f73ceaefef8eb"
+    },
+    {
+      "path": "test_runtime_transactions.py",
+      "sha256": "cfcfa6c2620a427c82f588d6b50f8372bd3595ec727da384f846e631fa2cc524"
+    },
+    {
+      "path": "test_transfer_projection.py",
+      "sha256": "4333faf9e840fc1422afecdfa5215b1346f409923159794c6d8cdb995d250e4f"
+    },
+    {
+      "path": "transfer_projection.py",
+      "sha256": "d943387fe978e04ba438a76b9450d734c69da071917b23520d1b709841d92543"
+    }
+  ]
+}

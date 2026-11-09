@@ -1,0 +1,44 @@
+[
+  {
+    "source": "RunBase.tla",
+    "source_path": "/Users/tylersheffield/.zeron/scratch/2026-11-08-19843a51/tla/v2/RunBase.tla",
+    "generated": "RuntimeSpecRunBase.tla",
+    "source_sha256": "2c20a96df29164feb90049457dc01a31350c348430ef3d0c4bbcebf3c2b5dc63",
+    "generated_sha256": "d3ceaa563ef96224235d35800dda2c0b5da484ad4a513bd9f2ea99b45110dc4e"
+  },
+  {
+    "source": "RunLifecycle.tla",
+    "source_path": "/Users/tylersheffield/.zeron/scratch/2026-11-08-19843a51/tla/v2/RunLifecycle.tla",
+    "generated": "RuntimeRunLifecycleSpec.tla",
+    "source_sha256": "0a95dbc80e9e81569ac0b35c1ce9137643c7eddbaf280ebe6ab8606749522ae3",
+    "generated_sha256": "068d356f42bb1798f99c040c1b1dbbce2e93a917ed36e5a29d5b3a235c319164"
+  },
+  {
+    "source": "Delegation.tla",
+    "source_path": "/Users/tylersheffield/.zeron/scratch/2026-11-08-19843a51/tla/v2/Delegation.tla",
+    "generated": "RuntimeDelegationSpec.tla",
+    "source_sha256": "c488fae742e4a44b9a577790a99911d06a9b1e6076c088d00757d2903528fc07",
+    "generated_sha256": "4822ab68b81316645e4e8327e4ad86a02331b850aae16318a7d0028d20807fbf"
+  },
+  {
+    "source": "NativeSubagents.tla",
+    "source_path": "/Users/tylersheffield/.zeron/scratch/2026-11-08-19843a51/tla/v2/NativeSubagents.tla",
+    "generated": "RuntimeNativeSpec.tla",
+    "source_sha256": "ff5fe91a9be70371756e80096e6f45d186f15579da33d9b95ab43e6fe7290add",
+    "generated_sha256": "5db42f5d93f35774ac56cdc7cc692499b11b59ff3711321b701225cb6a5086de"
+  },
+  {
+    "source": "ContextTransfer.tla",
+    "source_path": "/Users/tylersheffield/.zeron/scratch/2026-11-08-19843a51/tla/v2/ContextTransfer.tla",
+    "generated": "RuntimeContextTransferSpec.tla",
+    "source_sha256": "113c47c8dfe5c3a0e74fa244c358719a53eae48cecadc8740aeb648b3f98b1b6",
+    "generated_sha256": "b5762dfa2b91254c292a589b4158a5dd961e5ed6a6734c04eca2c0db7c8b2ec6"
+  },
+  {
+    "source": "Composition.tla",
+    "source_path": "/Users/tylersheffield/.zeron/scratch/2026-11-08-19843a51/tla/v2/Composition.tla",
+    "generated": "RuntimeCompositionSpec.tla",
+    "source_sha256": "18ca4d866e6ebd40e13f1057a8180afb8f159253a3be1812f53ae0d20e938ad3",
+    "generated_sha256": "18d57e8b1b428514414173ac8915335b3f06572b79205ca58435030916917901"
+  }
+]

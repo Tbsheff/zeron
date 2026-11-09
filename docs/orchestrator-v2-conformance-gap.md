@@ -1,122 +1,109 @@
 # Close runtime conformance
 
-Full runtime conformance is open. Do not create a passing placeholder checker.
-The required `orchestrator-verify` job runs the release check after executable
-checks. It fails until full S3, full conformance, and the use week pass. The S3
-wrapper is now present; the release gate generates its source from the
-vendored Delegation module, checks the inverse transform, then runs fresh
-TLAPS obligations. Full runtime conformance and the week remain absent.
+Full runtime conformance remains open. The code, local tests, and signed dev app
+are built. They do not prove the full implementation. Keep the required release
+check blocked until the model checks, engine coverage, and real use week pass.
 
-The approved design and acceptance snapshots are in
-[`orchestrator-v2/DESIGN.md`](orchestrator-v2/DESIGN.md) and
-[`orchestrator-v2/ACCEPTANCE.md`](orchestrator-v2/ACCEPTANCE.md). The design ledger
-records Tyler's approval on 2026-11-08. `SNAPSHOT.sha256` fixes these imported
-texts. Later R25–R42 rules in the task briefs and progress ledger take priority
-where the snapshot has older wording. Keep these differences explicit.
+The approved [design](orchestrator-v2/DESIGN.md) and
+[acceptance criteria](orchestrator-v2/ACCEPTANCE.md) remain unchanged.
+`orchestrator-v2/SNAPSHOT.sha256` fixes those texts. The mutable
+[implementation record](orchestrator-v2/IMPLEMENTATION.md) records later rules,
+including R43–R50. Do not replace an approved claim with a weaker check.
 
-## Capture mechanism state
+## Capture actual state
 
-The current row captures a reducer event, effects, and an opaque state hash.
-The v1 hash uses SHA-256; the approved schema requests BLAKE3. That
-proves neither the SQLite receipt/outbox state nor a synced doc write.
-Add a versioned mechanism row at each commit boundary. Keep user text out of
-the projection. Assign ids from stable chat and message ids; never infer global
-identity from per-device `ThreadId` integers.
+The old compact v1 trace records reducer events, effects, and SHA-256 state
+hashes. The opt-in v2 mechanism capture now adds structured SQLite snapshots:
+core state, receipts, outbox rows, processed commands, command receipts, stable
+thread bindings, and observation facts. Driver rows commit with the SQLite
+change. The exporter writes local JSONL; raw rows stay private.
+
+An earlier capture batch with 70 sidecars, including failed-test prefixes, used
+134,747,697 raw bytes. Observation snapshots repeat earlier facts and rows, so
+capture size can grow quadratically. No seven-day capture capacity check has
+passed. This remains a limit of the opt-in verification capture path.
+
+Each `origin.commit` identifies one row. `origin.transaction` identifies the
+physical SQLite commit. Several rows can share that transaction. The merger
+keeps them together. The mapper uses the current device's internal rows plus
+other devices' committed state, and exposes only the final state of the group.
+It must not let another device observe a temporary pending interrupt between
+an atomic Apply and CompleteEffect.
 
 ```mermaid
 flowchart LR
-  D[Doc commit] --> C[Mechanism capture]
-  S[SQLite commit] --> C
-  J[Journal append] --> C
-  H[Harness observation] --> C
-  C --> M[Seq and message edge merge]
-  M --> Z[ZeronImpl action replay]
-  Z --> A[Refinement mapping check]
+  A[SQLite rows and source facts] --> B[Private capture and provenance]
+  B --> C[Sequence and message edges]
+  C --> D[Physical transaction groups]
+  D --> E[Source state and named action map]
+  E --> F[Core, reporting and transfer target]
 ```
 
-| Capture boundary | Capture fields | Model operators |
-|---|---|---|
-| Commit reducer state and receipt in `Driver::apply_tx` (`driver.rs`) | stable chat id map; host rows; receipt ids; ordered held queue; emitted outbox ids and payload kind; accepted/rejected result; structured pre/post projection | `ZInit`, `DrainPerson`, `DrainTask`, `Delegate`, `ZEndRun`, `IngestNotice`, `DrainQRow`, `DrainClamp` in `ZI_ZeronImpl.tla` |
-| Mark processed commands in `Driver::mark_command` and DocHost drain (`driver.rs`, `doc_host.rs`) | ledger row id, row origin, deciding host, replica version read, receipt id, processed mark | `MarkLedger`, `DrainDupRow`; `ZI_ReceiptBeforeMark`; `ZI_PlImpl` replica gates |
-| Insert and finish outbox rows (`store::put_outbox`, `store::mark_done`) | effect id, originating command, host, payload kind, durable status; retain pending rows across crash | `obx`, `CreateWrite/CreateMark`, `PublishWrite/PublishMark`, `StopWrite/StopMark` |
-| Append remote rows in `OrchWire::transmit` (`remote.rs`) | stable wire id, sender/target chat and host, payload kind, doc ledger vs orch_out, append receipt, replica version | `cmds`, `orchOut`, `qCmd`, `qOut`, `aCmd`; matching write actions |
-| Start provider attempt (`OrchWire` start effect handler, `wire.rs`) | chat/run/attempt key, synced-doc gate result and version, journal pre/post seq, start receipt, effective access, actual provider start count | `DispatchRun`, `DispatchMark`, `jr`, `jseq`, `prov`, `dispatches`, `runAcc` |
-| Send wait/read reply and observe ToolResult (wire task helpers and session stream) | run/attempt, child/run, reply id, sent flag, observed flag; reset volatile flags on crash | `WaitReply`, `WaitObserved`, `ReadReply`, `ReadObserved`, `DeviceCrash`; `ZI_AckObserved` |
-| Apply Stop, question hop, Clamp and restart | chat host, epoch, holder/view/wake sets, access config/received ceiling/live-run access, timer state | `DrainStop`, `IngestQUp`, `IngestQClosed`, `ZStartQuestion`, `ZAgentAnswer`, `ZPersonAnswer`, `ZNarrowAccess`, `DrainClamp` |
-| Change device reachability; crash and recover | host id, offline/online transition, cleared volatile state, durable state retained, recovery generation | `GoOffline`, `GoOnline`, `DeviceCrash` |
+Provider request identity, session identity, context delivery, reporting loss,
+and process death are different facts. A session-start event does not prove
+context acceptance. A closed stream does not prove process death. A callback
+must keep the issued request and attempt even when approval or dispatch occurs
+later. The R50 checker joins the raw issue, route, and accepted question receipt;
+a normalized question row alone is insufficient.
 
-Suggested row fields, in addition to the existing clock-free header:
+The approved schema also calls for canonical BLAKE3 post hashes. The raw v2
+snapshot does not claim that field. Keep that schema gap explicit; do not label
+a compact SHA-256 hash as BLAKE3. Exact state-image checks do not remove the
+remaining schema requirement.
 
-```json
-{
-  "v": 2,
-  "dev": "host-id",
-  "seq": 12,
-  "act": "PublishWrite",
-  "args": {"child": "stable-chat-id", "run": 1},
-  "msg": {"id": "stable-wire-id", "dir": "send"},
-  "origin": {"kind": "doc", "commit": "stable-commit-id"},
-  "partition": {"hosts": {}, "runs": {}, "tasks": {}, "cohorts": {}, "queues": {}, "receipts": [], "outbox": [], "journal": [], "waits": {}, "questions": {}, "clamps": {}},
-  "post": "blake3:canonical-projection"
-}
-```
+## Check the shipped software
 
-Define the exact field types before implementation. The example is a schema
-proposal, not a supported capture. Hash the canonical projection after the
-mapping. Do not hash only `OrchState` and call that the mechanism state.
-Capture SQLite projection rows in the same transaction as the state change.
-Doc and journal commits need durable commit ids in their own records. A trace
-write after a remote append can be lost on a crash. The present send fence
-reduces this gap but does not remove it. Capture that commit record during
-recovery, with the same id; do not invent a second send.
+The vendored runtime tools reconstruct state from source facts and check exact
+named transitions. The common target requires the core, native reporting, and
+request-scoped transfer products. It cannot choose a target successor to make
+an unexplained source state pass. Unknown or conflicting hosts, missing source
+identities, missing request links, and unsupported observations fail closed.
 
-## Resolve semantic gaps
+The normalized vendor package removes Python comment text only. ASTs, token
+text and positions remain equal; TLA and original spec bytes remain exact.
+Its canonical allowlist records the new hashes. Earlier receipts retain their
+original hashes and scope.
 
-`ZI_ZeronImpl` does not yet model RunLifecycle attempts. Context transfer and
-native work use separate `ZI_CT*` and `ZI_NS*` modules. `ZI_Refinement` checks a
-Delegation slice; `ZI_PlacementRef` checks a Placement slice. Neither proves
-one full `ZeronImpl => Composition` relation for the new runtime. Add that
-relation before claiming AC-P2 in full.
+Comment removal retains spaces to preserve token positions. The scoped Git
+whitespace rule permits that padding only inside the vendored runtime package.
+The canonical hashes still cover every byte. Generated Python bytecode stays
+outside the package and the commit.
 
-`Followup` creates a new task run after the prior result is handled.
-`ReadTaskResult` carries both the observing parent run and the child task run.
-Capture both ordinals and settle/ack receipts keyed on child plus task run;
-otherwise an old notice or read can affect the new task (R25). Map these
-steps to `FollowUp`, the new cohort generation, and the live-reader guard.
+The final package passed all 148 unit tests, including the common-target entry
+point and JSON context comparison. A fresh source-bound test passed both its
+60-row core/transaction
+prerequisite and 63 exact common-target images. That test used one device and a
+provider stand-in. It checked physical transaction visibility and the raw
+question issuance join. It does not prove every runtime path, arbitrary
+executions, fair progress, deployed providers, or a real use week. Earlier
+component receipts remain separate.
 
-`RemoteImport` creates shadow rows and starts a remote child from a stable
-route. `RemoteNotice` updates a shadow and consumes the notice. These runtime
-steps have no direct named ZI action today. Define their map to ledger writes,
-host drain, ingest and stutter actions. Do not accept an arbitrary sequence of
-model actions just because its final hash matches. A runtime macro-step may
-map to a fixed documented finite path. Preserve each I/O boundary in that path.
+The latest engine gate passed 54 orchestrator tests, 25 transfer tests, all 68
+runtime integrations, and compact replay of 75 recordings. All 547 harness
+library tests also passed on unchanged harness source. These tests use provider
+stand-ins. [CHECKS.json](orchestrator-v2/CHECKS.json) records the exact local
+source and app scope. The manual engine and app receipts are not full-model
+provenance and must not be promoted to it after the run.
 
-The current reducer can use a local effective-access representation while the
-model separates config, received ceiling, and live-run access. Keep all three
-values in the projection. A single `access` value would hide a missing Clamp
-and repeat the already known R28 vacuity.
+## Keep the open work explicit
 
-Reconstruct ghost values (`pushes`, dispatch count, observed ack) from captured
-facts, not from expected model outputs. Check that captured facts constrain
-them. The checker must fail when a delivery repeats or an ack is only sent.
+- Bind fresh integration captures to source, binaries, models, and test receipts
+  before they run. Derive their context from those exact captured rows. Recheck
+  the same inputs before sealing the context. Reject app-only or unbound
+  provenance, incomplete groups, foreign contexts, and altered inputs.
+- Map every required source path. Current strict failures include absent host
+  authority, unsupported observation steps, and missing request or binding
+  links. Do not fill those gaps with expected model state or guessed facts.
+- Check the joint mechanism relation against the corrected operational target.
+  Prove safety and fair progress for the independent system model. Captured
+  paths and separate module proofs do not prove this relation in full (AC-P2).
+- Check every required engine action, guard in both states, and mutant (AC-I2).
+  Driver-only scripts and constructor counts do not prove live callers.
+- Check actual deployed Cloud and provider behavior. Local document channels
+  and provider stand-ins do not prove those services.
+- Collect and validate a real seven-day use window. Synthetic days, copied
+  databases, and runner setup do not count as use.
 
-## Check actual traces
-
-1. Freeze the v2 projection and the full model action map. Add one fixture for
-   each runtime action and each fixed macro-step.
-2. Export every mechanism commit from all integration tests. Inventory each
-   exporter so a missing trace fails rather than leaving an old recording.
-3. Merge only sequence and stable send/receive edges. Reject a missing remote
-   producer, duplicate sequence, origin conflict, or causal cycle.
-4. Replay each captured action with its arguments against the full model. At
-   each step compare the structured post projection and canonical hash.
-5. Apply the §9.2 mapping and check the Composition relation. State the finite
-   bounds; trace checking is evidence, not a proof of arbitrary executions.
-6. Run negative fixtures for FP1–FP6, duplicate rows, doc rollback, wrong host,
-   ack-before-observe, missing Clamp, and task follow-up run-key reuse. Each
-   mutant must fail at the changed boundary.
-7. Run the full checker on every integration recording and every capture in
-   the week. Only then replace the missing checker release blocker.
-
-These are required implementation tasks, not completed checks. Current receipts
-remain useful for reducer and durable receipt regression tests only.
+The strict full checker must report the first unsupported boundary and return
+failure. Keep those receipts. Never ship a placeholder success or weaken the
+release gate to make the build appear complete.
