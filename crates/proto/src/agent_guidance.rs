@@ -9,6 +9,7 @@ pub struct Features {
     pub visuals: bool,
     pub waits: bool,
     pub side_chats_only: bool,
+    pub delegation: bool,
 }
 
 impl Features {
@@ -17,8 +18,13 @@ impl Features {
             visuals: true,
             waits: true,
             side_chats_only: true,
+            delegation: false,
         }
     }
+}
+
+pub fn orchestrator_on(value: Option<&str>) -> bool {
+    value.is_some_and(|value| matches!(value.trim(), "1" | "true" | "on"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +62,17 @@ pub const WAITS: Section = Section {
 When you start background work you will come back to once it finishes (a test run, a build, a long check) and you end your turn before it finishes, call the Zeron tool `wait_on_background` with its task id first, so the person sees this chat waiting rather than finished. Never for work you leave running on purpose (a dev server, a watcher).",
 };
 
+pub const DELEGATION: Section = Section {
+    key: "delegation",
+    text: "\
+## Delegated tasks
+
+- Parallel or isolated work: `delegate_task`, one child per call. The child sees only `task`. Keep its `taskId`.
+- Default mode `async`: results arrive as one task-results message in a later turn, so end your turn. Do not poll `task_status`.
+- Mode `wait` only when this turn needs the answer.
+- Limits: depth 2, 8 unsettled children. Stop a task: `task_cancel`.",
+};
+
 pub const SIDE_CHATS_ONLY: Section = Section {
     key: "side_chats",
     text: "\
@@ -74,6 +91,9 @@ When a chart, table, diagram, or 3D view says more than prose, show it with `sho
 
 pub fn sections(features: Features) -> Vec<Section> {
     let mut out = vec![CORE];
+    if features.delegation {
+        out.push(DELEGATION);
+    }
     if features.waits {
         out.push(WAITS);
     }
@@ -159,15 +179,19 @@ fn split_hard(block: &str, max: usize) -> Vec<String> {
 
 impl McpServer {
     pub const GUIDANCE_ENV: &'static str = "ZERON_MCP_GUIDANCE";
+    pub const ORCHESTRATOR_ENV: &'static str = "ZERON_ORCH_V2";
 
     pub fn guidance_features(&self) -> Features {
+        let in_chat = self
+            .env
+            .get(Self::CHAT_ID_ENV)
+            .is_some_and(|id| !id.is_empty());
         Features {
-            visuals: self
-                .env
-                .get(Self::CHAT_ID_ENV)
-                .is_some_and(|id| !id.is_empty()),
+            visuals: in_chat,
             waits: self.waits_on_background(),
             side_chats_only: self.side_chats_only(),
+            delegation: in_chat
+                && orchestrator_on(self.env.get(Self::ORCHESTRATOR_ENV).map(String::as_str)),
         }
     }
 
@@ -260,5 +284,35 @@ mod tests {
         assert_eq!(server.guidance_features(), Features::all());
         assert!(!server.guidance_in_prompt());
         assert!(server.with_guidance_in_prompt().guidance_in_prompt());
+    }
+
+    #[test]
+    fn delegation_guidance_follows_the_orchestrator_flag_in_a_chat() {
+        let mut server = McpServer::default();
+        server
+            .env
+            .insert(McpServer::ORCHESTRATOR_ENV.into(), "1".into());
+        assert!(!server.guidance_features().delegation);
+        server.env.insert(McpServer::CHAT_ID_ENV.into(), "c".into());
+        assert!(server.guidance_features().delegation);
+        for (value, on) in [("true", true), (" on ", true), ("0", false), ("yes", false)] {
+            server
+                .env
+                .insert(McpServer::ORCHESTRATOR_ENV.into(), value.into());
+            assert_eq!(server.guidance_features().delegation, on, "{value}");
+        }
+        let on = Features {
+            delegation: true,
+            ..Features::all()
+        };
+        let keys: Vec<&str> = sections(on).iter().map(|s| s.key).collect();
+        assert_eq!(
+            keys,
+            ["core", "delegation", "waits", "side_chats", "visuals"]
+        );
+        assert!(!text(Features::all()).contains("delegate_task"));
+        for (key, value) in codex_entries(on, None) {
+            assert!(value.len() < 4_000, "{key}: {}", value.len());
+        }
     }
 }
