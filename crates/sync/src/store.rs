@@ -74,6 +74,35 @@ const MIGRATIONS: &[&str] = &[
     CREATE TABLE sync_job_clock (id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL) STRICT;
     INSERT INTO sync_job_clock VALUES (1,0);",
     "ALTER TABLE chat_sync_jobs ADD COLUMN cursor TEXT NOT NULL DEFAULT '';",
+    "CREATE TABLE orch_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE orch_state (
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        seq INTEGER NOT NULL,
+        state TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE orch_receipts (
+        key TEXT PRIMARY KEY,
+        seq INTEGER NOT NULL,
+        result TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE orch_outbox (
+        effect_id TEXT PRIMARY KEY,
+        seq INTEGER NOT NULL,
+        idx INTEGER NOT NULL,
+        payload TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending','done'))
+    ) STRICT;
+    CREATE INDEX orch_outbox_pending ON orch_outbox(status, seq, idx);
+    CREATE TABLE orch_trace (
+        seq INTEGER PRIMARY KEY,
+        dev TEXT NOT NULL,
+        act TEXT NOT NULL,
+        accepted INTEGER NOT NULL,
+        line TEXT NOT NULL
+    ) STRICT;",
 ];
 
 const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -611,6 +640,19 @@ impl DocsStore {
                 tracing::warn!(%err, "docs store: busy timeout not restored after reclaim");
             }
         });
+    }
+
+    pub fn transact<T, E: From<rusqlite::Error>>(
+        &self,
+        f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, E>,
+    ) -> Result<T, E> {
+        store_blocking(|| {
+            let mut conn = self.conn();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let out = f(&tx)?;
+            tx.commit()?;
+            Ok(out)
+        })
     }
 
     pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
