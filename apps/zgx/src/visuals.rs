@@ -329,7 +329,7 @@ pub fn register(host: &ScriptHost) {
     host.function("visuals.answers", move |arg| {
         let id = crate::auth::text(&arg);
         let answers = v.with(&id, |e| e.runtime.as_ref().map(zv::Visual::take_answers)).flatten();
-        Value::List(answers.unwrap_or_default().iter().map(|a| Value::from(a.as_str())).collect::<Vec<_>>().into())
+        Value::List(answers.unwrap_or_default().iter().map(|a| Value::from(a.line.as_str())).collect::<Vec<_>>().into())
     });
     let v = visuals.clone();
     host.function("visuals.draw", move |arg| {

@@ -493,8 +493,36 @@ fn a_handler_queues_its_answers_until_the_host_takes_them() {
     let click = button_of(&visual.render().unwrap());
     assert!(visual.take_answers().is_empty());
     visual.call(click, HandlerArg::None).unwrap();
-    assert_eq!(visual.take_answers(), ["Pick: B", "why: speed"]);
+    let lines: Vec<String> = visual.take_answers().into_iter().map(|a| a.line).collect();
+    assert_eq!(lines, ["Pick: B", "why: speed"]);
     assert!(visual.take_answers().is_empty());
+}
+
+#[test]
+fn an_answer_names_its_label_slot_and_whether_it_appends() {
+    let mut visual = Visual::load(
+        &answer_script(
+            r#"ui.answer("B", { label = "Pick" }) ui.answer("Approved") ui.answer("ran", { label = "Log", append = true }) ui.answer("x", { append = false })"#,
+        ),
+        1,
+    )
+    .unwrap();
+    let click = button_of(&visual.render().unwrap());
+    visual.call(click, HandlerArg::None).unwrap();
+    let answer = |line: &str, label: &str, append: bool| Answer {
+        line: line.into(),
+        label: label.into(),
+        append,
+    };
+    assert_eq!(
+        visual.take_answers(),
+        [
+            answer("Pick: B", "Pick", false),
+            answer("Approved", "", false),
+            answer("Log: ran", "Log", true),
+            answer("x", "", false),
+        ]
+    );
 }
 
 #[test]
@@ -544,7 +572,9 @@ fn answers_are_strings_capped_and_dropped_when_their_handler_fails() {
     for (call, needle) in [
         ("ui.answer(42)", "takes a string, not a"),
         (r#"ui.answer("B", { label = 1 })"#, "label is a string"),
-        (r#"ui.answer("B", { lable = "Pick" })"#, "no option 'lable'"),
+        (r#"ui.answer("B", { lable = "Pick" })"#, "no option 'lable' (only label, append)"),
+        (r#"ui.answer("B", { append = 1 })"#, "'append' must be true or false (got integer)"),
+        (r#"ui.answer("B", { append = "yes" })"#, "'append' must be true or false (got string)"),
     ] {
         let mut visual = Visual::load(&answer_script(call), 1).unwrap();
         let click = button_of(&visual.render().unwrap());
@@ -557,7 +587,7 @@ fn answers_are_strings_capped_and_dropped_when_their_handler_fails() {
     let click = button_of(&visual.render().unwrap());
     visual.call(click, HandlerArg::None).unwrap();
     let answers = visual.take_answers();
-    assert_eq!(answers[0].chars().count(), MAX_ANSWER_CHARS);
+    assert_eq!(answers[0].line.chars().count(), MAX_ANSWER_CHARS);
 
     let mut visual = Visual::load(&answer_script(r#"ui.answer("B") error("boom")"#), 1).unwrap();
     let click = button_of(&visual.render().unwrap());

@@ -130,9 +130,48 @@ pub struct Visual {
     seed: i64,
     deadline: Rc<Cell<Option<Instant>>>,
     logs: Rc<RefCell<Vec<String>>>,
-    answers: Rc<RefCell<Vec<String>>>,
+    answers: Rc<RefCell<Vec<Answer>>>,
     in_handler: Rc<Cell<bool>>,
     assets: Assets,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Answer {
+    pub line: String,
+    pub label: String,
+    pub append: bool,
+}
+
+fn answer_options(options: Option<Table>) -> mlua::Result<Answer> {
+    let mut answer = Answer::default();
+    let Some(options) = options else {
+        return Ok(answer);
+    };
+    for pair in options.pairs::<Value, Value>() {
+        let (key, value) = pair?;
+        match (key.to_string()?.as_str(), value) {
+            ("label", Value::String(l)) => answer.label = l.to_string_lossy(),
+            ("append", Value::Boolean(b)) => answer.append = b,
+            ("label", other) => {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "ui.answer's label is a string, not a {}",
+                    other.type_name()
+                )));
+            }
+            ("append", other) => {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "ui.answer's 'append' must be true or false (got {})",
+                    other.type_name()
+                )));
+            }
+            (other, _) => {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "ui.answer has no option '{other}' (only label, append)"
+                )));
+            }
+        }
+    }
+    Ok(answer)
 }
 
 const MAX_LOG_LINES: usize = 200;
@@ -213,7 +252,7 @@ impl Visual {
                 Ok(nice_ticks(lo, hi, count.unwrap_or(5)))
             })?,
         )?;
-        let answers: Rc<RefCell<Vec<String>>> = Rc::default();
+        let answers: Rc<RefCell<Vec<Answer>>> = Rc::default();
         let in_handler: Rc<Cell<bool>> = Rc::default();
         let (queue, answering) = (answers.clone(), in_handler.clone());
         ui.set(
@@ -232,34 +271,17 @@ impl Visual {
                         text.type_name()
                     )));
                 };
-                let mut label = None;
-                if let Some(options) = options {
-                    for pair in options.pairs::<Value, Value>() {
-                        let (key, value) = pair?;
-                        match (key.to_string()?.as_str(), value) {
-                            ("label", Value::String(l)) => label = Some(l.to_string_lossy()),
-                            ("label", other) => {
-                                return Err(mlua::Error::RuntimeError(format!(
-                                    "ui.answer's label is a string, not a {}",
-                                    other.type_name()
-                                )));
-                            }
-                            (other, _) => {
-                                return Err(mlua::Error::RuntimeError(format!(
-                                    "ui.answer has no option '{other}' (only label)"
-                                )));
-                            }
-                        }
-                    }
-                }
+                let mut answer = answer_options(options)?;
                 let text = text.to_string_lossy();
-                let answer = match label.filter(|l| !l.is_empty()) {
-                    Some(label) => format!("{label}: {text}"),
-                    None => text,
+                let line = if answer.label.is_empty() {
+                    text
+                } else {
+                    format!("{}: {text}", answer.label)
                 };
+                answer.line = line.chars().take(MAX_ANSWER_CHARS).collect();
                 let mut queue = queue.borrow_mut();
                 if queue.len() < MAX_QUEUED_ANSWERS {
-                    queue.push(answer.chars().take(MAX_ANSWER_CHARS).collect());
+                    queue.push(answer);
                 }
                 Ok(())
             })?,
@@ -370,7 +392,7 @@ impl Visual {
         result
     }
 
-    pub fn take_answers(&self) -> Vec<String> {
+    pub fn take_answers(&self) -> Vec<Answer> {
         std::mem::take(&mut *self.answers.borrow_mut())
     }
 
@@ -503,7 +525,7 @@ pub fn check_with_assets(source: &str, seed: u64, assets: Assets) -> Result<Repo
         report.interactions += 1;
     }
     report.logs = visual.logs();
-    report.answers = visual.take_answers();
+    report.answers = visual.take_answers().into_iter().map(|a| a.line).collect();
     Ok(report)
 }
 
