@@ -81,6 +81,7 @@ impl Agent {
             "invalid" => Plan::Done(Errored, Some(FailureClass::ValidationError)),
             "unknown" => Plan::Done(Errored, Some(FailureClass::Unknown)),
             "selfstop" => Plan::Done(DoneStatus::Interrupted, None),
+            "deny-hold" => Plan::Hold(Errored, Some(FailureClass::PermissionError)),
             _ => Plan::Done(Completed, None),
         }
     }
@@ -551,6 +552,42 @@ async fn an_engine_made_interrupt_ends_the_run_without_a_stop_hold() {
         "the queue is not held",
     )
     .await;
+    r.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failure_hold_keeps_earlier_rows_until_the_person_queues_again() {
+    let r = rig(Agent::new(None), Some(OrchOptions::default())).await;
+    r.send("deny-hold", "m1");
+    wait_for(|| r.agent.runs() == ["deny-hold"], "turn 1 starts").await;
+    r.core
+        .doc_host
+        .queue_message(CHAT, "earlier", Vec::new())
+        .expect("queue");
+    settle().await;
+    let _ = r.agent.finish.send(());
+    r.wait_statuses(&[RunStatus::Failed], "the run fails").await;
+    assert_eq!(r.thread().expect("thread").held, Hold::Fail);
+    settle().await;
+    assert_eq!(
+        r.agent.runs(),
+        ["deny-hold"],
+        "RL2: a fail hold blocks the queue"
+    );
+    r.core
+        .doc_host
+        .queue_message(CHAT, "later", Vec::new())
+        .expect("queue");
+    r.wait_statuses(
+        &[
+            RunStatus::Failed,
+            RunStatus::Completed,
+            RunStatus::Completed,
+        ],
+        "RL1: the new row releases the hold",
+    )
+    .await;
+    assert_eq!(r.agent.runs(), ["deny-hold", "earlier", "later"]);
     r.finish().await;
 }
 

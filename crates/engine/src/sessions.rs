@@ -433,9 +433,9 @@ impl SessionsEngine {
             .then(|| wire.clone())
     }
 
-    pub(crate) fn orch_holds_queue(&self, chat_id: &str) -> bool {
+    pub(crate) fn orch_holds_queue(&self, chat_id: &str, rows: &[String]) -> bool {
         self.orch_for(chat_id)
-            .is_some_and(|wire| wire.holds_queue(chat_id))
+            .is_some_and(|wire| wire.holds_queue(chat_id, rows))
     }
 
     pub(crate) fn orchestrates(&self, chat_id: &str) -> bool {

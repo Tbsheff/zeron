@@ -473,6 +473,14 @@ const ATTACHMENT_PROMPT_HEADER: &str = "Attached images (local files — open th
 /// Older clients stored the already-expanded prompt in `text`; recognize the
 /// exact trailer implied by `attachments` so those rows are not expanded a
 /// second time after an upgrade.
+fn queued_ids(handle: &ChatDocHandle) -> Vec<String> {
+    handle
+        .doc
+        .read_queue()
+        .map(|q| q.into_iter().map(|m| m.id).collect())
+        .unwrap_or_default()
+}
+
 fn receipt_first(sessions: &SessionsEngine, chat_id: &str, entry: &SessionCommandEntry) -> bool {
     matches!(
         entry.payload,
@@ -4322,7 +4330,7 @@ impl DocHost {
             if sessions.turn_in_flight(&handle.chat_id) {
                 return; // All queued messages wait, including rows from older clients.
             }
-            if sessions.orch_holds_queue(&handle.chat_id) {
+            if sessions.orch_holds_queue(&handle.chat_id, &queued_ids(handle)) {
                 return;
             }
             // A row from another device names its images by `pending://` ref

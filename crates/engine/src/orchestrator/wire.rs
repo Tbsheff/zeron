@@ -329,19 +329,42 @@ impl OrchWire {
         self.driver.state().ok()?.thread(t).ok().cloned()
     }
 
-    pub fn holds_queue(&self, chat: &str) -> bool {
+    pub fn holds_queue(&self, chat: &str, rows: &[String]) -> bool {
         let Ok(Some(t)) = self.known_thread(chat) else {
             return false;
         };
-        self.driver
-            .state()
+        let Ok(s) = self.driver.state() else {
+            return false;
+        };
+        let Ok(th) = s.thread(t) else {
+            return false;
+        };
+        if th.is_live() {
+            return true;
+        }
+        if th.held == Hold::None {
+            return false;
+        }
+        let key = format!("hold:{chat}:{}:{:?}:{}", th.rord(), th.held, s.stops);
+        let before = self.rows_at_hold(&key, rows);
+        rows.iter().all(|r| before.contains(r))
+    }
+
+    fn rows_at_hold(&self, key: &str, rows: &[String]) -> Vec<String> {
+        if let Some(seen) = self
+            .driver
+            .meta(key)
             .ok()
-            .and_then(|s| {
-                s.thread(t)
-                    .ok()
-                    .map(|th| th.held == Hold::Limit || th.is_live())
-            })
-            .unwrap_or(false)
+            .flatten()
+            .and_then(|v| serde_json::from_str::<Vec<String>>(&v).ok())
+        {
+            return seen;
+        }
+        let snap = serde_json::to_string(rows).unwrap_or_else(|_| "[]".into());
+        if let Err(err) = self.driver.put_meta(key, &snap) {
+            tracing::warn!(error = %err, "orchestrator hold snapshot failed");
+        }
+        rows.to_vec()
     }
 
     pub fn allow_redelivery(&self, chat: &str, message_id: &str) {
