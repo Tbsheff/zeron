@@ -10,5 +10,6 @@ pub fn step(s: &OrchState, e: Event) -> Result<(OrchState, Vec<Effect>), Reject>
         Event::Del(e) => delegation::apply(&mut next, e, &mut fx)?,
         Event::Outbox(e) => outbox::apply(&mut next, e, &mut fx)?,
     }
+    next.retire_runs();
     Ok((next, fx))
 }

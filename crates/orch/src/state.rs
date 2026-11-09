@@ -1,14 +1,18 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::VecDeque;
+
+use serde::{Deserialize, Serialize};
 
 use crate::event::{Effect, Reject};
 use crate::ids::{AttemptId, RunId, TaskId, ThreadId};
+use crate::small::{VecMap, VecSet};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Config {
     pub max_depth: u8,
     pub max_fanout: usize,
     pub max_queue: usize,
     pub max_retry: u32,
+    pub run_window: usize,
 }
 
 impl Default for Config {
@@ -18,11 +22,12 @@ impl Default for Config {
             max_fanout: 8,
             max_queue: 64,
             max_retry: 2,
+            run_window: 8,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Hold {
     None,
     Stop,
@@ -30,7 +35,7 @@ pub enum Hold {
     Limit,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Msg {
     Person(u64),
     Server(u64),
@@ -38,13 +43,13 @@ pub enum Msg {
     Wake { run: u32, generation: u32 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Start {
     Queued(Msg),
     Resume,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum RunKind {
     Person,
     Server,
@@ -65,7 +70,7 @@ impl Start {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum RunStatus {
     Live,
     Completed,
@@ -74,7 +79,7 @@ pub enum RunStatus {
     UsageLimit,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Reason {
     Initial,
     SteeringRestart,
@@ -83,13 +88,13 @@ pub enum Reason {
     AccessRestart,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Node {
     Root,
     Child,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Outcome {
     Completed,
     Failed,
@@ -114,7 +119,7 @@ impl Outcome {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ProviderEvent {
     pub node: Node,
     pub run: u32,
@@ -122,24 +127,24 @@ pub struct ProviderEvent {
     pub outcome: Outcome,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Disp {
     Open,
     Stopped,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CohortSt {
     None,
     Offered,
     Queued,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Cohort {
     pub disp: Disp,
     pub st: CohortSt,
-    pub del: BTreeSet<ThreadId>,
+    pub del: VecSet<ThreadId>,
     pub generation: u32,
 }
 
@@ -148,32 +153,32 @@ impl Default for Cohort {
         Self {
             disp: Disp::Open,
             st: CohortSt::None,
-            del: BTreeSet::new(),
+            del: VecSet::new(),
             generation: 0,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Run {
     pub start: Start,
     pub status: RunStatus,
     pub cohort: Cohort,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum TaskSt {
     Running,
     Settled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum WakeRule {
     Always,
     SettledOnly,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Delivery {
     Pending,
     Claimed,
@@ -195,7 +200,7 @@ impl Delivery {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Task {
     pub st: TaskSt,
     pub wake: WakeRule,
@@ -205,7 +210,7 @@ pub struct Task {
     pub pushes: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Attempt {
     pub n: u32,
     pub reason: Reason,
@@ -228,13 +233,13 @@ impl Default for Attempt {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct UsageLimit {
     pub armed: Option<u32>,
     pub due: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Thread {
     pub id: ThreadId,
     pub parent: Option<ThreadId>,
@@ -243,10 +248,11 @@ pub struct Thread {
     pub reconfigure: bool,
     pub queue: VecDeque<Msg>,
     pub held: Hold,
+    pub run_base: u32,
     pub runs: Vec<Run>,
     pub int_req: bool,
     pub attempt: Attempt,
-    pub inbox: BTreeSet<ProviderEvent>,
+    pub inbox: VecSet<ProviderEvent>,
     pub ul: UsageLimit,
     pub wait_on: Option<ThreadId>,
     pub late_wait: Option<ThreadId>,
@@ -269,10 +275,11 @@ impl Thread {
             reconfigure,
             queue: VecDeque::new(),
             held: Hold::None,
+            run_base: 0,
             runs: Vec::new(),
             int_req: false,
             attempt: Attempt::default(),
-            inbox: BTreeSet::new(),
+            inbox: VecSet::new(),
             ul: UsageLimit::default(),
             wait_on: None,
             late_wait: None,
@@ -281,7 +288,22 @@ impl Thread {
     }
 
     pub fn rord(&self) -> u32 {
-        u32::try_from(self.runs.len()).unwrap_or(u32::MAX)
+        let n = u32::try_from(self.runs.len()).unwrap_or(u32::MAX);
+        self.run_base.saturating_add(n)
+    }
+
+    pub fn ord_at(&self, i: usize) -> u32 {
+        let n = u32::try_from(i).unwrap_or(u32::MAX);
+        self.run_base.saturating_add(n).saturating_add(1)
+    }
+
+    fn index_of(&self, ord: u32) -> Option<usize> {
+        let i = ord.checked_sub(1)?.checked_sub(self.run_base)?;
+        usize::try_from(i).ok()
+    }
+
+    pub fn retired(&self, ord: u32) -> bool {
+        ord >= 1 && ord <= self.run_base
     }
 
     pub fn live_count(&self) -> usize {
@@ -296,12 +318,11 @@ impl Thread {
     }
 
     pub fn run(&self, ord: u32) -> Option<&Run> {
-        let i = usize::try_from(ord.checked_sub(1)?).ok()?;
-        self.runs.get(i)
+        self.runs.get(self.index_of(ord)?)
     }
 
     pub fn run_mut(&mut self, ord: u32) -> Option<&mut Run> {
-        let i = usize::try_from(ord.checked_sub(1)?).ok()?;
+        let i = self.index_of(ord)?;
         self.runs.get_mut(i)
     }
 
@@ -384,7 +405,7 @@ impl Thread {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Message {
     Notice {
         child: ThreadId,
@@ -401,12 +422,12 @@ pub enum Message {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OrchState {
     pub config: Config,
-    pub threads: BTreeMap<ThreadId, Thread>,
-    pub outbox: BTreeSet<Message>,
-    pub stop_receipts: BTreeSet<(ThreadId, u32)>,
+    pub threads: VecMap<ThreadId, Thread>,
+    pub outbox: VecSet<Message>,
+    pub stop_receipts: VecSet<(ThreadId, u32)>,
     pub stops: u32,
 }
 
@@ -414,9 +435,9 @@ impl OrchState {
     pub fn new(config: Config) -> Self {
         Self {
             config,
-            threads: BTreeMap::new(),
-            outbox: BTreeSet::new(),
-            stop_receipts: BTreeSet::new(),
+            threads: VecMap::new(),
+            outbox: VecSet::new(),
+            stop_receipts: VecSet::new(),
             stops: 0,
         }
     }
@@ -486,6 +507,54 @@ impl OrchState {
 
     pub fn cohort_live(&self, p: ThreadId, r: u32) -> bool {
         self.thread(p).is_ok_and(|t| t.is_live() && t.rord() == r)
+    }
+
+    fn oldest_quiet(&self, t: ThreadId) -> bool {
+        let Ok(th) = self.thread(t) else {
+            return false;
+        };
+        let Some(run) = th.runs.first() else {
+            return false;
+        };
+        let o = th.ord_at(0);
+        let own_quiet = run.status != RunStatus::Live
+            && run.cohort.st == CohortSt::None
+            && run.cohort.del.is_empty()
+            && th.ul.armed != Some(o)
+            && !th.inbox.iter().any(|e| e.run == o)
+            && !th
+                .queue
+                .iter()
+                .any(|m| matches!(m, Msg::Wake { run, .. } if *run == o));
+        let offer_quiet = !self
+            .outbox
+            .iter()
+            .any(|m| matches!(m, Message::Offer { parent, run, .. } if *parent == t && *run == o));
+        let kids_quiet = self.threads.values().all(|c| {
+            c.parent != Some(t)
+                || c.task.is_none_or(|k| {
+                    k.cohort != o || (k.st == TaskSt::Settled && k.delivery.handled())
+                })
+        });
+        own_quiet && offer_quiet && kids_quiet
+    }
+
+    pub(crate) fn retire_runs(&mut self) {
+        let window = self.config.run_window.max(1);
+        let long: Vec<ThreadId> = self
+            .threads
+            .values()
+            .filter(|th| th.runs.len() > window)
+            .map(|th| th.id)
+            .collect();
+        for t in long {
+            while self.thread(t).is_ok_and(|th| th.runs.len() > window) && self.oldest_quiet(t) {
+                if let Some(th) = self.threads.get_mut(&t) {
+                    th.runs.remove(0);
+                    th.run_base = th.run_base.saturating_add(1);
+                }
+            }
+        }
     }
 
     pub(crate) fn send(&mut self, m: Message, fx: &mut Vec<Effect>) {

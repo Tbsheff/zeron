@@ -1,5 +1,7 @@
 use crate::ids::ThreadId;
-use crate::state::{Delivery, Message, Msg, OrchState, RunStatus, Task, Thread, WakeRule};
+use crate::state::{
+    Delivery, Message, Msg, OrchState, RunStatus, Task, TaskSt, Thread, WakeRule,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Violation {
@@ -182,6 +184,10 @@ fn wf_task(s: &OrchState, th: &Thread) -> Result<(), Malformed> {
         return Ok(());
     };
     let pt = s.threads.get(&p).ok_or(Malformed::Lineage(th.id))?;
+    if pt.retired(task.cohort) {
+        let quiet = task.st == TaskSt::Settled && task.delivery.handled();
+        return wf_ok(quiet, Malformed::TaskCohort(th.id));
+    }
     let co = pt.cohort(task.cohort).ok_or(Malformed::TaskCohort(th.id))?;
     let claimed = task.delivery == Delivery::Claimed;
     wf_ok(claimed == co.del.contains(&th.id), Malformed::Claim(th.id))
@@ -189,7 +195,7 @@ fn wf_task(s: &OrchState, th: &Thread) -> Result<(), Malformed> {
 
 fn wf_cohorts(s: &OrchState, th: &Thread) -> Result<(), Malformed> {
     for (i, run) in th.runs.iter().enumerate() {
-        let r = u32::try_from(i + 1).unwrap_or(u32::MAX);
+        let r = th.ord_at(i);
         let members_ok = run.cohort.del.iter().all(|c| {
             s.threads
                 .get(c)

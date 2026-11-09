@@ -1,7 +1,8 @@
+use serde::{Deserialize, Serialize};
 use crate::ids::{AttemptId, RunId, TaskId, ThreadId};
 use crate::state::{Message, Outcome, ProviderEvent, Reason, Start};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Mode {
     Steer,
     Restart,
@@ -9,26 +10,28 @@ pub enum Mode {
     Now,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum DelegateMode {
     Async,
     Wait,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum How {
     Ack,
     Keep,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum Event {
     Run(RunEvent),
     Del(DelEvent),
     Outbox(OutboxEvent),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "act", content = "args")]
 pub enum RunEvent {
     PersonSend {
         t: ThreadId,
@@ -91,7 +94,8 @@ pub enum RunEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "act", content = "args")]
 pub enum DelEvent {
     OpenRoot {
         t: ThreadId,
@@ -137,7 +141,8 @@ pub enum DelEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "act", content = "args")]
 pub enum OutboxEvent {
     DoNotice {
         child: ThreadId,
@@ -219,13 +224,13 @@ impl OutboxEvent {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum WaitOutcome {
     Result,
     TimedOut,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Effect {
     StartRun {
         run: RunId,
@@ -271,7 +276,7 @@ pub enum Effect {
     Send(Message),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Reject {
     UnknownThread,
     ThreadExists,

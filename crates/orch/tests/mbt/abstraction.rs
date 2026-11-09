@@ -185,7 +185,7 @@ fn live_set(t: &Thread) -> Vec<Value> {
         .iter()
         .enumerate()
         .filter(|(_, r)| r.status == RunStatus::Live)
-        .map(|(i, _)| json!(i + 1))
+        .map(|(i, _)| json!(t.ord_at(i)))
         .collect()
 }
 

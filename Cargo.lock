@@ -13935,6 +13935,7 @@ name = "zeron-orch"
 version = "0.2.138"
 dependencies = [
  "proptest 1.12.0",
+ "serde",
  "serde_json",
 ]
 

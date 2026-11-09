@@ -6,6 +6,7 @@ mod outbox;
 #[cfg(kani)]
 mod proofs;
 mod run;
+mod small;
 mod state;
 mod step;
 
@@ -19,4 +20,5 @@ pub use state::{
     Outcome, ProviderEvent, Reason, Run, RunKind, RunStatus, Start, Task, TaskSt, Thread,
     UsageLimit, WakeRule,
 };
+pub use small::{VecMap, VecSet};
 pub use step::step;

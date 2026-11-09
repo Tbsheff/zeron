@@ -841,3 +841,30 @@ fn ingest_rejects_events_not_in_inbox_or_not_current() {
         Reject::NotCurrent
     );
 }
+
+#[test]
+fn run_window_retires_quiet_runs_and_keeps_open_cohorts() {
+    let mut h = H::with(Config {
+        run_window: 2,
+        ..Config::default()
+    });
+    h.live(R);
+    h.delegate(R, A, DelegateMode::Async);
+    h.end(R, Outcome::Completed);
+    for _ in 0..3 {
+        h.live(R);
+        h.end(R, Outcome::Completed);
+    }
+    assert_eq!(h.th(R).run_base, 0);
+    assert_eq!(h.th(R).rord(), 4);
+    h.finish_child(A);
+    h.deliver_offer(R);
+    h.ok(del(DelEvent::StartFromQueueWake { t: R }));
+    assert_eq!(h.task(A).delivery, Delivery::Delivered);
+    h.end(R, Outcome::Completed);
+    let th = h.th(R);
+    assert_eq!(th.runs.len(), 2);
+    assert_eq!(th.run_base + 2, th.rord());
+    assert!(th.retired(1));
+    assert!(th.cohort(1).is_none());
+}

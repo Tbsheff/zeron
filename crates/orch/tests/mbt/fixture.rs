@@ -105,12 +105,14 @@ impl Fixture {
                 max_fanout: 8,
                 max_queue: n("MaxQueue"),
                 max_retry: u32::try_from(self.constant("MaxRetry")).unwrap_or(0),
+                run_window: n("MaxRuns"),
             },
             Module::Delegation => Config {
                 max_depth: u8::try_from(self.constant("MaxDepth")).unwrap_or(0),
                 max_fanout: n("MaxFanout"),
                 max_queue: n("MaxQueue"),
                 max_retry: 0,
+                run_window: n("MaxRuns"),
             },
         }
     }

@@ -21,6 +21,7 @@ fn init() -> OrchState {
         max_fanout: 2,
         max_queue: 3,
         max_retry: 1,
+        run_window: 2,
     };
     let open = Event::Del(DelEvent::OpenRoot {
         t: ThreadId(0),
