@@ -184,7 +184,7 @@ export type Props = {
 	-- A subagent's spawn (an agent row naming its doc): what opens it (a
 	-- lane of its own). Without it, the row opens its call as any does.
 	on_open_subagent: ((sub: { ref: string, title: string?, status: string? }) -> ())?,
-	on_visual_answer: ((answers: { string }) -> ())?,
+	on_visual_answer: ((answers: { Visual.Answer }) -> ())?,
 }
 export type Anchor = { id: string, dy: number }
 export type TranscriptFind = {
@@ -556,7 +556,7 @@ type View = {
 	open: ((target: string) -> ())?,
 	link_menu: ((target: string) -> { Markdown.LinkEntry }?)?,
 	open_subagent: ((sub: any) -> ())?,
-	visual_answer: ((answers: { string }) -> ())?,
+	visual_answer: ((answers: { Visual.Answer }) -> ())?,
 	-- A message text's find (its key: `<id>:u`, `<id>:<block>`, `<id>:r`).
 	find: ((key: string) -> any)?,
 }

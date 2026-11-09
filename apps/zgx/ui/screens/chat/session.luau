@@ -288,7 +288,7 @@ local function Session(id: Id?): Node
 								end
 							end,
 							on_attach = shared.attach_quote,
-							on_visual_answer = function(answers: { string })
+							on_visual_answer = function(answers: { any })
 								shared.append_draft_of(id, answers)
 							end,
 							pictures = pictures,

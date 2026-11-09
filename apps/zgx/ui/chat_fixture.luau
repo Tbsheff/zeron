@@ -833,10 +833,22 @@ ui.command {
 					kind = "visual",
 					title = "Pick one",
 					source = [[
+local s = ui.state { pick = "" }
+local function pick(name)
+  return ui.button { label = name, primary = s.pick == name, on_click = function()
+    s.pick = name
+    ui.answer(name, { label = "Pick" })
+  end }
+end
 return function()
-  return ui.row { gap = 8,
-    ui.button { label = "Option B", on_click = function() ui.answer("B", { label = "Pick" }) end },
-    ui.button { label = "Approve", on_click = function() ui.answer("Approved") end },
+  return ui.column { gap = 8,
+    ui.row { gap = 8, pick("Option A"), pick("Option B"), pick("Option C") },
+    ui.row { gap = 8,
+      ui.button { label = "Small", on_click = function() ui.answer("Small", { label = "Size" }) end },
+      ui.button { label = "Red", on_click = function() ui.answer("Red", { label = "Color" }) end },
+      ui.button { label = "Approve", on_click = function() ui.answer("Approved") end },
+      ui.button { label = "Log run", on_click = function() ui.answer("ran", { label = "Log", append = true }) end },
+    },
   }
 end
 ]],

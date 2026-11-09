@@ -54,8 +54,9 @@ export type Props = {
 	title: string?,
 	device: string?,
 	source: string?,
-	on_answer: ((answers: { string }) -> ())?,
+	on_answer: ((answers: { Answer }) -> ())?,
 }
+export type Answer = { line: string, slot: string, append: boolean }
 
 -- What the host says of every visual: `{ [id] = { rev, gen } }`.
 local REVS = ui.shared("visuals", {} :: { [string]: { rev: number, gen: number } })
@@ -1045,7 +1046,11 @@ return ui.component(function(props: Props): Node
 				pcall(ui.invoke, "visuals.event", { id = id, h = handler, arg = arg })
 				local ok, answers = pcall(ui.call_sync, "visuals.answers", id)
 				if ok and type(answers) == "table" and #answers > 0 and props.on_answer then
-					props.on_answer(answers)
+					local slotted: { Answer } = {}
+					for _, a in answers do
+						table.insert(slotted, { line = a.line, slot = `{id}\n{a.label}`, append = a.append == true })
+					end
+					props.on_answer(slotted)
 				end
 			end
 		end,

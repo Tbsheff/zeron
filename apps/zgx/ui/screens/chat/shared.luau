@@ -27,6 +27,8 @@ M.text = ui.shared("chat.composer.text", "")
 M.cargo = ui.shared("chat.composer.cargo", {} :: { any })
 M.quotes = ui.shared("chat.composer.quotes", {} :: { [string]: string })
 M.chosen = ui.shared("chat.composer.chosen", {} :: { [string]: boolean })
+M.answered = ui.shared("chat.composer.answered", {} :: { [string]: { [string]: string } })
+export type DraftAnswer = { line: string, slot: string, append: boolean }
 -- Each session's agent, model, effort and Fast picked in its composer but
 -- not yet sent with (`model`, `effort`, `fast`), by session id: part of its
 -- draft, as the text is. The session takes them only when a message goes
@@ -120,6 +122,7 @@ function M.take(): (string, { any })
 		M.text:set("")
 		M.cargo:set({})
 		M.quotes:set({})
+		M.forget_answers_of(here:peek())
 	end)
 	return text, cargo
 end
@@ -243,6 +246,7 @@ function M.take_cargo_of(key: string): { any }
 	if #list > 0 then
 		set_cargo(key, {})
 	end
+	M.forget_answers_of(key)
 	return list
 end
 
@@ -736,14 +740,57 @@ function M.set_draft_of(key: string, field: string, value: any)
 	kept:set(all)
 end
 
-function M.append_draft_of(key: string, lines: { string })
+local function whole_line_at(text: string, line: string): number?
+	local from = 1
+	while true do
+		local at = string.find(text, line, from, true)
+		if not at then
+			return nil
+		end
+		local after = at + #line
+		local starts_line = at == 1 or string.sub(text, at - 1, at - 1) == "\n"
+		local ends_line = after > #text or string.sub(text, after, after) == "\n"
+		if starts_line and ends_line then
+			return at
+		end
+		from = at + 1
+	end
+end
+
+local function with_answer(text: string, answer: DraftAnswer, slots: { [string]: string }): string
+	local previous = if answer.append then nil else slots[answer.slot]
+	local at = if previous and previous ~= "" then whole_line_at(text, previous) else nil
+	if not answer.append then
+		slots[answer.slot] = answer.line
+	end
+	if at and previous then
+		return string.sub(text, 1, at - 1) .. answer.line .. string.sub(text, at + #previous)
+	end
+	local sep = if text == "" or string.sub(text, -1) == "\n" then "" else "\n"
+	return text .. sep .. answer.line
+end
+
+function M.forget_answers_of(key: string)
+	if M.answered:peek()[key] ~= nil then
+		local all = table.clone(M.answered:peek())
+		all[key] = nil
+		M.answered:set(all)
+	end
+end
+
+function M.append_draft_of(key: string, answers: { DraftAnswer })
 	local d = kept:peek()[key]
 	local text = if here:peek() == key then M.text:peek() elseif d and type(d.text) == "string" then d.text else ""
-	for _, line in lines do
-		local sep = if text == "" or string.sub(text, -1) == "\n" then "" else "\n"
-		text = text .. sep .. line
+	local slots = table.clone(M.answered:peek()[key] or {})
+	for _, answer in answers do
+		text = with_answer(text, answer, slots)
 	end
-	M.set_draft_of(key, "text", text)
+	local all = table.clone(M.answered:peek())
+	all[key] = slots
+	ui.batch(function()
+		M.answered:set(all)
+		M.set_draft_of(key, "text", text)
+	end)
 	if here:peek() == key then
 		M.focus:add(1)
 	end

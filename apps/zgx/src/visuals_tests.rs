@@ -570,30 +570,97 @@ fn a_show_visual_call_leaves_no_tool_row_and_its_visual_sits_in_place() {
     assert_eq!(tree.matches("Ran 1 command").count(), 2, "each command its own group, split by the visual:\n{tree}");
 }
 
+struct Answering {
+    app: TestApp,
+    draft: zgx_script::Shared,
+}
+
+impl Answering {
+    fn new(draft: &str) -> Self {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui/chat_fixture.luau");
+        let mut app = TestApp::new(|runtime| {
+            let host = ScriptHost::new(runtime, path);
+            crate::visuals::register(&host);
+            host
+        });
+        app.ui.scene.borrow_mut().resize(960., 900.);
+        app.frames(2);
+        assert!(app.host.run_command("go_s6"));
+        app.frames(30);
+        let shared = app.host.shared("chat.composer.text", zgx_script::Value::Nil);
+        shared.set(zgx_script::Value::from(draft));
+        assert!(app.host.run_command("visual_answers"));
+        app.wait_until(|app| app.find("role:button \"Option B\"").is_some());
+        Self { app, draft: shared }
+    }
+
+    fn click(&mut self, button: &str) -> String {
+        self.app.click(&format!("role:button \"{button}\""));
+        self.app.frames(5);
+        self.draft()
+    }
+
+    fn draft(&self) -> String {
+        crate::auth::text(&self.draft.get())
+    }
+
+    fn calls(&self) -> String {
+        let calls = self.app.host.states().into_iter().find(|(name, _)| name == "calls" || name.ends_with("::calls"));
+        calls.map(|(_, v)| crate::auth::text(&v)).expect("the fixture notes its calls")
+    }
+}
+
 #[test]
 fn a_visuals_buttons_answer_into_its_chats_draft_and_nothing_sends() {
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui/chat_fixture.luau");
-    let mut app = TestApp::new(|runtime| {
-        let host = ScriptHost::new(runtime, path);
-        crate::visuals::register(&host);
-        host
+    let mut chat = Answering::new("Thoughts so far");
+    assert_eq!(chat.click("Option B"), "Thoughts so far\nPick: Option B");
+    assert_eq!(chat.click("Approve"), "Thoughts so far\nPick: Option B\nApproved");
+    assert!(!chat.calls().contains("send:"), "an answer never sends: {}", chat.calls());
+    assert_eq!(chat.app.error(), None);
+}
+
+#[test]
+fn a_new_pick_replaces_its_labels_line_and_the_same_pick_is_a_no_op() {
+    let mut chat = Answering::new("");
+    chat.click("Option B");
+    assert_eq!(chat.click("Option C"), "Pick: Option C");
+    assert_eq!(chat.click("Option C"), "Pick: Option C");
+    assert_eq!(chat.click("Small"), "Pick: Option C\nSize: Small");
+    assert_eq!(chat.click("Red"), "Pick: Option C\nSize: Small\nColor: Red");
+    assert_eq!(chat.click("Option A"), "Pick: Option A\nSize: Small\nColor: Red");
+    assert_eq!(chat.app.error(), None);
+}
+
+#[test]
+fn an_edited_answer_line_is_kept_and_the_next_pick_gets_a_new_line() {
+    let mut chat = Answering::new("");
+    chat.click("Option B");
+    chat.draft.set(zgx_script::Value::from("Pick: Option B, but cheaper"));
+    assert_eq!(chat.click("Option C"), "Pick: Option B, but cheaper\nPick: Option C");
+    assert_eq!(chat.click("Option A"), "Pick: Option B, but cheaper\nPick: Option A");
+    assert_eq!(chat.app.error(), None);
+}
+
+#[test]
+fn an_append_answer_adds_a_line_each_time() {
+    let mut chat = Answering::new("");
+    chat.click("Log run");
+    assert_eq!(chat.click("Log run"), "Log: ran\nLog: ran");
+    assert_eq!(chat.app.error(), None);
+}
+
+#[test]
+fn sending_the_draft_forgets_which_lines_answers_wrote() {
+    let mut chat = Answering::new("");
+    chat.click("Option B");
+    chat.app.keys("enter");
+    chat.app.wait_until(|app| {
+        let calls = app.host.states().into_iter().find(|(name, _)| name == "calls" || name.ends_with("::calls"));
+        calls.is_some_and(|(_, v)| crate::auth::text(&v).contains("send:"))
     });
-    app.ui.scene.borrow_mut().resize(960., 900.);
-    app.frames(2);
-    assert!(app.host.run_command("go_s6"));
-    app.frames(30);
-    let draft = app.host.shared("chat.composer.text", zgx_script::Value::Nil);
-    draft.set(zgx_script::Value::from("Thoughts so far"));
-    assert!(app.host.run_command("visual_answers"));
-    app.wait_until(|app| app.find("role:button \"Option B\"").is_some());
-    app.click("role:button \"Option B\"");
-    app.frames(5);
-    assert_eq!(crate::auth::text(&draft.get()), "Thoughts so far\nPick: B");
-    app.click("role:button \"Approve\"");
-    app.frames(5);
-    assert_eq!(crate::auth::text(&draft.get()), "Thoughts so far\nPick: B\nApproved");
-    let calls = app.host.states().into_iter().find(|(name, _)| name == "calls" || name.ends_with("::calls"));
-    let calls = calls.map(|(_, v)| crate::auth::text(&v)).expect("the fixture notes its calls");
-    assert!(!calls.contains("send:"), "an answer never sends: {calls}");
-    assert_eq!(app.error(), None);
+    assert!(chat.calls().contains("Pick: Option B"), "{}", chat.calls());
+    assert_eq!(chat.draft(), "");
+    chat.draft.set(zgx_script::Value::from("Pick: Option B"));
+    assert_eq!(chat.click("Option C"), "Pick: Option B\nPick: Option C");
+    assert_eq!(chat.app.error(), None);
 }
