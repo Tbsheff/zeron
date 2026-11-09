@@ -46,7 +46,7 @@ end
 - ui.toggle { label, value = bool, on_change = function(on) end }
 - ui.slider { label, value, min, max, step, unit, on_change = function(n) end }
 - ui.button { label, on_click = function() end, primary = bool }
-- ui.answer(choice, { label = "Pick" }), in any handler, puts "Pick: <choice>" on its own line in the reader's draft. For questions to the person (choices, forms, plan approvals), use ui.answer; nothing sends until they send. Prefer a label. The check's presses fill no draft; show_visual's result lists the answers each would add.
+- ui.answer(choice, { label = "Pick" }), in any handler, puts "Pick: <choice>" on its own line in the reader's draft. For questions to the person (choices, forms, plan approvals), use ui.answer; nothing sends until they send. Prefer a label. Each label of a visual keeps one line: a new pick replaces that line, so a form's fields (label = "Size", label = "Color") each keep their own, and picking the same option again changes nothing. If the reader edited the line, the new pick goes on a new line instead. ui.answer(text, { label = "Log", append = true }) adds a line every time (multi-select, logs). The draft is not the visual's state: to highlight the chosen option, set state in the same handler, e.g. on_click = function() s.pick = "B"; ui.answer("B", { label = "Pick" }) end, with primary = s.pick == "B" on the button. The check's presses fill no draft; show_visual's result lists the answers each would add.
 
 ## canvas
 
