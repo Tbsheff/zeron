@@ -12,12 +12,12 @@ const TLA_TS = process.env.ORCH_TLA_TS ?? join(SCRATCH, "node_modules", ".bin", 
 const OUT = join(HERE, "fixtures");
 const WORKERS = process.env.ORCH_TLA_WORKERS ?? "4";
 const SPEC_FILES = ["RunBase.tla", "RunLifecycle.tla", "Delegation.tla"];
-const DROP = new Set(["kidIn", "doomed", "replayable", "replayBad", "receiptBad", "qPend", "qAt", "qVis", "qWake", "qUsed", "answers"]);
+const DROP = new Set(["kidIn", "doomed", "replayable", "replayBad", "receiptBad", "qPend", "qAt", "qVis", "qWake", "qUsed", "answers", "qEp"]);
 
 const RL_BASE = { Threads: "{t1}", Root: "t1", NoThread: "NoThread", Mut: '"none"', FixLimitRelease: "TRUE" };
 const DEL_BASE = {
   Root: "r", NoThread: "NoThread", MaxQueue: 2, Mut: '"none"', MaxGen: 3, Crash: "TRUE", LateAck: "TRUE",
-  Questions: "FALSE", FixWakeSkipsFailHold: "TRUE", StopCheckAnc: "FALSE", PartialCrash: "FALSE",
+  Questions: "FALSE", FixWakeSkipsFailHold: "TRUE", StopCheckAnc: "FALSE", PartialCrash: "FALSE", QSplit: "FALSE",
 };
 
 const rl = (name, c) => ({ name, module: "RunLifecycle", spec: "RLSpec", invariants: ["RL_BoundsNotHit", "S1_AtMostOneActiveRun"], constants: { ...RL_BASE, ...c } });
@@ -206,11 +206,12 @@ function encode(job, graph) {
     edges.push([pos.get(from), pos.get(to), intern(actions, aindex, parseAction(label))]);
   }
   edges.sort((a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2]);
-  return { name: job.name, module: job.module, spec: specDigest(), constants: job.constants, init: pos.get(graph.init), vars, values, states, actions, edges };
+  return { name: job.name, module: job.module, spec: specDigest(job.module), constants: job.constants, init: pos.get(graph.init), vars, values, states, actions, edges };
 }
 
-function specDigest() {
-  return Object.fromEntries(SPEC_FILES.map((f) => [f, createHash("sha256").update(readFileSync(join(SPEC_DIR, f))).digest("hex").slice(0, 16)]));
+function specDigest(module) {
+  const files = ["RunBase.tla", `${module}.tla`];
+  return Object.fromEntries(files.map((f) => [f, createHash("sha256").update(readFileSync(join(SPEC_DIR, f))).digest("hex").slice(0, 16)]));
 }
 
 function exportJob(job) {
