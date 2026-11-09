@@ -538,7 +538,7 @@ impl OrchWire {
             Some(id) => command_key(id),
             None => format!("int:{chat}:{}", self.driver.bump(&format!("ints:{chat}"))?),
         };
-        let ev = Event::Run(RunEvent::RequestInterrupt { t });
+        let ev = Event::Del(DelEvent::Stop { t });
         let r = self.driver.apply_command(&key, cmd.as_deref(), ev)?;
         self.note_command(cmd.as_deref())?;
         let mut fx = accepted_ids(&r);
@@ -621,7 +621,7 @@ impl OrchWire {
         let key = format!("int:{chat}:{}:{}:engine", at.run.ord, at.n);
         let r = self
             .driver
-            .apply(&key, Event::Run(RunEvent::RequestInterrupt { t }))?;
+            .apply(&key, Event::Del(DelEvent::InterruptChat { t }))?;
         for id in accepted_ids(&r) {
             self.driver.complete(&id)?;
         }

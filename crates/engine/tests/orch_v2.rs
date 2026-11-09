@@ -80,6 +80,7 @@ impl Agent {
             "deny" => Plan::Done(Errored, Some(FailureClass::PermissionError)),
             "invalid" => Plan::Done(Errored, Some(FailureClass::ValidationError)),
             "unknown" => Plan::Done(Errored, Some(FailureClass::Unknown)),
+            "selfstop" => Plan::Done(DoneStatus::Interrupted, None),
             _ => Plan::Done(Completed, None),
         }
     }
@@ -521,11 +522,33 @@ async fn an_interrupt_is_a_request_and_the_run_ends_on_the_provider_done() {
     assert_eq!(r.thread().expect("thread").held, Hold::Stop);
     let acts = r.acts();
     let at = |name: &str| acts.iter().position(|a| a == name).expect(name);
-    assert!(at("RequestInterrupt") < at("ProviderTerminal"));
+    assert!(at("Stop") < at("ProviderTerminal"));
     r.send("again", "m2");
     wait_for(
         || r.statuses().len() == 2,
         "a person send releases the stop",
+    )
+    .await;
+    r.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_engine_made_interrupt_ends_the_run_without_a_stop_hold() {
+    let r = rig(Agent::new(None), Some(OrchOptions::default())).await;
+    r.send("selfstop", "m1");
+    r.wait_statuses(&[RunStatus::Interrupted], "the run ends interrupted")
+        .await;
+    assert_eq!(r.thread().expect("thread").held, Hold::None);
+    let acts = r.acts();
+    assert!(acts.iter().any(|a| a == "InterruptChat"), "{acts:?}");
+    assert!(!acts.iter().any(|a| a == "Stop"), "{acts:?}");
+    r.core
+        .doc_host
+        .queue_message(CHAT, "after", Vec::new())
+        .expect("queue");
+    r.wait_statuses(
+        &[RunStatus::Interrupted, RunStatus::Completed],
+        "the queue is not held",
     )
     .await;
     r.finish().await;
