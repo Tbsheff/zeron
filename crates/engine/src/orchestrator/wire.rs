@@ -218,7 +218,7 @@ impl OrchWire {
     pub fn attach(self: &Arc<Self>, engine: Arc<dyn RunEngine>) {
         *lock(&self.engine) = Some(engine);
         let wire = self.clone();
-        tokio::spawn(async move { wire.worker().await });
+        spawn_task("worker", async move { wire.worker().await });
     }
 
     pub fn detach(&self) {
@@ -804,7 +804,7 @@ impl OrchWire {
         let Some(wire) = self.self_arc() else {
             return Ok(());
         };
-        tokio::spawn(async move {
+        spawn_task("usage-limit timer", async move {
             let wait = u64::try_from(due.saturating_sub(now_ms())).unwrap_or(0);
             tokio::time::sleep(Duration::from_millis(wait)).await;
             wire.timer_fired(run);
@@ -896,4 +896,23 @@ impl OrchWire {
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+pub fn spawn_task<F>(what: &'static str, fut: F) -> bool
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(rt) => {
+            rt.spawn(fut);
+            true
+        }
+        Err(_) => {
+            tracing::error!(
+                task = what,
+                "orchestrator task not started: no tokio runtime"
+            );
+            false
+        }
+    }
 }

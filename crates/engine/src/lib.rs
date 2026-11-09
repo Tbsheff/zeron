@@ -157,7 +157,7 @@ fn wire_orchestrator(
 }
 
 fn spawn_orchestrator_recovery(wire: Arc<orchestrator::OrchWire>, sessions: SessionsEngine) {
-    tokio::spawn(async move {
+    orchestrator::wire::spawn_task("recovery", async move {
         if let Err(err) = wire.recover(&sessions).await {
             tracing::error!(error = %err, "orchestrator outbox replay failed");
         }
