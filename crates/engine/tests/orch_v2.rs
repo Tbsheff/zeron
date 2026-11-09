@@ -75,8 +75,14 @@ impl Agent {
         }
         match word {
             "hold" => Plan::Hold(Completed, None),
-            "limit-hold" => Plan::Hold(Errored, Some(FailureClass::UsageLimit)),
-            "limit" => Plan::Done(Errored, Some(FailureClass::UsageLimit)),
+            "limit-hold" => Plan::Hold(Errored, Some(FailureClass::UsageLimit { reset_at: None })),
+            "limit" => Plan::Done(Errored, Some(FailureClass::UsageLimit { reset_at: None })),
+            "limit-at" => Plan::Done(
+                Errored,
+                Some(FailureClass::UsageLimit {
+                    reset_at: Some(chrono::Utc::now().timestamp_millis() + 2_000),
+                }),
+            ),
             "deny" => Plan::Done(Errored, Some(FailureClass::PermissionError)),
             "invalid" => Plan::Done(Errored, Some(FailureClass::ValidationError)),
             "unknown" => Plan::Done(Errored, Some(FailureClass::Unknown)),
@@ -815,6 +821,29 @@ async fn a_usage_limit_timer_is_rearmed_after_a_restart() {
     wait_for(
         || r.agent.runs() == ["limit", RESUME_PROMPT],
         "the rearmed timer resumes",
+    )
+    .await;
+    r.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_usage_limit_with_a_reset_time_resumes_at_that_time_not_the_fallback_delay() {
+    let r = rig(Agent::new(None), Some(options(Duration::from_secs(3600)))).await;
+    let sent = std::time::Instant::now();
+    r.send("limit-at", "m1");
+    wait_for(
+        || r.agent.runs() == ["limit-at", RESUME_PROMPT],
+        "the reset time resumes the run",
+    )
+    .await;
+    assert!(
+        sent.elapsed() >= Duration::from_millis(1500),
+        "resumed before the reset: {:?}",
+        sent.elapsed()
+    );
+    r.wait_statuses(
+        &[RunStatus::UsageLimit, RunStatus::Completed],
+        "both runs end",
     )
     .await;
     r.finish().await;

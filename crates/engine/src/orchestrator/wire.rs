@@ -117,7 +117,7 @@ pub fn outcome_of(status: DoneStatus, failure: Option<FailureClass>) -> Outcome 
     match (status, failure) {
         (DoneStatus::Completed, _) => Outcome::Completed,
         (DoneStatus::Interrupted, _) => Outcome::Interrupted,
-        (DoneStatus::Errored, Some(FailureClass::UsageLimit)) => Outcome::UsageLimit,
+        (DoneStatus::Errored, Some(FailureClass::UsageLimit { .. })) => Outcome::UsageLimit,
         (DoneStatus::Errored, Some(FailureClass::TransportError | FailureClass::ProviderError)) => {
             Outcome::Transient
         }
@@ -685,7 +685,10 @@ impl OrchWire {
         if self.is_dead() || lock(&self.lose).remove(chat) {
             return;
         }
-        match self.done_locked(chat, outcome_of(status, failure)) {
+        let res = self
+            .note_reset(chat, status, failure)
+            .and_then(|()| self.done_locked(chat, outcome_of(status, failure)));
+        match res {
             Ok(changed) => {
                 self.wake.notify_one();
                 if changed && let Some(e) = self.engine() {
@@ -695,6 +698,26 @@ impl OrchWire {
             Err(err) => {
                 self.fail(err);
             }
+        }
+    }
+
+    fn note_reset(
+        &self,
+        chat: &str,
+        status: DoneStatus,
+        failure: Option<FailureClass>,
+    ) -> Result<(), DriverError> {
+        let (DoneStatus::Errored, Some(FailureClass::UsageLimit { reset_at })) = (status, failure)
+        else {
+            return Ok(());
+        };
+        if self.known_thread(chat)?.is_none() {
+            return Ok(());
+        }
+        let key = format!("limit_at:{chat}");
+        match reset_at {
+            Some(at) => self.driver.put_meta(&key, &at.to_string()),
+            None => self.driver.delete_meta(&key),
         }
     }
 
@@ -972,6 +995,15 @@ impl OrchWire {
         pick.copied().unwrap_or(Duration::from_secs(15 * 60))
     }
 
+    fn first_due(&self, run: RunId, reset_at: Option<String>) -> i64 {
+        let now = now_ms();
+        let reset_at = reset_at.and_then(|v| v.parse::<i64>().ok());
+        reset_at.filter(|at| *at > now).unwrap_or_else(|| {
+            let ms = i64::try_from(self.delay_for(run).as_millis()).unwrap_or(i64::MAX);
+            now.saturating_add(ms)
+        })
+    }
+
     fn arm_timer(&self, run: RunId) -> Result<(), DriverError> {
         let chat = self.chat_of(run.thread)?;
         let key = format!("timer:{chat}:{}", run.ord);
@@ -980,9 +1012,10 @@ impl OrchWire {
                 .parse::<i64>()
                 .map_err(|_| DriverError::Corrupt(format!("{key} = {v:?}")))?,
             None => {
-                let ms = i64::try_from(self.delay_for(run).as_millis()).unwrap_or(i64::MAX);
-                let due = now_ms().saturating_add(ms);
+                let reset_key = format!("limit_at:{chat}");
+                let due = self.first_due(run, self.driver.meta(&reset_key)?);
                 self.driver.put_meta(&key, &due.to_string())?;
+                self.driver.delete_meta(&reset_key)?;
                 due
             }
         };
