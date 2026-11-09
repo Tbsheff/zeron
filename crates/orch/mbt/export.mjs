@@ -17,7 +17,7 @@ const DROP = new Set(["kidIn", "doomed", "replayable", "replayBad", "receiptBad"
 const RL_BASE = { Threads: "{t1}", Root: "t1", NoThread: "NoThread", Mut: '"none"', FixLimitRelease: "TRUE" };
 const DEL_BASE = {
   Root: "r", NoThread: "NoThread", MaxQueue: 2, Mut: '"none"', MaxGen: 3, Crash: "TRUE", LateAck: "TRUE",
-  Questions: "FALSE", FixWakeSkipsFailHold: "TRUE", StopCheckAnc: "FALSE", PartialCrash: "FALSE", QSplit: "FALSE",
+  Questions: "FALSE", FixWakeSkipsFailHold: "TRUE", StopCheckAnc: "FALSE", PartialCrash: "FALSE", QSplit: "FALSE", MaxFollowUp: 0,
 };
 
 const rl = (name, c) => ({ name, module: "RunLifecycle", spec: "RLSpec", invariants: ["RL_BoundsNotHit", "S1_AtMostOneActiveRun"], constants: { ...RL_BASE, ...c } });
