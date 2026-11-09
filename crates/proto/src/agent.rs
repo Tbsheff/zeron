@@ -1238,6 +1238,24 @@ mod tests {
         assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
     }
 
+    #[test]
+    fn done_without_failure_key_still_parses_and_none_is_not_written() {
+        let old = r#"{"type":"done","status":"errored","result":null,"error":"boom","sessionId":null}"#;
+        let ev: AgentEvent = serde_json::from_str(old).unwrap();
+        assert!(matches!(&ev, AgentEvent::Done { failure: None, error: Some(e), .. } if e == "boom"));
+        assert!(!serde_json::to_string(&ev).unwrap().contains("failure"));
+        let classed = AgentEvent::Done {
+            status: DoneStatus::Errored,
+            result: None,
+            error: Some("limit".into()),
+            session_id: None,
+            failure: Some(FailureClass::UsageLimit),
+        };
+        let json = serde_json::to_string(&classed).unwrap();
+        assert!(json.contains(r#""failure":"usage_limit""#), "{json}");
+        assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), classed);
+    }
+
     /// Drivers spell the key differently; the chip must not care which one
     /// spawned the child. Non-spawns never answer, whatever they carry.
     #[test]
