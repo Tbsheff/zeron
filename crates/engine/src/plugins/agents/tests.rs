@@ -187,6 +187,7 @@ impl Harness for Capture {
                 result: None,
                 error: None,
                 session_id: Some("sess-agents".into()),
+                failure: None,
             }),
         ];
         Ok(futures::stream::iter(events).boxed())

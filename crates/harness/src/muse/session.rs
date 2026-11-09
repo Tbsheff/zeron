@@ -165,6 +165,7 @@ impl Runner {
             result: None,
             error: self.error.clone(),
             session_id: (!self.session.is_empty()).then(|| self.session.clone()),
+            failure: None,
         })
         .await
     }
@@ -690,6 +691,7 @@ impl Runner {
             result: None,
             error,
             session_id: Some(self.session.clone()),
+            failure: None,
         })
         .await?;
         self.norm.reset();

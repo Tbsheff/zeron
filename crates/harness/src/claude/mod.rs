@@ -1789,6 +1789,7 @@ async fn run_session(session: Session) {
                         result: None,
                         error: None,
                         session_id: norm.session_id.clone(),
+                        failure: None,
                     });
                     // No result came to settle a typed fork: it ends here,
                     // with the turn, or its chip runs on in the parked run.
@@ -1890,6 +1891,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: None,
                     session_id: norm.session_id.clone(),
+                    failure: None,
                 }))
                 .await;
         } else if !interrupted && turn_open {
@@ -1916,6 +1918,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: Some(crate::crash_message("claude", status, &stderr_tail)),
                     session_id: norm.session_id.clone(),
+                    failure: None,
                 }))
                 .await;
         }

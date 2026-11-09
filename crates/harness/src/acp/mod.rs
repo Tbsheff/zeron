@@ -5325,6 +5325,7 @@ async fn run_session(session: Session) {
                             result: None,
                             error: None,
                             session_id: None,
+                            failure: None,
                         }))
                         .await;
                     client.close_stdin_for_teardown();
@@ -5377,6 +5378,7 @@ async fn run_session(session: Session) {
                     // A resumed run that never got going still owns the
                     // session it was restoring; the next message retries it.
                     session_id: request.resume.clone(),
+                    failure: None,
                 }))
                 .await;
             client.close_stdin_for_teardown();
@@ -5572,6 +5574,7 @@ async fn run_session(session: Session) {
                         result: None,
                         error: Some(not_signed_in(agent_name)),
                         session_id: Some(session_id.clone()),
+                        failure: None,
                     }).await;
                 }
                 break 'main;
@@ -5740,6 +5743,7 @@ async fn run_session(session: Session) {
                             result: None,
                             error,
                             session_id: Some(session_id.clone()),
+                            failure: None,
                         },
                     )
                     .await
@@ -5947,6 +5951,7 @@ async fn run_session(session: Session) {
                                 result: None,
                                 error,
                                 session_id: Some(session_id.clone()),
+                                failure: None,
                             },
                         )
                         .await;
@@ -6196,6 +6201,7 @@ async fn run_session(session: Session) {
                         result: None,
                         error: None,
                         session_id: Some(session_id.clone()),
+                        failure: None,
                     },
                 )
                 .await
@@ -6296,6 +6302,7 @@ async fn run_session(session: Session) {
                                 result: None,
                                 error: None,
                                 session_id: Some(session_id.clone()),
+                                failure: None,
                             }).await {
                                 break 'main;
                             }
@@ -6323,6 +6330,7 @@ async fn run_session(session: Session) {
                                         result: None,
                                         error: Some(message),
                                         session_id: Some(session_id.clone()),
+                                        failure: None,
                                     }).await
                                 {
                                     break 'main;
@@ -6453,6 +6461,7 @@ async fn run_session(session: Session) {
                         result: None,
                         error: None,
                         session_id: Some(session_id.clone()),
+                        failure: None,
                     }).await {
                         break 'main;
                     }
@@ -6537,6 +6546,7 @@ async fn run_session(session: Session) {
                             "{agent_name} is unresponsive — the run was closed."
                         )),
                         session_id: Some(session_id.clone()),
+                        failure: None,
                     },
                 )
                 .await;
@@ -6589,6 +6599,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: None,
                     session_id: Some(session_id.clone()),
+                    failure: None,
                 }))
                 .await;
         } else if !interrupted && !done_current {
@@ -6608,6 +6619,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: Some(crate::crash_message(agent_name, status, &stderr_tail)),
                     session_id: Some(session_id.clone()),
+                    failure: None,
                 }))
                 .await;
         }

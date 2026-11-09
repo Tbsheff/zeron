@@ -1954,6 +1954,7 @@ impl SessionsEngine {
                     result: None,
                     error: Some(note.clone()),
                     session_id: None,
+                    failure: None,
                 };
                 self.inner.publish(&chat_id, &done);
             }
@@ -2936,6 +2937,7 @@ impl Inner {
                 result: None,
                 error: cut.then(|| SHUTDOWN_NOTE.into()),
                 session_id: None,
+                failure: None,
             },
         );
         self.set_status_with_completion(
@@ -4089,6 +4091,7 @@ async fn drive_run(
                         result: None,
                         error: None,
                         session_id: None,
+                        failure: None,
                     })
                 })
                 .boxed())
@@ -4183,6 +4186,7 @@ async fn drive_run(
                         result: None,
                         error: cut.then(|| SHUTDOWN_NOTE.into()),
                         session_id: None,
+                        failure: None,
                     },
                 );
                 inner.set_status_with_completion(
@@ -4270,6 +4274,7 @@ async fn drive_run(
                     result: None,
                     error: Some(message),
                     session_id: None,
+                    failure: None,
                 },
             );
             inner.remove_run(&chat_id, &run_id);
@@ -4437,6 +4442,7 @@ async fn drive_run(
                     result: None,
                     error: None,
                     session_id: None,
+                    failure: None,
                 },
                 _ = live_heartbeat.tick() => {
                     inner.touch_session(&chat_id);
@@ -4596,12 +4602,14 @@ async fn drive_run(
                         result: None,
                         error: Some(err.to_string()),
                         session_id: None,
+                        failure: None,
                     },
                     None if interrupted => AgentEvent::Done {
                         status: DoneStatus::Interrupted,
                         result: None,
                         error: None,
                         session_id: None,
+                        failure: None,
                     },
                     // Stream end while PARKED idle: a per-turn adapter closing
                     // after its final Done — a clean end, not a crash (the turn
@@ -4613,6 +4621,7 @@ async fn drive_run(
                         result: None,
                         error: Some("harness stream ended without Done".into()),
                         session_id: None,
+                        failure: None,
                     },
                 },
                 _ = tokio::time::sleep_until(flush_at), if dirty || subagents.values().any(|s| s.dirty) => {
@@ -5209,6 +5218,7 @@ async fn drive_run(
                 result,
                 error,
                 session_id,
+                ..
             } if interrupted && turn_was_active && inner.mark_shutdown_cut(&chat_id, &run_id) => {
                 if let Some(error) = error.filter(|_| status == DoneStatus::Errored) {
                     tracing::info!(chat = %chat_id, %error, "a turn the shutdown cut off ended with an error");
@@ -5218,6 +5228,7 @@ async fn drive_run(
                     result,
                     error: Some(SHUTDOWN_NOTE.into()),
                     session_id,
+                    failure: None,
                 }
             }
             event => event,
@@ -5793,6 +5804,7 @@ mod tests {
                 result: None,
                 error: None,
                 session_id: id.map(Into::into),
+                failure: None,
             }
         }
         fn text() -> AgentEvent {
@@ -5984,6 +5996,7 @@ mod tests {
                     result: None,
                     error: Some("offline startup failed".into()),
                     session_id: None,
+                    failure: None,
                 }
             } else {
                 AgentEvent::SessionStarted {
@@ -6460,6 +6473,7 @@ mod tests {
             result: None,
             error: None,
             session_id: None,
+            failure: None,
         }
     }
 

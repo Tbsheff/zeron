@@ -152,7 +152,8 @@ fn agent_events_map_to_plain_payloads() {
                 status: DoneStatus::Errored,
                 result: None,
                 error: Some("boom".into()),
-                session_id: None
+                session_id: None,
+                failure: None,
             }
         ),
         Some((
@@ -167,6 +168,7 @@ fn agent_events_map_to_plain_payloads() {
             result: None,
             error: None,
             session_id: None,
+            failure: None,
         }),
     };
     assert_eq!(

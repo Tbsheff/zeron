@@ -1739,6 +1739,7 @@ mod tests {
                     result: None,
                     error: None,
                     session_id: None,
+                    failure: None,
                 }),
             },
         );
@@ -1804,6 +1805,7 @@ mod tests {
                     result: None,
                     error: None,
                     session_id: None,
+                    failure: None,
                 }),
             },
         );

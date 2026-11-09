@@ -119,6 +119,7 @@ fn fanout_settle(i: usize) -> Vec<AgentEvent> {
                 result: None,
                 error: None,
                 session_id: None,
+                failure: None,
             },
         ),
     ]
@@ -292,6 +293,7 @@ impl Harness for MockHarness {
                     result: None,
                     error: None,
                     session_id: None,
+                    failure: None,
                 });
             });
             let stream = futures::stream::unfold(rx, |mut rx| async move {
@@ -345,6 +347,7 @@ impl Harness for MockHarness {
                     result: None,
                     error: None,
                     session_id: None,
+                    failure: None,
                 });
             });
             let stream = futures::stream::unfold(rx, |mut rx| async move {
@@ -392,6 +395,7 @@ impl Harness for MockHarness {
                     result: None,
                     error: None,
                     session_id: None,
+                    failure: None,
                 }),
             ];
             return Ok(futures::stream::iter(events).boxed());
@@ -426,6 +430,7 @@ impl Harness for MockHarness {
                     result: None,
                     error: None,
                     session_id: None,
+                    failure: None,
                 });
             });
             let stream = futures::stream::unfold(rx, |mut rx| async move {
@@ -611,6 +616,7 @@ impl Harness for MockHarness {
                     result: None,
                     error: None,
                     session_id: None,
+                    failure: None,
                 };
                 vec![
                     AgentEvent::TextDelta {
@@ -988,6 +994,7 @@ fn background_run(
             result: None,
             error: None,
             session_id: None,
+            failure: None,
         };
         let _ = tx.send(AgentEvent::TextDelta {
             text:
@@ -1081,6 +1088,7 @@ fn background_run(
                 result: None,
                 error: None,
                 session_id: None,
+                failure: None,
             });
         }
     });
@@ -1170,6 +1178,7 @@ fn long_tool_run(
             result: None,
             error: None,
             session_id: None,
+            failure: None,
         };
         let say = |text: String| AgentEvent::TextDelta { text };
         let mut background: Option<tokio::process::Child> = None;

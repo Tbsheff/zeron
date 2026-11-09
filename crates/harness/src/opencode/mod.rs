@@ -2151,6 +2151,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: Some(e.to_string()),
                     session_id: None,
+                    failure: None,
                 }).await;
                 server.shutdown(kill_grace).await;
                 return;
@@ -2162,6 +2163,7 @@ async fn run_session(session: Session) {
                 result: None,
                 error: None,
                 session_id: None,
+                failure: None,
             }).await;
             server.shutdown(kill_grace).await;
             return;
@@ -2305,6 +2307,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: Some(e.to_string()),
                     session_id: Some(session_id.clone()),
+                    failure: None,
                 },
             )
             .await;
@@ -2367,6 +2370,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: None,
                     session_id: Some(session_id.clone()),
+                    failure: None,
                 }).await;
                 done_sent = true;
                 if interrupt_requested {
@@ -2472,6 +2476,7 @@ async fn run_session(session: Session) {
                 result: None,
                 error: if errored { turn.error.clone() } else { None },
                 session_id: Some(session_id.clone()),
+                failure: None,
             }).await;
             done_sent = true;
             if errored || !steering_open {
@@ -2545,6 +2550,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: (!halted).then_some(message),
                     session_id: Some(session_id.clone()),
+                    failure: None,
                 },
             )
             .await;
@@ -2674,6 +2680,7 @@ async fn run_session(session: Session) {
                         result: None,
                         error: None,
                         session_id: Some(session_id.clone()),
+                        failure: None,
                     }).await;
                     done_sent = true;
                 }
@@ -2698,6 +2705,7 @@ async fn run_session(session: Session) {
                             result: None,
                             error: None,
                             session_id: Some(session_id.clone()),
+                            failure: None,
                         }).await;
                         done_sent = true;
                         break 'main;
@@ -2713,6 +2721,7 @@ async fn run_session(session: Session) {
                         result: None,
                         error: None,
                         session_id: Some(session_id.clone()),
+                        failure: None,
                     }).await;
                     done_sent = true;
                     break 'main;
@@ -2780,6 +2789,7 @@ async fn run_session(session: Session) {
                         result: None,
                         error: Some(message),
                         session_id: Some(session_id.clone()),
+                        failure: None,
                     },
                 )
                 .await;
@@ -2868,6 +2878,7 @@ async fn run_session(session: Session) {
                                             result: None,
                                             error: Some(message),
                                             session_id: Some(session_id.clone()),
+                                            failure: None,
                                         },
                                     )
                                     .await;
@@ -2903,6 +2914,7 @@ async fn run_session(session: Session) {
                         result: None,
                         error: None,
                         session_id: Some(session_id.clone()),
+                        failure: None,
                     }).await;
                     done_sent = true;
                     break 'main;
@@ -2923,6 +2935,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: Some(message),
                     session_id: Some(session_id.clone()),
+                    failure: None,
                 }).await;
                 done_sent = true;
                 break 'main;
@@ -3041,6 +3054,7 @@ async fn run_session(session: Session) {
                 result: None,
                 error: None,
                 session_id: Some(session_id.clone()),
+                failure: None,
             },
         )
         .await;
@@ -3755,6 +3769,7 @@ async fn settle_children(
                     result: None,
                     error: None,
                     session_id: None,
+                    failure: None,
                 },
             )))
             .await;
@@ -4042,6 +4057,7 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                                 result: None,
                                 error: None,
                                 session_id: None,
+                                failure: None,
                             },
                         ));
                     }

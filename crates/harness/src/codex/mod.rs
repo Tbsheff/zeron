@@ -1470,6 +1470,7 @@ async fn run_session(session: Session) {
                         result: None,
                         error: None,
                         session_id: None,
+                        failure: None,
                     }))
                     .await;
                 client.close_stdin_for_teardown();
@@ -1509,6 +1510,7 @@ async fn run_session(session: Session) {
                             result: None,
                             error: None,
                             session_id: None,
+                            failure: None,
                         }))
                         .await;
                     return;
@@ -1530,6 +1532,7 @@ async fn run_session(session: Session) {
                             result: None,
                             error: Some(e.to_string()),
                             session_id: None,
+                            failure: None,
                         }))
                         .await;
                     return;
@@ -1556,6 +1559,7 @@ async fn run_session(session: Session) {
                 result: None,
                 error: Some(error),
                 session_id: None,
+                failure: None,
             }))
             .await;
         client.close_stdin_for_teardown();
@@ -1655,6 +1659,7 @@ async fn run_session(session: Session) {
                         result: None,
                         error: Some(error),
                         session_id: None,
+                        failure: None,
                     }))
                     .await;
                 client.close_stdin_for_teardown();
@@ -1669,6 +1674,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: None,
                     session_id: None,
+                    failure: None,
                 }))
                 .await;
             client.close_stdin_for_teardown();
@@ -1784,6 +1790,7 @@ async fn run_session(session: Session) {
                         result: None,
                         error: Some(error),
                         session_id: Some(thread_id.clone()),
+                        failure: None,
                     }))
                     .await;
                 client.close_stdin_for_teardown();
@@ -2146,6 +2153,7 @@ async fn run_session(session: Session) {
                                 result: None,
                                 error,
                                 session_id: Some(thread_id.clone()),
+                                failure: None,
                             },
                         )
                         .await
@@ -2205,6 +2213,7 @@ async fn run_session(session: Session) {
                                 result: None,
                                 error: None,
                                 session_id: Some(thread_id.clone()),
+                                failure: None,
                             }).await {
                                 break 'main;
                             }
@@ -2228,6 +2237,7 @@ async fn run_session(session: Session) {
                                         .unwrap_or_else(|| "Codex turn failed".into()),
                                 ),
                                 session_id: Some(thread_id.clone()),
+                                failure: None,
                             },
                         )
                         .await;
@@ -2254,6 +2264,7 @@ async fn run_session(session: Session) {
                                 result: None,
                                 error: None,
                                 session_id: Some(thread_id.clone()),
+                                failure: None,
                             }).await {
                                 break 'main;
                             }
@@ -2269,6 +2280,7 @@ async fn run_session(session: Session) {
                                 result: None,
                                 error: None,
                                 session_id: Some(thread_id.clone()),
+                                failure: None,
                             },
                         )
                         .await;
@@ -2418,6 +2430,7 @@ async fn run_session(session: Session) {
                             result: None,
                             error: None,
                             session_id: Some(thread_id.clone()),
+                            failure: None,
                         }).await {
                             break 'main;
                         }
@@ -2543,6 +2556,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: None,
                     session_id: Some(thread_id.clone()),
+                    failure: None,
                 }))
                 .await;
         } else if !interrupted && !done_current {
@@ -2562,6 +2576,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: Some(error),
                     session_id: Some(thread_id.clone()),
+                    failure: None,
                 }))
                 .await;
         }

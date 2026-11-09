@@ -64,6 +64,7 @@ impl Harness for AckHarness {
                 result: None,
                 error: None,
                 session_id: Some("sess-ua".into()),
+                failure: None,
             }),
         ];
         Ok(futures::stream::iter(events).boxed())

@@ -80,6 +80,7 @@ impl Harness for Agent {
                     result: None,
                     error: None,
                     session_id: Some("sess-hook".into()),
+                    failure: None,
                 }),
             ])
         });

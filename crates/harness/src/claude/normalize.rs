@@ -709,6 +709,7 @@ impl Normalizer {
                     result: None,
                     error: None,
                     session_id: None,
+                    failure: None,
                 },
             ),
             AgentEvent::ToolResult {
@@ -842,6 +843,7 @@ impl Normalizer {
                             result: None,
                             error: None,
                             session_id: None,
+                            failure: None,
                         },
                     )];
                 }
@@ -1260,6 +1262,7 @@ impl Normalizer {
                         error: (failed && !error_shown)
                             .then(|| "Claude's result for this turn could not be read.".to_owned()),
                         session_id: self.session_id.clone(),
+                        failure: None,
                     });
                     return out;
                 }
@@ -1299,6 +1302,7 @@ impl Normalizer {
                         result: None,
                         error: (!error_shown).then_some(error),
                         session_id: f.session_id,
+                        failure: None,
                     }
                 } else if f.subtype == "success" {
                     AgentEvent::Done {
@@ -1310,6 +1314,7 @@ impl Normalizer {
                         result: f.result,
                         error: None,
                         session_id: f.session_id,
+                        failure: None,
                     }
                 } else {
                     // Split the CLI's internal `[ede_diagnostic]` breadcrumbs
@@ -1363,6 +1368,7 @@ impl Normalizer {
                         result: None,
                         error,
                         session_id: f.session_id,
+                        failure: None,
                     }
                 };
                 let mut out = Vec::new();
@@ -1973,6 +1979,7 @@ mod tests {
                         result: None,
                         error: None,
                         session_id: None,
+                        failure: None,
                     }
                 )]
             );
@@ -2054,6 +2061,7 @@ mod tests {
                     result: None,
                     error: None,
                     session_id: None,
+                    failure: None,
                 }
             )]
         );
@@ -2225,6 +2233,7 @@ mod tests {
                     result: None,
                     error: None,
                     session_id: None,
+                    failure: None,
                 },
             ),
             AgentEvent::ToolResult {

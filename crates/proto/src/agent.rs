@@ -1049,6 +1049,17 @@ pub enum DoneStatus {
     Errored,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClass {
+    UsageLimit,
+    ProviderError,
+    TransportError,
+    PermissionError,
+    ValidationError,
+    Unknown,
+}
+
 /// The normalized streaming event every harness emits.
 ///
 /// Mirrors zeron's `AgentEvent` tagged enum.
@@ -1180,6 +1191,8 @@ pub enum AgentEvent {
         result: Option<String>,
         error: Option<String>,
         session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<FailureClass>,
     },
     /// A USER-role message injected into a running session — today only seen
     /// wrapped in [`AgentEvent::Subagent`]: the PARENT agent steering its

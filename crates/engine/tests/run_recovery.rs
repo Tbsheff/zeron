@@ -81,6 +81,7 @@ fn completed_turn(session_id: &str, text: &str) -> Vec<AgentEvent> {
             result: None,
             error: None,
             session_id: Some(session_id.into()),
+            failure: None,
         },
     ]
 }
@@ -243,6 +244,7 @@ impl Harness for HoldingHarness {
                         result: None,
                         error: None,
                         session_id: Some("hs-held".into()),
+                        failure: None,
                     }));
                 }
                 OnInterrupt::Ignore => std::future::pending::<()>().await,
@@ -252,6 +254,7 @@ impl Harness for HoldingHarness {
                         result: None,
                         error: Some("stdin closed: Broken pipe (os error 32)".into()),
                         session_id: Some("hs-held".into()),
+                        failure: None,
                     }));
                 }
             }
@@ -580,6 +583,7 @@ async fn a_message_the_user_sends_resets_the_revival_budget() {
                         result: None,
                         error: Some("model overloaded".into()),
                         session_id: None,
+                        failure: None,
                     },
                 ])
             }),
@@ -1018,6 +1022,7 @@ async fn a_resume_the_provider_rejects_retries_in_a_fresh_session() {
                             "Mock exited unexpectedly (exit code 1): No conversation found with session ID: {id}"
                         )),
                         session_id: None,
+                        failure: None,
                     }],
                     None => completed_turn("hs-fresh", "fresh start"),
                 })
@@ -1065,6 +1070,7 @@ async fn a_rejected_resume_in_a_switched_chat_starts_fresh_and_says_so() {
                         result: None,
                         error: Some("Pi exited unexpectedly: session not found: hs-pi".into()),
                         session_id: None,
+                        failure: None,
                     }],
                     _ => completed_turn("hs-pi-2", "pi again"),
                 })

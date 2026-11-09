@@ -77,6 +77,7 @@ impl Harness for Agent {
                 result: None,
                 error: fails.then(|| "boom".to_owned()),
                 session_id: Some("sess-act".into()),
+                failure: None,
             }),
         ];
         Ok(futures::stream::iter(events).boxed())

@@ -860,6 +860,7 @@ fn full_registry() -> HarnessRegistry {
                 result: None,
                 error: None,
                 session_id: None,
+                failure: None,
             },
         ],
     }));

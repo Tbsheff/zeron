@@ -818,6 +818,7 @@ impl ChildStream {
                         result: None,
                         error,
                         session_id: Some(child.to_owned()),
+                        failure: None,
                     }])
                     .collect()
             }
@@ -1561,6 +1562,7 @@ mod tests {
                 result: None,
                 error: Some("stream failed".into()),
                 session_id: Some("c".into()),
+                failure: None,
             }]
         );
     }

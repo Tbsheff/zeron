@@ -223,6 +223,7 @@ async fn happy_path_normalizes_events_and_tags_subagents() {
             result: Some("done!".into()),
             error: None,
             session_id: Some("sess-1".into()),
+            failure: None,
         })
     );
 }
@@ -424,6 +425,7 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
             result: Some("answered".into()),
             error: None,
             session_id: Some("sess-ask".into()),
+            failure: None,
         })
     );
 }
@@ -454,6 +456,7 @@ async fn questions_closed_unanswered_deny_the_tool() {
             result: Some("declined".into()),
             error: None,
             session_id: Some("sess-ask".into()),
+            failure: None,
         })
     );
 }
@@ -604,6 +607,7 @@ async fn interrupt_escalates_to_sigterm_and_ends_with_interrupted_done() {
             result: None,
             error: None,
             session_id: Some("sess-int".into()),
+            failure: None,
         })
     );
 }
@@ -639,6 +643,7 @@ async fn error_codes_map_to_readable_messages() {
             result: None,
             error: Some("The run hit the maximum number of turns.".into()),
             session_id: Some("sess-err".into()),
+            failure: None,
         })
     );
 }

@@ -76,6 +76,7 @@ impl Harness for HoldingHarness {
                 result: None,
                 error: None,
                 session_id: Some("sess-quiesce".into()),
+                failure: None,
             }));
         });
         Ok(rx.boxed())

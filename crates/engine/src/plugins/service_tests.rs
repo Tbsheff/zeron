@@ -315,6 +315,7 @@ fn done(status: zeron_proto::DoneStatus, error: Option<&str>) -> AgentEvent {
         result: None,
         error: error.map(str::to_owned),
         session_id: None,
+        failure: None,
     }
 }
 

@@ -71,6 +71,7 @@ impl Harness for Fake {
                 result: None,
                 error: Some("not signed in".into()),
                 session_id: None,
+                failure: None,
             })])
             .boxed());
         }
@@ -99,6 +100,7 @@ impl Harness for Fake {
                     result: None,
                     error: None,
                     session_id: Some(session),
+                    failure: None,
                 }),
             ]
         })

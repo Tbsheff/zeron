@@ -554,6 +554,7 @@ impl Runner {
             result: None,
             error: self.norm.error.clone(),
             session_id: (!self.session.is_empty()).then(|| self.session.clone()),
+            failure: None,
         })
         .await
     }

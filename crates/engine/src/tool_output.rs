@@ -161,6 +161,7 @@ mod tests {
                 result: None,
                 error: None,
                 session_id: None,
+                failure: None,
             },
         ]);
         let (text, last, chunks) = read_all(&journal, "chat-1", "t1");
