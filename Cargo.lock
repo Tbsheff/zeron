@@ -13799,6 +13799,7 @@ dependencies = [
  "zeron-launch",
  "zeron-mcp",
  "zeron-notify",
+ "zeron-orch",
  "zeron-plugin-guard",
  "zeron-preview",
  "zeron-proto",
