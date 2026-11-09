@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use zeron_orch::{
-    AttemptId, Config, DelEvent, Effect, Event, Hold, Mode, Msg, Node, OrchState, Outcome,
+    AttemptId, Config, DelEvent, Effect, Event, Hold, Mode, Msg, Node, OrchState, Outcome, Reason,
     RunEvent, RunId, RunKind, Start, Thread, ThreadId, step,
 };
 use zeron_proto::{DoneStatus, FailureClass, HarnessId, RunRequest};
@@ -27,6 +27,8 @@ pub fn flag_from_env() -> bool {
 pub struct OrchOptions {
     pub config: Config,
     pub limit_delays: Vec<Duration>,
+    pub retry_delays: Vec<Duration>,
+    pub reconcile_every: Duration,
 }
 
 impl Default for OrchOptions {
@@ -34,6 +36,12 @@ impl Default for OrchOptions {
         Self {
             config: Config::default(),
             limit_delays: vec![Duration::from_secs(15 * 60), Duration::from_secs(60 * 60)],
+            retry_delays: vec![
+                Duration::from_millis(250),
+                Duration::from_secs(1),
+                Duration::from_secs(3),
+            ],
+            reconcile_every: Duration::from_secs(30),
         }
     }
 }
@@ -692,7 +700,13 @@ impl OrchWire {
                 let p = self.start_pending(*run, *start).map_err(wrap)?;
                 self.start(engine, &row.effect_id, at, p, replay).await
             }
-            Effect::StartAttempt { attempt, msg, .. } => {
+            Effect::StartAttempt {
+                attempt,
+                msg,
+                reason,
+                ..
+            } => {
+                self.back_off(*reason, attempt.n).await;
                 let p = self.attempt_pending(*attempt, *msg).map_err(wrap)?;
                 self.start(engine, &row.effect_id, *attempt, p, replay)
                     .await
@@ -716,6 +730,17 @@ impl OrchWire {
                 Ok(Ran::Nothing)
             }
             _ => Ok(Ran::Nothing),
+        }
+    }
+
+    async fn back_off(&self, reason: Reason, n: u32) {
+        if !matches!(reason, Reason::Retry | Reason::ProviderRecovery) {
+            return;
+        }
+        let d = &self.opts.retry_delays;
+        let i = usize::try_from(n.saturating_sub(2)).unwrap_or(usize::MAX);
+        if let Some(wait) = d.get(i).or(d.last()) {
+            tokio::time::sleep(*wait).await;
         }
     }
 

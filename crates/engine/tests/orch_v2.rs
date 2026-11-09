@@ -149,6 +149,9 @@ impl Harness for Agent {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         self.runs.lock().unwrap().push(request.prompt.clone());
+        if request.prompt.starts_with("busy") {
+            return Err(HarnessError::Io(std::io::ErrorKind::ResourceBusy.into()));
+        }
         let (tx, rx) = futures::channel::mpsc::unbounded();
         let _ = tx.unbounded_send(Ok(AgentEvent::SessionStarted {
             harness: HarnessId::Mock,
@@ -230,6 +233,7 @@ fn options(delay: Duration) -> OrchOptions {
     OrchOptions {
         config: Config::default(),
         limit_delays: vec![delay, delay],
+        ..OrchOptions::default()
     }
 }
 
@@ -638,6 +642,39 @@ async fn a_transient_failure_retries_within_the_budget() {
     .await;
     assert_eq!(r.agent.runs().len(), 6, "one try plus max_retry 2 retries");
     assert_eq!(r.acts().iter().filter(|a| *a == "RetryAttempt").count(), 4);
+    r.finish().await;
+}
+
+fn fast_retries() -> OrchOptions {
+    OrchOptions {
+        retry_delays: vec![Duration::from_millis(20)],
+        ..OrchOptions::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flag_on_the_orchestrator_alone_retries_a_transient_start_failure() {
+    let r = rig(Agent::new(None), Some(fast_retries())).await;
+    r.send("busy", "m1");
+    r.wait_statuses(&[RunStatus::Failed], "the retries run out")
+        .await;
+    settle().await;
+    assert_eq!(
+        r.agent.runs().len(),
+        3,
+        "one try plus max_retry 2, with no engine spawn retries stacked under each"
+    );
+    assert_eq!(r.acts().iter().filter(|a| *a == "RetryAttempt").count(), 2);
+    r.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flag_off_the_engine_retries_a_transient_start_failure() {
+    let r = rig(Agent::new(None), None).await;
+    r.send("busy", "m1");
+    wait_for(|| r.agent.runs().len() == 4, "one try plus 3 spawn retries").await;
+    settle().await;
+    assert_eq!(r.agent.runs().len(), 4);
     r.finish().await;
 }
 

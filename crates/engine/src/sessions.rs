@@ -1404,6 +1404,7 @@ impl SessionsEngine {
                 stops_seen: stops,
                 fork_history_sent,
                 started,
+                orchestrated: self.orchestrates(chat_id),
             },
             turn,
             side_chats_only,
@@ -3910,6 +3911,26 @@ struct RunResumeState {
     fork_history_sent: Arc<std::sync::atomic::AtomicBool>,
     /// Set once the harness stream is open (see [`RunHandle::started`]).
     started: Arc<std::sync::atomic::AtomicBool>,
+    orchestrated: bool,
+}
+
+fn retryable_done(event: AgentEvent) -> AgentEvent {
+    match event {
+        AgentEvent::Done {
+            status,
+            result,
+            error,
+            session_id,
+            ..
+        } => AgentEvent::Done {
+            status,
+            result,
+            error,
+            session_id,
+            failure: Some(zeron_proto::FailureClass::TransportError),
+        },
+        other => other,
+    }
 }
 
 fn cursor_unstarted_history(
@@ -4303,6 +4324,7 @@ async fn drive_run(
         // `dispatch_inner`).
         Err(err)
             if !resume_state.idle
+                && !resume_state.orchestrated
                 && usize::from(resume_state.spawn_attempt) < SPAWN_RETRY_DELAYS.len()
                 && transient_start_failure(&err, cli_just_replaced) =>
         {
@@ -4408,6 +4430,12 @@ async fn drive_run(
         }
         Err(err) => {
             let message = err.to_string();
+            let failure =
+                if resume_state.orchestrated && transient_start_failure(&err, cli_just_replaced) {
+                    zeron_proto::FailureClass::TransportError
+                } else {
+                    zeron_proto::FailureClass::Unknown
+                };
             tracing::warn!(chat = %chat_id, harness = ?harness_id, error = %message, "run failed to start");
             // The journal alone is live-only: without an entry the transcript
             // shows "Run failed" with no reason (an OpenCode server that never
@@ -4448,7 +4476,7 @@ async fn drive_run(
                     result: None,
                     error: Some(message),
                     session_id: None,
-                    failure: Some(zeron_proto::FailureClass::Unknown),
+                    failure: Some(failure),
                 },
             );
             inner.remove_run(&chat_id, &run_id);
@@ -5316,7 +5344,7 @@ async fn drive_run(
         // The one exception is the provider SAYING the session is gone
         // (`resume_rejected`): resuming it again can only fail again, so the
         // retry starts a fresh session instead.
-        if resume_state.resume_injected
+        let startup_crash = resume_state.resume_injected
             && !resume_state.idle
             && !resume_state.startup_retry
             && !saw_session_started
@@ -5328,7 +5356,17 @@ async fn drive_run(
                     status: DoneStatus::Errored,
                     ..
                 }
-            )
+            );
+        let event = if startup_crash && resume_state.orchestrated {
+            if matches!(&event, AgentEvent::Done { error: Some(e), .. } if resume_rejected(e)) {
+                inner.reject_resume(&chat_id, resumed_session.as_deref(), harness_id, &run_cwd);
+            }
+            retryable_done(event)
+        } else {
+            event
+        };
+        if startup_crash
+            && !resume_state.orchestrated
             && let Some(retry) = retry_request.take()
         {
             let rejected = matches!(
