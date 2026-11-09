@@ -333,3 +333,13 @@ fn ingest_stale(s: &mut OrchState, t: ThreadId, ev: ProviderEvent) -> Result<(),
     th.inbox.remove(&ev);
     Ok(())
 }
+
+#[cfg(kani)]
+pub(crate) fn kani_ingest_end(
+    s: &mut OrchState,
+    t: ThreadId,
+    ev: ProviderEvent,
+    fx: &mut Vec<Effect>,
+) -> Result<(), Reject> {
+    ingest_end(s, t, ev, fx)
+}

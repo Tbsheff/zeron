@@ -96,3 +96,14 @@ fn crash_engine(s: &mut OrchState) {
         th.late_wait = None;
     }
 }
+
+#[cfg(kani)]
+pub(crate) fn kani_do_notice(
+    s: &mut OrchState,
+    c: ThreadId,
+    run: u32,
+    how: How,
+    fx: &mut Vec<Effect>,
+) -> Result<(), Reject> {
+    do_notice(s, c, run, how, fx)
+}

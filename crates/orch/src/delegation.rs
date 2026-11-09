@@ -428,3 +428,50 @@ pub(crate) fn end_run(s: &mut OrchState, t: ThreadId, fx: &mut Vec<Effect>) -> R
     }
     plan(s, t, r, &sweep, false, fx)
 }
+
+#[cfg(kani)]
+pub(crate) fn kani_stop(
+    s: &mut OrchState,
+    t: ThreadId,
+    fx: &mut Vec<Effect>,
+) -> Result<(), Reject> {
+    stop(s, t, fx)
+}
+
+#[cfg(kani)]
+pub(crate) fn kani_narrow_access(
+    s: &mut OrchState,
+    t: ThreadId,
+    access: u8,
+    fx: &mut Vec<Effect>,
+) -> Result<(), Reject> {
+    narrow_access(s, t, access, fx)
+}
+
+#[cfg(kani)]
+pub(crate) fn kani_delegate(
+    s: &mut OrchState,
+    t: ThreadId,
+    child: ThreadId,
+    mode: DelegateMode,
+    access: u8,
+    reconfigure: bool,
+    fx: &mut Vec<Effect>,
+) -> Result<(), Reject> {
+    let sp = Spawn {
+        child,
+        mode,
+        access,
+        reconfigure,
+    };
+    delegate(s, t, sp, fx)
+}
+
+#[cfg(kani)]
+pub(crate) fn kani_start_from_queue_wake(
+    s: &mut OrchState,
+    t: ThreadId,
+    fx: &mut Vec<Effect>,
+) -> Result<(), Reject> {
+    start_from_queue_wake(s, t, fx)
+}
