@@ -42,8 +42,8 @@ min, max, unit, prefix, decimals }\n\
 - tabs { options, value, on_change }, toggle { label, value, on_change }, slider { label, value, \
 min, max, step, unit, on_change }, button { label, on_click, primary }\n\
 - canvas (2D), scene (3D), shader (GLSL): read visual_reference first.\n\
-To ask the person, call ui.answer(choice, { label = \"Pick\" }) in the handler that sets the pick's \
-state: their draft keeps one \"Pick: <choice>\" line per label, the latest pick; nothing sends.\n\
+To ask the person, set the pick's state and call ui.answer(choice, { label = \"Pick\" }) in one \
+handler: their draft keeps one \"Pick: <choice>\" line per label, the latest pick; nothing sends.\n\
 \n\
 Colors are theme tokens, never hex (except 3D materials): text, muted, faint, accent, on-accent, \
 success, warning, danger, border, chart1, chart2, chart3, chart4, chart5, chart6.\n\

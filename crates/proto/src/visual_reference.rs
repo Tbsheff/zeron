@@ -136,6 +136,7 @@ mod tests {
             ("ui.chart needs series = { { name = ..., values = { ... } } }", "data"),
             ("ui.table has no 'width_px' (it takes columns, rows, hover)", "data"),
             ("ui.answer takes a string, not a nil", "controls"),
+            ("ui.answer's 'append' must be true or false (got integer)", "controls"),
             ("ui.text 'weight' must be a number or a name", "text"),
             ("in a scene draw: s:box needs at", "scene"),
             ("options: bad value", "basics"),
