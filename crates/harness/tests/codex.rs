@@ -14,7 +14,7 @@ use zeron_harness::{
     CancellationToken, CodexHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use zeron_proto::{
-    AccessMode, AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel,
+    AccessMode, AgentEvent, DoneStatus, FailureClass, HarnessId, ReasoningLevel, RunRequest, SandboxLevel,
     TodoItem, TodoStatus, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
@@ -943,7 +943,7 @@ async fn turn_failed_maps_to_errored_done() {
             result: None,
             error: Some("boom".into()),
             session_id: Some("th-1".into()),
-            failure: None,
+            failure: Some(FailureClass::Unknown),
         })
     );
 }
@@ -1079,13 +1079,19 @@ async fn retry_notices_stay_out_of_the_transcript_and_the_final_error_lands_once
     let dones: Vec<_> = events
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::Done { status, error, .. } => Some((*status, error.clone())),
+            AgentEvent::Done {
+                status,
+                error,
+                failure,
+                ..
+            } => Some((*status, error.clone(), *failure)),
             _ => None,
         })
         .collect();
     assert_eq!(dones.len(), 1, "{events:?}");
-    let (status, error) = &dones[0];
+    let (status, error, failure) = &dones[0];
     assert_eq!(*status, DoneStatus::Errored);
+    assert_eq!(*failure, Some(FailureClass::UsageLimit));
     let error = error.as_deref().unwrap();
     assert!(
         error.starts_with("Codex usage limit reached — it resets in 2h 1"),
@@ -1112,8 +1118,10 @@ async fn a_crash_after_a_final_error_reports_both() {
         Some(AgentEvent::Done {
             status: DoneStatus::Errored,
             error: Some(error),
+            failure,
             ..
         }) => {
+            assert_eq!(*failure, Some(FailureClass::PermissionError));
             assert!(
                 error.starts_with("Codex's credentials were rejected. Run codex login"),
                 "{error}"

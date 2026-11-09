@@ -3421,8 +3421,11 @@ impl Harness for AcpHarness {
             sign_in_prompted,
         }));
 
-        let events = futures::stream::unfold(event_rx, |mut rx| async move {
-            rx.recv().await.map(|ev| (ev, rx))
+        let harness = self.spec.id;
+        let events = futures::stream::unfold(event_rx, move |mut rx| async move {
+            rx.recv()
+                .await
+                .map(|ev| (ev.map(|ev| crate::with_failure(harness, ev)), rx))
         })
         .boxed();
         Ok(if self.spec.id == HarnessId::Antigravity {

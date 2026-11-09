@@ -467,8 +467,12 @@ impl Harness for PiHarness {
             let _ = runner.finish().await;
         });
         Ok(
-            futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|v| (v, rx)) })
-                .boxed(),
+            futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv()
+                    .await
+                    .map(|v| (v.map(|ev| crate::with_failure(HarnessId::Pi, ev)), rx))
+            })
+            .boxed(),
         )
     }
 }

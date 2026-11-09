@@ -920,7 +920,9 @@ impl CodexHarness {
         }));
 
         Ok(futures::stream::unfold(event_rx, |mut rx| async move {
-            rx.recv().await.map(|ev| (ev, rx))
+            rx.recv()
+                .await
+                .map(|ev| (ev.map(|ev| crate::with_failure(HarnessId::Codex, ev)), rx))
         })
         .boxed())
     }

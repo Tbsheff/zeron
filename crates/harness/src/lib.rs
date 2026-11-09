@@ -420,10 +420,13 @@ mod background;
 pub use background::{MarkOutcome, MarkRefused, OutputSource};
 mod catalog;
 mod catalog_failure;
+mod failure;
 pub(crate) mod code_signature;
 /// Secret redaction, shared with the doc fold (command output tails).
 pub use zeron_proto::redact;
 pub use catalog_failure::{CatalogFailure, CatalogFailureCode};
+pub use failure::{classify_failure, failure_of, with_failure};
+pub use zeron_proto::FailureClass;
 pub mod claude;
 pub mod codex;
 pub mod agent_ports;

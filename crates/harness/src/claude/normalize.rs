@@ -2,7 +2,9 @@
 //! decoding, error-code mapping).
 
 use serde_json::Value;
-use zeron_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, TodoStatus, ToolCall};
+use zeron_proto::{
+    AgentEvent, DoneStatus, FailureClass, HarnessId, TodoItem, TodoStatus, ToolCall,
+};
 
 use super::wire::{ContentBlock, Frame, MessageFrame, ResultFrame};
 
@@ -142,6 +144,29 @@ fn api_failure(f: &ResultFrame) -> Option<String> {
         (None, Some(detail)) => detail,
         (None, None) => "Claude's API request failed.".to_owned(),
     })
+}
+
+fn classify(message: &str) -> FailureClass {
+    crate::classify_failure(HarnessId::ClaudeCode, message)
+}
+
+fn set_failure(done: &mut AgentEvent, shown: Option<FailureClass>) {
+    let AgentEvent::Done {
+        status,
+        error,
+        failure,
+        ..
+    } = done
+    else {
+        return;
+    };
+    let from_error = error.as_deref().map(classify);
+    *failure = match (from_error, shown) {
+        (None | Some(FailureClass::Unknown), Some(shown)) if *status == DoneStatus::Errored => {
+            Some(shown)
+        }
+        (from_error, _) => from_error,
+    };
 }
 
 fn str_field(input: &Value, key: &str) -> String {
@@ -495,7 +520,7 @@ pub(crate) struct Normalizer {
     /// This turn already showed its failure as an `Error` part (an
     /// assistant-level error code, a blocking rate limit): the result's own
     /// wording of the same failure is not repeated.
-    turn_error_shown: bool,
+    turn_error_shown: Option<FailureClass>,
     /// This turn already said it is retrying the API.
     retry_noticed: bool,
 }
@@ -514,7 +539,7 @@ impl Normalizer {
             fork_transcripts: true,
             assistant_message_id: new_message_id(),
             session_id: None,
-            turn_error_shown: false,
+            turn_error_shown: None,
             retry_noticed: false,
         }
     }
@@ -1158,10 +1183,9 @@ impl Normalizer {
                 // carries a terse `error` code here — often with empty content
                 // and no `result` error — so surface it visibly.
                 if let Some(code) = &f.error {
-                    self.turn_error_shown = true;
-                    out.push(AgentEvent::Error {
-                        message: assistant_error_text(code),
-                    });
+                    let message = assistant_error_text(code);
+                    self.turn_error_shown = Some(classify(&message));
+                    out.push(AgentEvent::Error { message });
                 }
                 // The enclosing assistant frame closes the streamed message
                 // item; rotate so post-boundary deltas get a fresh id.
@@ -1232,16 +1256,16 @@ impl Normalizer {
                 }
                 let window =
                     rate_window_label(f.rate_limit_info.rate_limit_type.as_deref().unwrap_or(""));
-                self.turn_error_shown = true;
-                vec![AgentEvent::Error {
-                    message: format!(
-                        "Claude {window} limit reached — the turn was blocked. Try again after it resets."
-                    ),
-                }]
+                let message = format!(
+                    "Claude {window} limit reached — the turn was blocked. Try again after it resets."
+                );
+                self.turn_error_shown = Some(classify(&message));
+                vec![AgentEvent::Error { message }]
             }
 
             Frame::Result(f) => {
-                let error_shown = std::mem::take(&mut self.turn_error_shown);
+                let shown = self.turn_error_shown.take();
+                let error_shown = shown.is_some();
                 self.retry_noticed = false;
                 // A result line that would not parse (see `parse_frame`):
                 // its turn still ends, with what little the line told us.
@@ -1256,14 +1280,16 @@ impl Normalizer {
                         DoneStatus::Completed
                     };
                     let mut out = self.settle_typed_fork(status);
-                    out.push(AgentEvent::Done {
+                    let mut done = AgentEvent::Done {
                         status,
                         result: None,
                         error: (failed && !error_shown)
                             .then(|| "Claude's result for this turn could not be read.".to_owned()),
                         session_id: self.session_id.clone(),
                         failure: None,
-                    });
+                    };
+                    set_failure(&mut done, shown);
+                    out.push(done);
                     return out;
                 }
                 let model_usage = self
@@ -1296,7 +1322,7 @@ impl Normalizer {
                 let failure = (f.subtype == "success" && !interrupted && !aborted(&f))
                     .then(|| api_failure(&f))
                     .flatten();
-                let done = if let Some(error) = failure {
+                let mut done = if let Some(error) = failure {
                     AgentEvent::Done {
                         status: DoneStatus::Errored,
                         result: None,
@@ -1382,6 +1408,7 @@ impl Normalizer {
                 if let AgentEvent::Done { status, .. } = &done {
                     out.extend(self.settle_typed_fork(*status));
                 }
+                set_failure(&mut done, shown);
                 out.push(done);
                 out
             }
@@ -2816,6 +2843,78 @@ mod tests {
             assert_eq!(status, DoneStatus::Errored);
             assert!(error.unwrap().contains("/compact"), "{full}");
         }
+    }
+
+    fn failure_in(events: &[AgentEvent]) -> Option<FailureClass> {
+        events.iter().find_map(|e| match e {
+            AgentEvent::Done { failure, .. } => Some(*failure),
+            _ => None,
+        })?
+    }
+
+    fn feed(norm: &mut Normalizer, raw: &str) -> Vec<AgentEvent> {
+        norm.normalize(crate::claude::wire::parse_frame(raw).unwrap(), false)
+    }
+
+    #[test]
+    fn done_failure_keeps_the_class_of_an_error_already_shown() {
+        let mut norm = Normalizer::new();
+        feed(
+            &mut norm,
+            r#"{"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"Invalid API key · Fix external API key"}]},"error":"authentication_failed","api_error_status":401}"#,
+        );
+        let done = feed(
+            &mut norm,
+            r#"{"type":"result","subtype":"success","is_error":true,"result":"Invalid API key · Fix external API key","terminal_reason":"api_error","api_error_status":401,"session_id":"s"}"#,
+        );
+        assert_eq!(done_of(&done), (DoneStatus::Errored, None));
+        assert_eq!(failure_in(&done), Some(FailureClass::PermissionError));
+
+        let mut norm = Normalizer::new();
+        feed(
+            &mut norm,
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","overageStatus":"rejected"}}"#,
+        );
+        let done = feed(
+            &mut norm,
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":[]}"#,
+        );
+        assert_eq!(done_of(&done), (DoneStatus::Errored, None));
+        assert_eq!(failure_in(&done), Some(FailureClass::UsageLimit));
+    }
+
+    #[test]
+    fn done_failure_classifies_result_errors() {
+        for (raw, expected) in [
+            (
+                r#"{"type":"result","subtype":"success","is_error":true,"result":"API Error: 429 rate_limit_error (resets 3pm)","api_error_status":429}"#,
+                FailureClass::UsageLimit,
+            ),
+            (
+                r#"{"type":"result","subtype":"success","is_error":true,"result":"API Error: 529","api_error_status":529}"#,
+                FailureClass::ProviderError,
+            ),
+            (
+                r#"{"type":"result","subtype":"success","is_error":true,"result":"Prompt is too long","terminal_reason":"prompt_too_long"}"#,
+                FailureClass::ValidationError,
+            ),
+            (
+                r#"{"type":"result","subtype":"success","is_error":true,"result":"Invalid API key · Fix external API key","terminal_reason":"api_error","api_error_status":401,"session_id":"s"}"#,
+                FailureClass::PermissionError,
+            ),
+            (
+                r#"{"type":"result","subtype":"error_max_turns","is_error":true,"errors":[]}"#,
+                FailureClass::Unknown,
+            ),
+        ] {
+            assert_eq!(failure_in(&normalize_one(raw)), Some(expected), "{raw}");
+        }
+        assert_eq!(
+            failure_in(&normalize_one(
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"hi"}"#
+            )),
+            None
+        );
     }
 
     #[test]

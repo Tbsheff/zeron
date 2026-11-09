@@ -15,7 +15,7 @@ use zeron_harness::{
     CancellationToken, ClaudeHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel, ToolCall, UserInputAnswer,
+    AgentEvent, DoneStatus, FailureClass, HarnessId, RunRequest, SandboxLevel, ToolCall, UserInputAnswer,
     UserInputQuestion,
 };
 
@@ -643,7 +643,7 @@ async fn error_codes_map_to_readable_messages() {
             result: None,
             error: Some("The run hit the maximum number of turns.".into()),
             session_id: Some("sess-err".into()),
-            failure: None,
+            failure: Some(FailureClass::UsageLimit),
         })
     );
 }

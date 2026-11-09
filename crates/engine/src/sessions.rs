@@ -1954,7 +1954,7 @@ impl SessionsEngine {
                     result: None,
                     error: Some(note.clone()),
                     session_id: None,
-                    failure: None,
+                    failure: Some(zeron_proto::FailureClass::Unknown),
                 };
                 self.inner.publish(&chat_id, &done);
             }
@@ -2937,7 +2937,7 @@ impl Inner {
                 result: None,
                 error: cut.then(|| SHUTDOWN_NOTE.into()),
                 session_id: None,
-                failure: None,
+                failure: cut.then_some(zeron_proto::FailureClass::Unknown),
             },
         );
         self.set_status_with_completion(
@@ -4186,7 +4186,7 @@ async fn drive_run(
                         result: None,
                         error: cut.then(|| SHUTDOWN_NOTE.into()),
                         session_id: None,
-                        failure: None,
+                        failure: cut.then_some(zeron_proto::FailureClass::Unknown),
                     },
                 );
                 inner.set_status_with_completion(
@@ -4274,7 +4274,7 @@ async fn drive_run(
                     result: None,
                     error: Some(message),
                     session_id: None,
-                    failure: None,
+                    failure: Some(zeron_proto::FailureClass::Unknown),
                 },
             );
             inner.remove_run(&chat_id, &run_id);
@@ -4597,13 +4597,16 @@ async fn drive_run(
                         tracing::warn!(chat = %chat_id, error = %err, "parked session child died; ending clean");
                         break SessionStatus::Idle;
                     }
-                    Some(Err(err)) => AgentEvent::Done {
-                        status: DoneStatus::Errored,
-                        result: None,
-                        error: Some(err.to_string()),
-                        session_id: None,
-                        failure: None,
-                    },
+                    Some(Err(err)) => {
+                        let error = err.to_string();
+                        AgentEvent::Done {
+                            status: DoneStatus::Errored,
+                            result: None,
+                            failure: Some(zeron_harness::classify_failure(harness_id, &error)),
+                            error: Some(error),
+                            session_id: None,
+                        }
+                    }
                     None if interrupted => AgentEvent::Done {
                         status: DoneStatus::Interrupted,
                         result: None,
@@ -4621,7 +4624,7 @@ async fn drive_run(
                         result: None,
                         error: Some("harness stream ended without Done".into()),
                         session_id: None,
-                        failure: None,
+                        failure: Some(zeron_proto::FailureClass::Unknown),
                     },
                 },
                 _ = tokio::time::sleep_until(flush_at), if dirty || subagents.values().any(|s| s.dirty) => {
@@ -5228,7 +5231,7 @@ async fn drive_run(
                     result,
                     error: Some(SHUTDOWN_NOTE.into()),
                     session_id,
-                    failure: None,
+                    failure: Some(zeron_proto::FailureClass::Unknown),
                 }
             }
             event => event,
@@ -5996,7 +5999,7 @@ mod tests {
                     result: None,
                     error: Some("offline startup failed".into()),
                     session_id: None,
-                    failure: None,
+                    failure: Some(zeron_proto::FailureClass::Unknown),
                 }
             } else {
                 AgentEvent::SessionStarted {
