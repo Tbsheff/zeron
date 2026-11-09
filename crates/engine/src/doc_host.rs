@@ -589,6 +589,7 @@ pub struct ChatDocHandle {
     /// Serialize historical imports with publication so an async doc-change
     /// task cannot publish recovered content before its presentation cutoff.
     transcript_import: Mutex<()>,
+    snapshot_write: Mutex<()>,
     transcript_history: Arc<Mutex<crate::transcript_history::TranscriptHistory>>,
     /// Pending-message queue watch (WatchQueue). Cheap to rebuild — a handful
     /// of short rows — so unlike the transcript mirror it publishes on every
@@ -1183,6 +1184,11 @@ impl DocHost {
     pub async fn quiesce_for_sleep(&self) -> Result<(), String> {
         let generation = self.inner.quiesce_generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.inner.quiesced.store(true, Ordering::SeqCst);
+        if let Some(wire) = self.sessions().and_then(|sessions| sessions.orchestrator()) {
+            if let Err(error) = wire.admission_quiesced() {
+                tracing::error!(%error, "admission capture failed");
+            }
+        }
         // Drains already past their check finish dispatching first.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         while self.inner.dispatching.load(Ordering::SeqCst) > 0 {
@@ -1236,12 +1242,22 @@ impl DocHost {
     /// they do in a quiesce, and what queues meanwhile runs when it's lifted.
     pub fn hold_work(&self) {
         self.inner.quiesced.store(true, Ordering::SeqCst);
+        if let Some(wire) = self.sessions().and_then(|sessions| sessions.orchestrator()) {
+            if let Err(error) = wire.admission_held() {
+                tracing::error!(%error, "admission capture failed");
+            }
+        }
     }
 
     /// End a quiesce and run everything that queued meanwhile.
     pub fn lift_quiesce(&self) {
         if !self.inner.quiesced.swap(false, Ordering::SeqCst) {
             return;
+        }
+        if let Some(wire) = self.sessions().and_then(|sessions| sessions.orchestrator()) {
+            if let Err(error) = wire.admission_open() {
+                tracing::error!(%error, "admission capture failed");
+            }
         }
         let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
         for handle in handles {
@@ -1530,6 +1546,14 @@ impl DocHost {
                 }
                 for handle in rooms.values() {
                     host.activate_sync(handle);
+                    if let (Some(wire), Some(stats)) = (
+                        host.sessions().and_then(|sessions| sessions.orchestrator()),
+                        ChatConnectionSnapshot::read(handle).stats,
+                    ) {
+                        if let Err(error) = wire.observe_room_transport(&handle.chat_id, &stats) {
+                            tracing::error!(%error, "transport capture failed");
+                        }
+                    }
                     host.ingest_orch_doc(handle);
                 }
                 tokio::select! {
@@ -1942,6 +1966,7 @@ impl DocHost {
             doc: doc.clone(),
             messages_tx,
             transcript_import: Mutex::default(),
+            snapshot_write: Mutex::default(),
             transcript_history,
             queue_tx,
             drain_lock: tokio::sync::Mutex::new(()),
@@ -5825,10 +5850,29 @@ impl DocHost {
 
     fn settle_dead_command(&self, sessions: &SessionsEngine, handle: &ChatDocHandle, id: &str) {
         if sessions.orch_command_done(id) {
-            tracing::info!(chat = %handle.chat_id, command = %id,
-                "command has an orchestrator receipt but no ledger mark; marking it applied");
+            let receipt = if let Some(wire) = sessions.orchestrator() {
+                match wire.driver().command_decision(id, "outcome")
+                    .and_then(|outcome| match outcome {
+                        Some(receipt) => Ok(Some(receipt)),
+                        None => wire.driver().command_decision(id, "decision"),
+                    }) {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        tracing::error!(%error, command = %id, "command recovery receipt read failed");
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let status = match receipt.map(|receipt| receipt.disposition) {
+                Some(crate::orchestrator::CommandDisposition::Refused
+                    | crate::orchestrator::CommandDisposition::Error
+                    | crate::orchestrator::CommandDisposition::Rejected) => SessionCommandStatus::Rejected,
+                _ => SessionCommandStatus::Applied,
+            };
             if sessions.orch_finish_command(id) {
-                self.resolve_command(handle, id, SessionCommandStatus::Applied, None);
+                self.resolve_command(handle, id, status, None);
             }
             return;
         }
@@ -5855,10 +5899,38 @@ impl DocHost {
             self.await_earlier_controls(handle, &entry.id).await;
         }
         let run = self.execute(sessions, handle, entry);
-        let (status, resolution) = match with_command(&entry.id, run).await {
-            Ok(outcome) => outcome,
-            Err(err) => (SessionCommandStatus::Rejected, Some(err.to_string())),
+        let (mut status, mut resolution, disposition) = match with_command(&entry.id, run).await {
+            Ok((status, resolution)) => {
+                let disposition = match status {
+                    SessionCommandStatus::Applied => crate::orchestrator::CommandDisposition::Applied,
+                    SessionCommandStatus::Rejected => crate::orchestrator::CommandDisposition::Rejected,
+                    _ => crate::orchestrator::CommandDisposition::Error,
+                };
+                (status, resolution, disposition)
+            }
+            Err(err) => (SessionCommandStatus::Rejected, Some(err.to_string()), crate::orchestrator::CommandDisposition::Error),
         };
+        if let Some(wire) = sessions.orchestrator() {
+            let receipt = crate::orchestrator::CommandReceipt {
+                source:crate::orchestrator::CommandSource::DocHostExecute,
+                disposition,message_id:None,effect_ids:Vec::new(),refusal:None,
+            };
+            match wire.driver().record_command_decision(&entry.id, receipt.clone()) {
+                Ok(stored) => {
+                    if stored != receipt {
+                        status = match stored.disposition {
+                            crate::orchestrator::CommandDisposition::Applied => SessionCommandStatus::Applied,
+                            _ => SessionCommandStatus::Rejected,
+                        };
+                        resolution = None;
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, command = %entry.id, "command outcome receipt failed");
+                    return false;
+                }
+            }
+        }
         if !sessions.orch_finish_command(&entry.id) {
             tracing::error!(chat = %handle.chat_id, command = %entry.id,
                 "ledger mark after the orchestrator receipt failed; halting drain");
@@ -6526,6 +6598,12 @@ impl DocHost {
         chat_id: &str,
         prompt: &str,
     ) -> Option<zeron_proto::RunRequest> {
+        self.request_from_chat_row_source(chat_id, prompt).map(|(request, _)| request)
+    }
+
+    pub(crate) fn request_from_chat_row_source(
+        &self, chat_id: &str, prompt: &str,
+    ) -> Option<(zeron_proto::RunRequest, bool)> {
         let workspace = self.workspace()?;
         let chat = match workspace.chat(chat_id) {
             Ok(chat) => chat?,
@@ -6535,7 +6613,7 @@ impl DocHost {
             }
         };
         let config = chat.config;
-        Some(zeron_proto::RunRequest {
+        Some((zeron_proto::RunRequest {
             mcp: None,
             prompt: prompt.to_string(),
             harness: config.as_ref().map(|c| c.harness),
@@ -6558,7 +6636,7 @@ impl DocHost {
             worktree: None,
             env: Default::default(),
             extra_mcp: Vec::new(),
-        })
+        }, config.is_some()))
     }
 
     fn save_snapshot(&self, handle: &ChatDocHandle) {
@@ -6581,6 +6659,7 @@ impl DocHost {
             persistence.flush_sync();
             return;
         }
+        let _write = lock(&handle.snapshot_write);
         match handle.doc.export_snapshot() {
             Ok(bytes) => {
                 handle.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
@@ -6596,10 +6675,20 @@ impl DocHost {
 
     /// A fork must be durable before publishing its discoverable registry row.
     pub(crate) fn persist_fork(&self, handle: &ChatDocHandle) -> Result<(), EngineError> {
-        let bytes = handle.doc.export_snapshot()?;
-        self.inner.store.save_snapshot(&handle.chat_id, &bytes)?;
+        self.persist_fork_snapshot(handle).map(|_| ())
+    }
+
+    pub(crate) fn persist_fork_snapshot(&self, handle: &ChatDocHandle) -> Result<Vec<u8>, EngineError> {
+        let bytes = if let Some(persistence) = &handle.persistence {
+            persistence.save_snapshot_sync().map_err(EngineError::Other)?
+        } else {
+            let _write = lock(&handle.snapshot_write);
+            let bytes = handle.doc.export_snapshot()?;
+            self.inner.store.save_snapshot(&handle.chat_id, &bytes)?;
+            bytes
+        };
         handle.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
-        Ok(())
+        Ok(bytes)
     }
 
     /// Persist every open doc now (shutdown path; bypasses the debounce).
@@ -6614,6 +6703,11 @@ impl DocHost {
     /// draining. Auth-aware join supervisors will not install a late client.
     pub fn disconnect_edge(&self) {
         self.inner.edge_disconnected.store(true, Ordering::Release);
+        if let Some(wire) = self.sessions().and_then(|sessions| sessions.orchestrator()) {
+            if let Err(error) = wire.edge_disconnected() {
+                tracing::error!(%error, "transport capture failed");
+            }
+        }
         let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
         for handle in handles {
             lock(&handle.chat2).take();

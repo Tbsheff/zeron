@@ -45,7 +45,15 @@ e1f11b75c4b5bc4478ba0ac5cb6ae28e40a01b0016bc33e0aa97da22dfdbcd7f
 
 The jar manifest gives source commit
 `d8fb231de4e4b5d02c1b2ed1ac759c086f694021` in
-<https://github.com/tlaplus/tlaplus>. A replaced release asset fails the hash.
+<https://github.com/tlaplus/tlaplus/tree/d8fb231de4e4b5d02c1b2ed1ac759c086f694021>.
+Verify the source revision in the fetched jar with:
+
+```sh
+unzip -p verification/orchestrator/tools/tla2tools.jar META-INF/MANIFEST.MF
+```
+
+The release URL itself can change; the mandatory content hash prevents accepting
+a replaced artifact.
 For offline setup, set `TLA_JAR` to a local copy with that hash. The file stays
 ignored. TLAPS and Kani remain explicit host tools, not vendored binaries.
 
@@ -61,7 +69,7 @@ projection alone does not close AC-M4. The `orchestrator-fast` check can pass du
 `orchestrator-verify` acceptance check needs that pass and runs the release
 gate, so it stays red until release criteria pass. Kani checks only the bounds of each named harness, not all Rust states. The
 fast tier runs only `s1_restart_bound3`, `s3_stop_bound3`, and `s5a_narrow`,
-with three jobs and a five-minute total cap. AC-I4 permits Kani or proptest. The core proptest suite checks S1, S3, S5a,
+with three jobs and a five-minute cap per scope. These checks are optional evidence; they do not fail the required fast gate. The outer cap is sixteen minutes. AC-I4 permits Kani or proptest. The core proptest suite checks S1, S3, S5a,
 and S6 after each accepted step over bounded generated sequences; it runs in
 `cargo test -p zeron-orch`. Selected Kani scopes add proof evidence, with their
 fixture limits stated in the proof report. Unfinished extra Kani scopes are

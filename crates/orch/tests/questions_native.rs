@@ -482,3 +482,189 @@ fn host_closure_retracts_a_newer_shadow_epoch() {
     assert!(question.views.is_empty());
     assert_eq!(question.epoch, 2);
 }
+
+#[test]
+fn late_nested_spawn_keeps_ancestor_attempt_and_lifetime() {
+    let mut s = setup(false);
+    apply(
+        &mut s,
+        n(N::Start {
+            parent: ThreadId(1),
+            key: 70,
+            background: true,
+        }),
+    );
+    let original = s.natives[&(ThreadId(1), 70)].attempt;
+    end(&mut s, ThreadId(1), Outcome::Completed);
+    apply(
+        &mut s,
+        r(RunEvent::PersonSend {
+            t: ThreadId(1),
+            mode: Mode::Queue,
+            msg: 99,
+        }),
+    );
+    apply(&mut s, r(RunEvent::StartFromQueue { t: ThreadId(1) }));
+    assert_ne!(s.thread(ThreadId(1)).unwrap().attempt_id(), original);
+    apply(
+        &mut s,
+        n(N::StartNested {
+            parent: ThreadId(1),
+            key: 71,
+            ancestor: 70,
+            background: false,
+        }),
+    );
+    let nested = s.natives[&(ThreadId(1), 71)];
+    assert_eq!(nested.attempt, original);
+    assert!(nested.background);
+    assert_eq!(nested.ancestor, Some(70));
+    assert!(
+        apply(
+            &mut s,
+            n(N::StartNested {
+                parent: ThreadId(1),
+                key: 71,
+                ancestor: 70,
+                background: false
+            })
+        )
+        .is_empty()
+    );
+    let fx = apply(
+        &mut s,
+        n(N::End {
+            parent: ThreadId(1),
+            key: 71,
+            failed: false,
+        }),
+    );
+    assert!(fx.contains(&Effect::DeliverNative {
+        parent: ThreadId(1),
+        key: 71,
+        generation: 0
+    }));
+    assert_eq!(s.natives[&(ThreadId(1), 70)].status, NativeStatus::Running);
+    assert!(
+        step(
+            &s,
+            n(N::StartNested {
+                parent: ThreadId(1),
+                key: 72,
+                ancestor: 71,
+                background: false
+            })
+        )
+        .is_err()
+    );
+    assert!(
+        step(
+            &s,
+            n(N::StartNested {
+                parent: ThreadId(1),
+                key: 73,
+                ancestor: 73,
+                background: false
+            })
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn failure_wake_bypasses_held_native_input_without_releasing_people() {
+    let mut s = setup(false);
+    apply(
+        &mut s,
+        n(N::Start {
+            parent: ThreadId(1),
+            key: 80,
+            background: true,
+        }),
+    );
+    apply(
+        &mut s,
+        r(RunEvent::PersonSend {
+            t: ThreadId(1),
+            mode: Mode::Queue,
+            msg: 55,
+        }),
+    );
+    end(&mut s, ThreadId(1), Outcome::Failed);
+    apply(
+        &mut s,
+        n(N::End {
+            parent: ThreadId(1),
+            key: 80,
+            failed: false,
+        }),
+    );
+    apply(
+        &mut s,
+        r(RunEvent::ServerEnqueue {
+            t: ThreadId(1),
+            msg: 77,
+        }),
+    );
+    assert_eq!(
+        step(&s, r(RunEvent::StartFromQueue { t: ThreadId(1) })).unwrap_err(),
+        Reject::Held
+    );
+    end(&mut s, ThreadId(2), Outcome::Completed);
+    apply(
+        &mut s,
+        Event::Outbox(OutboxEvent::DoNotice {
+            child: ThreadId(2),
+            run: 1,
+            how: How::Ack,
+        }),
+    );
+    let Message::Offer {
+        parent,
+        run,
+        generation,
+    } = *s
+        .outbox
+        .iter()
+        .find(|m| matches!(m, Message::Offer { .. }))
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    apply(
+        &mut s,
+        Event::Outbox(OutboxEvent::DoOffer {
+            parent,
+            run,
+            generation,
+            how: How::Ack,
+        }),
+    );
+    let before: Vec<_> = s
+        .thread(ThreadId(1))
+        .unwrap()
+        .queue
+        .iter()
+        .copied()
+        .filter(|m| !matches!(m, Msg::Wake { .. }))
+        .collect();
+    assert_eq!(before, vec![Msg::Person(55), Msg::Server(77)]);
+    apply(&mut s, d(DelEvent::StartFromQueueWake { t: ThreadId(1) }));
+    assert_eq!(s.task(ThreadId(2)).unwrap().delivery, Delivery::Delivered);
+    assert_eq!(s.thread(ThreadId(1)).unwrap().held, Hold::Fail);
+    assert_eq!(
+        s.thread(ThreadId(1))
+            .unwrap()
+            .queue
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        before
+    );
+    end(&mut s, ThreadId(1), Outcome::Completed);
+    assert_eq!(s.thread(ThreadId(1)).unwrap().held, Hold::Fail);
+    assert_eq!(
+        step(&s, r(RunEvent::StartFromQueue { t: ThreadId(1) })).unwrap_err(),
+        Reject::Held
+    );
+}

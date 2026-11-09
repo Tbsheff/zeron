@@ -58,6 +58,9 @@ enum Plan {
 }
 
 struct Agent {
+    mcp_runs: Mutex<Vec<String>>,
+    early_rpc: Mutex<Option<Arc<dyn RpcService>>>,
+    early_result: Mutex<Option<Result<(), String>>>,
     steering: Option<SteeringMode>,
     finish: tokio::sync::broadcast::Sender<()>,
     runs: Arc<Mutex<Vec<String>>>,
@@ -81,6 +84,9 @@ impl Agent {
     fn new(steering: Option<SteeringMode>) -> Arc<Self> {
         let (finish, _) = tokio::sync::broadcast::channel(16);
         Arc::new(Self {
+            mcp_runs: Mutex::default(),
+            early_rpc: Mutex::default(),
+            early_result: Mutex::default(),
             steering,
             finish,
             runs: Arc::default(),
@@ -114,7 +120,7 @@ impl Agent {
             };
         }
         match word {
-            "hold" => Plan::Hold(Completed, None),
+            "hold" | "early-hold" => Plan::Hold(Completed, None),
             "limit-hold" => Plan::Hold(Errored, Some(FailureClass::UsageLimit { reset_at: None })),
             "limit" => Plan::Done(Errored, Some(FailureClass::UsageLimit { reset_at: None })),
             "limit-at" => Plan::Done(
@@ -221,6 +227,22 @@ impl Harness for Agent {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let identity = request.mcp.as_ref().and_then(|mcp| mcp.env.get("ZERON_RUN_ID")).cloned();
+        if let Some(id) = &identity {
+            self.mcp_runs.lock().unwrap().push(id.clone());
+        }
+        if request.prompt == "early-hold" {
+            let service = self.early_rpc.lock().unwrap().clone().expect("early RPC");
+            let params = serde_json::json!({
+                "task":"hold", "mode":"wait", "timeoutMs":1, "clientRequestId":"early-child",
+                "child":{"chatId":"early-child","config":child_config(),"cwd":"/tmp"}
+            });
+            let result = zeron_rpc::with_agent_run(identity, zeron_rpc::with_caller(
+                zeron_rpc::Caller::Agent {chat:Some(CHAT.into())},
+                service.handle(zeron_rpc::methods::ORCH_DELEGATE, params)
+            )).await.map(|_|()).map_err(|e|e.to_string());
+            *self.early_result.lock().unwrap() = Some(result);
+        }
         if request.prompt.starts_with("Task results") {
             let path = self.projection_store.lock().unwrap().clone();
             if let Some(path) = path {
@@ -356,15 +378,16 @@ async fn rig(agent: Arc<Agent>, orch: Option<OrchOptions>) -> Rig {
 async fn boot(dir: std::path::PathBuf, agent: Arc<Agent>, orch: Option<OrchOptions>) -> Rig {
     let registry = HarnessRegistry::new();
     registry.register(agent.clone());
-    let core = EngineCore::assemble(&dir.join("data"), Arc::new(registry), HarnessId::Mock, None)
-        .expect("engine assembles");
+    let registry = Arc::new(registry);
+    let core = match orch {
+        Some(opts) => EngineCore::assemble_with_orchestrator(&dir.join("data"), registry, HarnessId::Mock, None, opts),
+        None => EngineCore::assemble(&dir.join("data"), registry, HarnessId::Mock, None),
+    }.expect("engine assembles");
     create_chat(&core).await;
-    let wire = orch.map(|o| {
-        core.enable_orchestrator_v2(o)
-            .expect("orchestrator enables")
-    });
+    let wire = core.sessions.orchestrator();
     if let Some(w) = &wire {
         forward_changes(w);
+        wait_for(|| !w.recovery_pending(), "boot recovery completes").await;
     }
     Rig {
         core,
@@ -478,6 +501,24 @@ impl Rig {
         }
         let _ = self.agent.finish.send(());
         self.core.shutdown().await;
+    }
+}
+
+impl Drop for Rig {
+    fn drop(&mut self) {
+        if !std::thread::panicking() { return; }
+        let Some(root) = std::env::var_os("ORCH_MECHANISM_OUT") else { return; };
+        let Some(wire) = self.wire.as_ref() else { return; };
+        let Ok(rows) = wire.driver().mechanism_lines() else { return; };
+        let recording = std::path::PathBuf::from(root).join(format!("orch_v2-failed-{}", uuid::Uuid::new_v4()));
+        if std::fs::create_dir_all(&recording).is_err() { return; }
+        let filename = format!("{}.jsonl", self.core.device_id);
+        if std::fs::write(recording.join(&filename), rows.join("\n") + "\n").is_err() { return; }
+        let sidecar = serde_json::json!({
+            "test_name":std::thread::current().name(), "devices":[self.core.device_id],
+            "filenames":[filename], "capture":"failed_test", "reason":"panic"
+        });
+        if let Ok(bytes) = serde_json::to_vec(&sidecar) { let _ = std::fs::write(recording.join("capture.json"), bytes); }
     }
 }
 
@@ -1121,19 +1162,13 @@ async fn r18_a_landed_message_with_no_receipt_is_not_run_again() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_chat_without_a_registry_row_is_not_orchestrated() {
+async fn a_chat_without_a_registry_row_requires_a_known_local_host() {
     let r = rig(Agent::new(None), Some(OrchOptions::default())).await;
-    r.core
-        .sessions
-        .dispatch(
-            "no-row",
-            HarnessId::Mock,
-            request("stray"),
-            Some("x1".into()),
-        )
-        .await
-        .expect("legacy dispatch");
-    wait_for(|| r.agent.runs() == ["stray"], "the legacy path runs it").await;
+    let error = r.core.sessions.dispatch(
+        "no-row", HarnessId::Mock, request("stray"), Some("x1".into()),
+    ).await.unwrap_err();
+    assert!(error.to_string().contains("requires a known local host row"));
+    assert!(r.agent.runs().is_empty());
     assert!(r.wire().thread_state("no-row").is_none());
     r.finish().await;
 }
@@ -1736,6 +1771,11 @@ async fn fp1_fp2_a_crash_after_delegate_commits_runs_the_child_once_and_wakes_th
             "recovery handles the root",
         )
         .await;
+        r.wait(
+            || zeron_engine::orchestrator::wire::RunEngine::agent_attempt(&r.core.sessions, CHAT)
+                .is_some_and(|runtime| r.wire().thread_state(CHAT).is_some_and(|thread| thread.attempt_id() == runtime.attempt)),
+            "recovery binds the root runtime to its saved attempt",
+        ).await;
         let _ = r.agent.finish.send(());
         r.wait(
             || r.wake_runs().iter().any(|w| w.contains("result of quick")),
@@ -1965,6 +2005,7 @@ async fn s12_worktree_isolation_runs_the_child_in_a_fresh_checkout() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s10_sender_scope_overrides_forged_origin_on_status_and_delegate() {
     let r = rig(Agent::new(None), Some(OrchOptions::default())).await;
+    r.core.sessions.set_ipc_port(9);
     r.send("hold root", "m1");
     r.wait(|| r.agent.runs() == ["hold root"], "root starts")
         .await;
@@ -1978,8 +2019,10 @@ async fn s10_sender_scope_overrides_forged_origin_on_status_and_delegate() {
         "child starts",
     )
     .await;
+    r.wait(|| r.agent.mcp_runs.lock().unwrap().len() == 2, "child MCP starts").await;
+    let child_run = r.agent.mcp_runs.lock().unwrap()[1].clone();
     let service = r.core.rpc_service();
-    let status = zeron_rpc::with_caller(
+    let status = zeron_rpc::with_agent_run(Some(child_run), zeron_rpc::with_caller(
         zeron_rpc::Caller::Agent {
             chat: Some(child.clone()),
         },
@@ -1987,7 +2030,7 @@ async fn s10_sender_scope_overrides_forged_origin_on_status_and_delegate() {
             zeron_rpc::methods::ORCH_TASK_STATUS,
             serde_json::json!({"originChatId":CHAT,"taskId":view["taskId"]}),
         ),
-    )
+    ))
     .await;
     assert!(
         status
@@ -2220,5 +2263,77 @@ async fn r25_followups_reuse_the_child_and_keep_old_results_and_receipts() {
             .count(),
         1
     );
+    r.finish().await;
+}
+
+#[tokio::test]
+async fn an_actual_harness_can_delegate_before_its_stream_opens() {
+    let r = rig(Agent::new(None), Some(options(Duration::from_secs(1)))).await;
+    r.core.sessions.set_ipc_port(9);
+    *r.agent.early_rpc.lock().unwrap() = Some(r.core.rpc_service());
+    r.send("early-hold", "early-root");
+    assert!(until(|| r.agent.early_result.lock().unwrap().is_some()).await);
+    assert_eq!(r.agent.early_result.lock().unwrap().as_ref(), Some(&Ok(())));
+    assert!(r.wire().thread_state("early-child").is_some());
+    *r.agent.early_rpc.lock().unwrap() = None;
+    r.finish().await;
+}
+
+#[tokio::test]
+async fn an_old_background_handle_cannot_borrow_a_pending_replacement_attempt() {
+    let r = rig(Agent::parking(), Some(options(Duration::from_secs(1)))).await;
+    r.core.sessions.set_ipc_port(9);
+    r.send("hold", "old-root");
+    assert!(until(|| !r.agent.mcp_runs.lock().unwrap().is_empty()).await);
+    let old = r.agent.mcp_runs.lock().unwrap()[0].clone();
+    let service = r.core.rpc_service();
+    let params = serde_json::json!({"task":"hold","mode":"wait","timeoutMs":1,
+        "child":{"chatId":"stale-child","config":child_config(),"cwd":"/tmp"}});
+    let missing = zeron_rpc::with_caller(zeron_rpc::Caller::Agent {chat:Some(CHAT.into())},
+        service.handle(zeron_rpc::methods::ORCH_DELEGATE, params.clone())).await;
+    assert!(missing.err().expect("missing identity refused").to_string().contains("parent_not_active"));
+    let before = r.thread().unwrap();
+    r.wire().driver().apply_command("pending-replacement",None,zeron_orch::Event::Run(
+        zeron_orch::RunEvent::RestartActive {t:before.id,mode:zeron_orch::Mode::Restart,msg:999_999}
+    )).unwrap();
+    assert_ne!(r.thread().unwrap().attempt_id(),before.attempt_id());
+    let refused = zeron_rpc::with_agent_run(Some(old),zeron_rpc::with_caller(
+        zeron_rpc::Caller::Agent {chat:Some(CHAT.into())},
+        service.handle(zeron_rpc::methods::ORCH_DELEGATE,params))).await;
+    assert!(refused.err().expect("old handle refused").to_string().contains("parent_not_active"));
+    assert!(r.wire().thread_state("stale-child").is_none());
+    r.finish().await;
+}
+
+#[tokio::test]
+async fn a_retained_background_handle_needs_an_accepted_live_turn() {
+    let r = rig(Agent::parking(), Some(options(Duration::from_secs(1)))).await;
+    r.core.sessions.set_ipc_port(9);
+    r.send("done", "retained-root");
+    r.wait_statuses(&[RunStatus::Completed],"parked root").await;
+    let run = r.agent.mcp_runs.lock().unwrap()[0].clone();
+    let service = r.core.rpc_service();
+    let params = serde_json::json!({"task":"hold","mode":"async",
+        "child":{"chatId":"retained-child","config":child_config(),"cwd":"/tmp"}});
+    let refused = zeron_rpc::with_agent_run(Some(run.clone()),zeron_rpc::with_caller(
+        zeron_rpc::Caller::Agent {chat:Some(CHAT.into())},
+        service.handle(zeron_rpc::methods::ORCH_DELEGATE,params.clone()))).await;
+    assert!(refused.err().expect("old handle refused").to_string().contains("parent_not_active"));
+    r.send("hold", "retained-next");
+    assert!(until(|| r.agent.steers.lock().unwrap().iter().any(|s|s=="hold")
+        && r.thread().is_some_and(|t|t.is_live())).await);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let ready = zeron_rpc::with_agent_run(Some(run.clone()), zeron_rpc::with_caller(
+                zeron_rpc::Caller::Agent {chat:Some(CHAT.into())},
+                service.handle(zeron_rpc::methods::ORCH_TASK_STATUS,serde_json::json!({})))).await;
+            if ready.is_ok() { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("provider accepted retained turn");
+    let accepted = zeron_rpc::with_agent_run(Some(run),zeron_rpc::with_caller(
+        zeron_rpc::Caller::Agent {chat:Some(CHAT.into())},
+        service.handle(zeron_rpc::methods::ORCH_DELEGATE,params))).await;
+    if let Err(error) = accepted { panic!("current handle refused: {error}"); }
     r.finish().await;
 }

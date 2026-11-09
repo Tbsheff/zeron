@@ -46,7 +46,7 @@ pub(super) async fn wait_for_model(
                 return Ok(id.to_owned());
             }
             match incoming.recv().await {
-                Some(Incoming::Notification { method, params })
+                Some(Incoming::Notification { method, params, .. })
                     if method == "session/update"
                         && params.get("sessionId").and_then(serde_json::Value::as_str)
                             == Some(session_id)
@@ -56,7 +56,9 @@ pub(super) async fn wait_for_model(
                         response["configOptions"] = params["update"]["configOptions"].clone();
                     }
                 }
-                Some(Incoming::Request { id, method, params }) => {
+                Some(Incoming::Request {
+                    id, method, params, ..
+                }) => {
                     super::handle_server_request_unattended(client, id, &method, &params, access);
                 }
                 Some(_) => {}

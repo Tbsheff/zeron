@@ -21,6 +21,15 @@ struct Params {
 }
 impl EngineRpc {
     pub(super) fn orch_transfer(&self, params: Value) -> Result<RpcReply, RpcError> {
+        if let zeron_rpc::Caller::Agent { chat } = zeron_rpc::caller() {
+            let chat=chat.ok_or_else(||RpcError::Failed("capability_denied: calling chat required".into()))?;
+            if let Some(wire)=self.sessions.orchestrator() {
+                return wire.with_agent_admission(&self.sessions,&chat,|error|Err(RpcError::Failed(error.to_string())),||self.orch_transfer_admitted(params));
+            }
+        }
+        self.orch_transfer_admitted(params)
+    }
+    fn orch_transfer_admitted(&self, params: Value) -> Result<RpcReply, RpcError> {
         if self.sessions.orchestrator().is_none() {
             return Err(RpcError::Failed(
                 "capability_denied: context transfers need orchestrator v2".into(),
@@ -101,8 +110,9 @@ impl EngineRpc {
             .doc_host
             .open(&p.origin_chat_id)
             .map_err(|e| RpcError::Failed(e.to_string()))?;
-        let entries = source
-            .doc()
+        let frozen_source = self.sessions.orchestrator().filter(|wire|wire.driver().mechanism_capture_enabled()).map(|wire|crate::orchestrator::transfer::freeze_source(wire.driver(),&self.doc_host,&source,&p.origin_chat_id)).transpose().map_err(RpcError::Failed)?;
+        let source_view = frozen_source.as_ref().unwrap_or(source.doc());
+        let entries = source_view
             .read_entries()
             .map_err(|e| RpcError::Failed(e.to_string()))?;
         let stable = entries
@@ -124,7 +134,7 @@ impl EngineRpc {
             .map_err(|e| RpcError::Failed(e.to_string()))?;
         let id = format!("{}:{}", p.origin_chat_id, p.client_request_id);
         if p.action == "merge_back" && p.base_message_id.is_none() {
-            p.base_message_id = crate::orchestrator::transfer::fork_base(source.doc());
+            p.base_message_id = crate::orchestrator::transfer::fork_base(source_view);
         }
         let wire = self.sessions.orchestrator().expect("v2 gate checked");
         let before = crate::orchestrator::transfer::begin_operation(
@@ -139,7 +149,7 @@ impl EngineRpc {
                 "id":id,"source_chat":p.origin_chat_id,"target_chat":p.target_chat_id,
                 "base":p.base_message_id,"point":point,"source":crate::orchestrator::transfer::source_fact(&entries[..=stable]),
                 "queue_id":if p.action == "merge_back" {Some(format!("merge-back:{id}"))}else{None},
-                "hold_for_turn_end":p.action == "merge_back","target_local":true,
+                "hold_for_turn_end":p.action == "merge_back","target_local":true,"issuer":self.doc_host.device_id(),
                 "caller_relation_checked":matches!(zeron_rpc::caller(), zeron_rpc::Caller::Agent { .. })
             })
         } else {
@@ -184,6 +194,7 @@ impl EngineRpc {
             crate::orchestrator::transfer::merge_marker(target.doc(), &transfer)
                 .map_err(RpcError::Failed)?;
         }
+        if wire.driver().mechanism_capture_enabled() { crate::orchestrator::transfer::record_lineage(target.doc(),source_view,&id,if p.action=="merge_back" {"merge_back"}else{"provider_switch"},&p.origin_chat_id,&p.target_chat_id,point,transfer.base.as_deref(),&[]).map_err(RpcError::Failed)?; }
         self.doc_host
             .persist_fork(&target)
             .map_err(|e| RpcError::Failed(e.to_string()))?;
@@ -225,6 +236,7 @@ mod tests {
             None,
         )
         .unwrap();
+        core.doc_host.docs_store().transact(|tx|crate::orchestrator::store::put_meta(tx,"mechanism_capture","1")).unwrap();
         core.enable_orchestrator_v2(crate::orchestrator::OrchOptions::default())
             .unwrap();
         for id in ["a", "b", "unrelated"] {
@@ -279,14 +291,7 @@ mod tests {
             .await
             .is_err()
         );
-        with_caller(
-            Caller::Agent {
-                chat: Some("a".into()),
-            },
-            rpc.handle(METHOD, params.clone()),
-        )
-        .await
-        .unwrap();
+        rpc.handle(METHOD, params.clone()).await.unwrap();
         rpc.handle(METHOD, params).await.unwrap();
         let target = core.doc_host.open("b").unwrap();
         let transfers = crate::orchestrator::transfer::status(target.doc());
@@ -294,4 +299,73 @@ mod tests {
         assert_eq!(transfers["a:x"].point, "m1");
         assert!(rpc.handle(METHOD, json!({"originChatId":"a","targetChatId":"b","clientRequestId":"bad","pointMessageId":"missing"})).await.is_err());
     }
+    #[tokio::test]
+    async fn captures_actual_fork_and_idempotent_merge_back() {
+        let (_temp, core) = setup().await;
+        let rpc = core.rpc_service();
+        rpc.handle(methods::FORK_SIDE_CHAT, json!({"sourceChatId":"a","chatId":"fork-child"})).await.unwrap();
+        let child = core.doc_host.open("fork-child").unwrap();
+        let mut entry = core.doc_host.open("a").unwrap().doc().read_entries().unwrap().remove(0);
+        entry.id = "child-complete".into();
+        entry.parts = vec![zeron_doc::MessagePart::Text { id:"child-text".into(), text:"child delta".into() }];
+        child.doc().push_message(&entry).unwrap();
+        core.doc_host.persist_fork(&child).unwrap();
+        let params = json!({"action":"merge_back","originChatId":"fork-child","clientRequestId":"merge-once"});
+        rpc.handle(METHOD, params.clone()).await.unwrap();
+        rpc.handle(METHOD, params).await.unwrap();
+        let parent = core.doc_host.open("a").unwrap();
+        let transfers = crate::orchestrator::transfer::status(parent.doc());
+        let transfer = &transfers["fork-child:merge-once"];
+        assert_eq!(transfer.base.as_deref(),Some("m1"));
+        assert_eq!(transfer.items.iter().filter(|i|!i.text.is_empty()).map(|i|i.id.as_str()).collect::<Vec<_>>(),vec!["child-complete"]);
+        let queue = parent.doc().read_queue().unwrap();
+        let entries = parent.doc().read_entries().unwrap();
+        let row = "merge-back:fork-child:merge-once";
+        assert_eq!(queue.iter().filter(|q|q.id==row).count()+entries.iter().filter(|e|e.id==row).count(),1);
+        assert!(queue.iter().filter(|q|q.id==row).all(|q|q.hold_for_turn_end));
+        crate::orchestrator::transfer::export_capture_for_test(core.sessions.orchestrator().unwrap().driver(),"captures_actual_fork_and_idempotent_merge_back","engine-integration");
+        core.sessions.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn frozen_source_excludes_concurrent_completed_append() {
+        let (_temp,core)=setup().await;
+        let wire=core.sessions.orchestrator().unwrap();
+        let driver=wire.driver();
+        let source=core.doc_host.open("a").unwrap();
+        let frozen=crate::orchestrator::transfer::freeze_source(driver,&core.doc_host,&source,"a").unwrap();
+        let original_version=frozen.doc().state_vv();
+        let live=source.doc_arc();
+        let mut entry=frozen.read_entries().unwrap().remove(0);
+        entry.id="concurrent-complete".into();
+        std::thread::spawn(move ||live.push_message(&entry).unwrap()).join().unwrap();
+        let entries=frozen.read_entries().unwrap();
+        assert_eq!(entries.iter().map(|e|e.id.as_str()).collect::<Vec<_>>(),vec!["m1"]);
+        assert_eq!(frozen.doc().state_vv(),original_version);
+        assert_eq!(source.doc().read_entries().unwrap().last().unwrap().id,"concurrent-complete");
+        let target=core.doc_host.open("b").unwrap();
+        for entry in &entries {target.doc().push_message(entry).unwrap();}
+        crate::orchestrator::transfer::pin(target.doc(),"frozen","a","b",None,"m1",&entries).unwrap();
+        crate::orchestrator::transfer::record_lineage(target.doc(),&frozen,"frozen","fork","a","b","m1",None,&entries).unwrap();
+        core.doc_host.persist_fork(&target).unwrap();
+        let fact=crate::orchestrator::transfer::durable_fact(target.doc(),"b").unwrap();
+        assert_eq!(fact["lineage"]["frozen"]["source_point"]["last_item_id"],"m1");
+        assert_eq!(fact["lineage"]["frozen"]["copied_items"].as_array().unwrap().len(),1);
+        assert_eq!(crate::orchestrator::transfer::status(target.doc())["frozen"].point,"m1");
+        crate::orchestrator::transfer::export_capture_for_test(driver,"frozen_source_excludes_concurrent_completed_append","focused-mock-engine");
+        core.sessions.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rejects_transfer_and_fork_from_unadmitted_agent() {
+        let (_temp,core)=setup().await;
+        let rpc=core.rpc_service();
+        for (method,params) in [(METHOD,json!({"action":"status","originChatId":"a"})),(METHOD,json!({"originChatId":"a","targetChatId":"b","clientRequestId":"stale"})),(methods::FORK_SIDE_CHAT,json!({"sourceChatId":"a","chatId":"stale-fork"}))] {
+            assert!(with_caller(Caller::Agent {chat:Some("a".into())},rpc.handle(method,params)).await.is_err());
+        }
+        assert!(core.workspace.chat("stale-fork").unwrap().is_none());
+        assert!(crate::orchestrator::transfer::status(core.doc_host.open("b").unwrap().doc()).is_empty());
+        core.sessions.shutdown().await;
+    }
+
 }

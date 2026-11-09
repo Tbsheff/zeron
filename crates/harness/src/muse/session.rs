@@ -131,6 +131,9 @@ impl Runner {
     }
 
     async fn emit(&self, event: AgentEvent) -> Result<(), HarnessError> {
+        if matches!(&event, AgentEvent::Steered { .. }) {
+            self.turn.source_steered();
+        }
         self.tx
             .send(Ok(event))
             .await

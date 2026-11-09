@@ -178,6 +178,9 @@ fn extension_actions_use_unique_round_trip_trace_names() {
             key: 1,
             background: false,
         }),
+        Event::Native(NativeEvent::StartNested {
+            parent: t, key: 2, ancestor: 1, background: true,
+        }),
         Event::Native(NativeEvent::End {
             parent: t,
             key: 1,

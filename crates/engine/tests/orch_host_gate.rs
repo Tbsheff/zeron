@@ -12,6 +12,31 @@ use zeron_proto::{
     SteeringMode,
 };
 
+fn export_capture(core: &EngineCore, test_name: &str) {
+    let Some(root) = std::env::var_os("ORCH_MECHANISM_OUT") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(root).join(format!("host-gate-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let inventory = if let Some(wire) = core.sessions.orchestrator() {
+        let rows = wire.driver().mechanism_lines().unwrap();
+        assert!(
+            !rows.is_empty(),
+            "capture requires ORCH_CAPTURE_MECHANISM=1"
+        );
+        let file = format!("{}.jsonl", core.device_id);
+        std::fs::write(dir.join(&file), rows.join("\n") + "\n").unwrap();
+        serde_json::json!({"test_name":test_name,"devices":[core.device_id],"filenames":[file],"capture":"present"})
+    } else {
+        serde_json::json!({"test_name":test_name,"devices":[],"filenames":[],"capture":"skipped","reason":"orchestrator_disabled"})
+    };
+    std::fs::write(
+        dir.join("capture.json"),
+        serde_json::to_vec(&inventory).unwrap(),
+    )
+    .unwrap();
+}
+
 struct CountHarness(AtomicUsize);
 #[async_trait]
 impl Harness for CountHarness {
@@ -183,7 +208,52 @@ async fn v2_unknown_and_remote_hosts_never_start_or_claim_and_unknown_work_stays
     .await
     .unwrap();
     assert_eq!(harness.0.load(Ordering::SeqCst), 2);
+    if let Some(wire) = core
+        .sessions
+        .orchestrator()
+        .filter(|wire| wire.driver().mechanism_capture_enabled())
+    {
+        let row: serde_json::Value =
+            serde_json::from_str(&wire.driver().mechanism_lines().unwrap().pop().unwrap()).unwrap();
+        assert!(
+            row["snapshot"]["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|binding| binding["host_known"] == true && binding["host"] == core.device_id)
+        );
+    }
+    core.doc_host.hold_work();
+    core.doc_host.lift_quiesce();
+    core.disconnect_edge();
     core.shutdown().await;
+    if let Some(wire) = core.sessions.orchestrator().filter(|wire| wire.driver().mechanism_capture_enabled()) {
+        let row: serde_json::Value = serde_json::from_str(&wire.driver().mechanism_lines().unwrap().pop().unwrap()).unwrap();
+        let facts = row["snapshot"]["facts"].as_array().unwrap();
+        for state in ["started", "stopping", "stopped"] {
+            assert!(facts.iter().any(|fact| fact["kind"] == "engine_lifecycle" && fact["data"]["state"] == state));
+        }
+        for state in ["open", "held"] {
+            assert!(facts.iter().any(|fact| fact["kind"] == "admission_state" && fact["data"]["state"] == state));
+        }
+        assert!(facts.iter().any(|fact| fact["kind"] == "transport_connection" && fact["data"]["source"] == "disconnect_edge" && fact["data"]["state"] == "disconnected"));
+        assert!(!facts.iter().any(|fact| fact["kind"] == "target_reachability"));
+        let catalog = &facts.iter().find(|fact| fact["kind"] == "capability_catalog").unwrap()["data"];
+        assert_eq!(catalog["scope"], "selected_harnesses");
+        assert_eq!(catalog["complete"], true);
+        assert_eq!(catalog["providers"][0]["provider_id"], "mock");
+        assert_eq!(catalog["providers"][0]["delivery_path"], "portable_prompt");
+        assert_eq!(catalog["providers"][0]["declared_native_fork"], false);
+        assert_eq!(catalog["providers"][0]["declared_inject_history"], true);
+        assert_eq!(catalog["providers"][0]["effective_native_fork"], false);
+        assert_eq!(catalog["providers"][0]["effective_native_injection"], false);
+        assert!(catalog["policy"].as_object().unwrap().values().all(serde_json::Value::is_null));
+        assert!(catalog["policy_sources"]["in_place_access"].as_str().unwrap().contains("actual_request_pair"));
+    }
+    export_capture(
+        &core,
+        "v2_unknown_and_remote_hosts_never_start_or_claim_and_unknown_work_stays_pending",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -210,5 +280,6 @@ async fn flag_off_keeps_legacy_unknown_chat_dispatch() {
     .await
     .unwrap();
     assert_eq!(harness.0.load(Ordering::SeqCst), 1);
+    export_capture(&core, "flag_off_keeps_legacy_unknown_chat_dispatch");
     core.shutdown().await;
 }

@@ -39,6 +39,7 @@ struct Host {
     interrupts: Mutex<Vec<String>>,
     fail_send: AtomicBool,
     send_attempts: Mutex<Vec<OrchMessage>>,
+    dispatched_access: Mutex<BTreeMap<String, u8>>,
     fail_response: AtomicBool,
     answers: Mutex<Vec<(String, String)>>,
 }
@@ -52,6 +53,7 @@ impl Host {
             interrupts: Mutex::new(Vec::new()),
             fail_send: AtomicBool::new(false),
             send_attempts: Mutex::new(Vec::new()),
+            dispatched_access: Mutex::new(BTreeMap::new()),
             fail_response: AtomicBool::new(false),
             answers: Mutex::new(Vec::new()),
         }
@@ -94,6 +96,17 @@ impl RunEngine for Host {
             Via::Resume { prompt, .. } | Via::Steer { prompt, .. } => prompt.clone(),
             Via::Dispatch { request, .. } => request.prompt.clone(),
         };
+        match &p.via {
+            Via::Dispatch { request, .. } => {
+                self.dispatched_access.lock().unwrap().insert(
+                    p.chat.clone(),
+                    zeron_engine::orchestrator::wire::access_level(request.access),
+                );
+            }
+            _ => {
+                self.dispatched_access.lock().unwrap().remove(&p.chat);
+            }
+        }
         self.starts.lock().unwrap().push((p.chat.clone(), prompt));
         self.running.lock().unwrap().insert(p.chat.clone());
         Ok(p.message_id.clone())
@@ -117,6 +130,9 @@ impl RunEngine for Host {
     }
     fn journal_seq(&self, _: &str) -> u64 {
         0
+    }
+    fn effective_access(&self, chat: &str) -> Option<u8> {
+        self.dispatched_access.lock().unwrap().get(chat).copied()
     }
     fn create_child(&self, parent: &str, spec: &ChildSpec) -> Result<(), EngineError> {
         let mut n = self.network.lock().unwrap();
@@ -673,6 +689,14 @@ async fn remote_recover_blocks_later_controls_and_starts_another_thread() {
             .iter()
             .any(|row| matches!(row.effect, zeron_orch::Effect::StartAttempt { .. }))
     );
+    assert!(
+        a.send_attempts
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|message| { matches!(message.body, zeron_doc::OrchBody::CreateChild { .. }) }),
+        "filtered control overtook failed Create"
+    );
     a.send_attempts.lock().unwrap().clear();
     wa.recover(&a).await.unwrap();
     assert_eq!(
@@ -731,4 +755,93 @@ async fn remote_recover_blocks_later_controls_and_starts_another_thread() {
     check(&wa);
     check(&wb);
     trace_pair("remote-recovery-order", &wa, &wb);
+}
+
+#[tokio::test]
+async fn remote_retry_keeps_committed_create_payload_across_followup() {
+    let n = network();
+    let a = Host::new("laptop", n.clone());
+    let b = Host::new("cloud", n.clone());
+    let da = tempfile::tempdir().unwrap();
+    let db = tempfile::tempdir().unwrap();
+    let wa = wire(da.path(), "laptop");
+    let wb = wire(db.path(), "cloud");
+    parent(&wa, &a).await;
+    wa.driver().crash_at(FaultPoint::Fp2EffectRunNotMarked, 0);
+    wa.delegate(&a, request("c")).await.unwrap();
+    assert!(
+        wa.driver()
+            .pending()
+            .unwrap()
+            .iter()
+            .any(|row| matches!(row.effect, zeron_orch::Effect::CreateChild { .. }))
+    );
+    drop(wa);
+    let wa = wire(da.path(), "laptop");
+    a.fail_send.store(true, Ordering::SeqCst);
+    a.finish(&wa, "p", DoneStatus::Completed);
+    let _ = wa.run_effects(&a, None).await;
+    assert!(
+        b.backfill(&wb, "c")
+            .into_iter()
+            .all(|result| result.is_ok())
+    );
+    flush(&wb, &b).await;
+    assert_eq!(b.count("c"), 1);
+    b.finish(&wb, "c", DoneStatus::Completed);
+    flush(&wb, &b).await;
+    assert!(
+        a.backfill(&wa, "c")
+            .into_iter()
+            .all(|result| result.is_ok())
+    );
+    for _ in 0..3 {
+        let _ = wa.run_effects(&a, None).await;
+    }
+    assert_eq!(a.count("p"), 2);
+    let next = wa
+        .followup(&a, "p", "c", "next immutable task", "retry-followup")
+        .await
+        .unwrap();
+    assert_eq!(next.task_id, "c:2");
+    a.fail_send.store(false, Ordering::SeqCst);
+    wa.recover(&a).await.unwrap();
+    flush(&wa, &a).await;
+    {
+        let net = n.lock().unwrap();
+        let messages = placement::scan(&*net, "cloud", &net.docs["c"]).unwrap();
+        let create = messages
+            .iter()
+            .find(|message| matches!(message.body, zeron_doc::OrchBody::CreateChild { .. }))
+            .unwrap();
+        match &create.body {
+            zeron_doc::OrchBody::CreateChild { cohort, spec, .. } => {
+                assert_eq!(*cohort, 1);
+                assert_eq!(spec["task"], "remote work");
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message.body, zeron_doc::OrchBody::FollowUp { .. }))
+                .count(),
+            1
+        );
+    }
+    assert!(
+        b.backfill(&wb, "c")
+            .into_iter()
+            .all(|result| result.is_ok())
+    );
+    flush(&wb, &b).await;
+    assert_eq!(b.count("c"), 2);
+    assert_eq!(
+        b.starts.lock().unwrap().last().unwrap().1,
+        "next immutable task"
+    );
+    assert_eq!(a.count("c"), 0);
+    check(&wa);
+    check(&wb);
+    trace_pair("remote-prepared-retry", &wa, &wb);
 }

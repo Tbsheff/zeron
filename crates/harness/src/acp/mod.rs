@@ -46,9 +46,9 @@ use std::time::Duration;
 
 use crate::process::{ChildStdin, ChildStdout};
 use async_trait::async_trait;
-use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
+use futures::{FutureExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
@@ -57,7 +57,7 @@ use zeron_proto::{
     ReasoningLevel, RunRequest, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
-use crate::jsonrpc::{Incoming, RpcClient};
+use crate::jsonrpc::{Incoming, OrderedResponse, RpcClient};
 pub(crate) use crate::process::owned as child;
 use crate::process::{Command, Stdio};
 use crate::scratch::ScratchDir;
@@ -2847,7 +2847,7 @@ impl AcpHarness {
                     loop {
                         tokio::select! {
                             inc = incoming.recv() => match inc {
-                                Some(Incoming::Notification { method, params })
+                                Some(Incoming::Notification { method, params, .. })
                                     if method == "session/update" =>
                                 {
                                     let update = params.get("update").cloned().unwrap_or(Value::Null);
@@ -4137,7 +4137,7 @@ fn prompt_turn(
     session_id: String,
     prompt: &PromptInput,
     prompt_id: Option<String>,
-) -> BoxFuture<'static, Result<Value, HarnessError>> {
+) -> BoxFuture<'static, Result<OrderedResponse, HarnessError>> {
     let mut params = json!({
         "sessionId": session_id,
         "prompt": prompt.blocks(),
@@ -4147,7 +4147,7 @@ fn prompt_turn(
     }
     // Written now, not on first poll: a steer's `session/cancel` issued in
     // the same loop iteration must reach the agent after this prompt.
-    client.request_now("session/prompt", params)
+    client.request_ordered_now("session/prompt", params)
 }
 
 /// A message bound for the agent: its text plus the image blocks inlined
@@ -4366,11 +4366,9 @@ fn handle_server_request_live(
             return Vec::new();
         }
         let question = permission::question(agent_name, params);
-        let request_input = std::sync::Arc::clone(request_input);
+        let answers = (request_input)(vec![question.clone()]);
         questions.spawn(client.clone(), id, async move {
-            let answers = (request_input)(vec![question.clone()])
-                .await
-                .unwrap_or_default();
+            let answers = answers.await.unwrap_or_default();
             permission::outcome(&options, crate::approval::approved(&question, &answers))
         });
         return Vec::new();
@@ -4398,11 +4396,9 @@ fn handle_server_request_live(
         multiline: false,
         multi_select: false,
     };
-    let request_input = std::sync::Arc::clone(request_input);
+    let answers = (request_input)(vec![question.clone()]);
     questions.spawn(client.clone(), id, async move {
-        let answers = (request_input)(vec![question.clone()])
-            .await
-            .unwrap_or_default();
+        let answers = answers.await.unwrap_or_default();
         let picked = answers
             .iter()
             .find(|a| a.question_id == question.id)
@@ -4899,14 +4895,16 @@ async fn request_draining_with(
         .map(str::to_owned);
     let mut metadata = VecDeque::new();
     let mut handle_incoming = |inc| match inc {
-        Incoming::Request { id, method, params }
-            if method == "elicitation/create" && on_page.is_some() =>
-        {
+        Incoming::Request {
+            id, method, params, ..
+        } if method == "elicitation/create" && on_page.is_some() => {
             if let Some(on_page) = on_page {
                 answer_elicitation(client, &id, &params, on_page);
             }
         }
-        Incoming::Request { id, method, params } => {
+        Incoming::Request {
+            id, method, params, ..
+        } => {
             if method == "session/request_permission"
                 && params.get("sessionId").and_then(Value::as_str) != requested_session.as_deref()
             {
@@ -4915,7 +4913,7 @@ async fn request_draining_with(
                 handle_server_request_unattended(client, id, &method, &params, access);
             }
         }
-        Incoming::Notification { method, params }
+        Incoming::Notification { method, params, .. }
             if loading_session
                 && method == "session/update"
                 && matches!(
@@ -5045,17 +5043,93 @@ fn track_open_tools(ev: &AgentEvent, open_tools: &mut std::collections::HashSet<
 /// A mid-turn `_session/steering` call. `idleBehavior: promptRequired`
 /// covers the turn-ended race: the agent hands the text back instead of
 /// firing an untracked turn.
+fn cache_ready_response(
+    future: Option<&mut BoxFuture<'static, Result<OrderedResponse, HarnessError>>>,
+    ready: &mut Option<Result<OrderedResponse, HarnessError>>,
+) -> bool {
+    if ready.is_none() {
+        *ready = future.and_then(|future| future.as_mut().now_or_never());
+    }
+    ready.is_some()
+}
+
+async fn next_held_incoming(
+    held: &mut VecDeque<Incoming>,
+    incoming: &mut mpsc::Receiver<Incoming>,
+) -> Option<Incoming> {
+    match held.pop_front() {
+        Some(frame) => Some(frame),
+        None => incoming.recv().await,
+    }
+}
+
+fn take_before_boundary(
+    held: &mut VecDeque<Incoming>,
+    incoming: &mut mpsc::Receiver<Incoming>,
+    boundary: Option<u64>,
+) -> Option<Incoming> {
+    let frame = held.pop_front().or_else(|| incoming.try_recv().ok())?;
+    if boundary.is_some_and(|b| frame.reader_position().is_none_or(|p| p >= b)) {
+        held.push_front(frame);
+        return None;
+    }
+    Some(frame)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drain_before_boundary(
+    held: &mut VecDeque<Incoming>,
+    incoming: &mut mpsc::Receiver<Incoming>,
+    boundary: Option<u64>,
+    client: &RpcClient,
+    session_id: &str,
+    request_input: &std::sync::Arc<RequestInputFn>,
+    questions: &mut PendingQuestions,
+    access: AccessMode,
+    agent_name: &str,
+    subagents: &mut SubagentObserver,
+    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
+) -> bool {
+    while let Some(frame) = take_before_boundary(held, incoming, boundary) {
+        let events = match frame {
+            Incoming::Notification { method, params, .. } => {
+                session_update_events(&method, &params, session_id, subagents)
+            }
+            Incoming::Request {
+                id, method, params, ..
+            } => handle_server_request_live(
+                client,
+                id,
+                &method,
+                &params,
+                request_input,
+                session_id,
+                questions,
+                access,
+                agent_name,
+            ),
+            Incoming::Eof => Vec::new(),
+        };
+        for event in events {
+            if !send(event_tx, event).await {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn steering_call_future(
     client: &RpcClient,
     session_id: &str,
     prompt: &PromptInput,
-) -> BoxFuture<'static, Result<Value, HarnessError>> {
+) -> BoxFuture<'static, Result<OrderedResponse, HarnessError>> {
     let params = json!({
         "sessionId": session_id,
         "prompt": prompt.blocks(),
         "_meta": { "steering": { "idleBehavior": "promptRequired" } },
     });
-    prompt_like_request(client.clone(), "_session/steering", params)
+    client.request_ordered_now("_session/steering", params)
 }
 
 /// The per-run event loop: one task multiplexing agent messages, the pending
@@ -5586,7 +5660,7 @@ async fn run_session(session: Session) {
         inline_images,
     )
     .await;
-    let mut turn: Option<BoxFuture<'static, Result<Value, HarnessError>>> = Some({
+    let mut turn: Option<BoxFuture<'static, Result<OrderedResponse, HarnessError>>> = Some({
         prompt_turn(
             client.clone(),
             session_id.clone(),
@@ -5603,8 +5677,10 @@ async fn run_session(session: Session) {
     // deadlocks against a full incoming channel when the agent floods
     // updates (the reader blocks on the channel and never parses the
     // steering response).
-    let mut steering_call: Option<(PromptInput, BoxFuture<'static, Result<Value, HarnessError>>)> =
-        None;
+    let mut steering_call: Option<(
+        PromptInput,
+        BoxFuture<'static, Result<OrderedResponse, HarnessError>>,
+    )> = None;
     let mut steer_backlog: VecDeque<PromptInput> = VecDeque::new();
     let mut steering_open = true;
     // Immediate steering for agents without a mid-turn steering extension:
@@ -5689,6 +5765,9 @@ async fn run_session(session: Session) {
         };
     }
 
+    let mut pending_incoming = VecDeque::new();
+    let mut ready_turn = None;
+    let mut ready_steer = None;
     let mut child_exit = None;
     let mut exit_drain_deadline = None;
     'main: loop {
@@ -5717,8 +5796,11 @@ async fn run_session(session: Session) {
             _ = tokio::time::sleep_until(exit_drain_deadline.unwrap_or_else(tokio::time::Instant::now)),
                 if exit_drain_deadline.is_some() => break 'main,
 
-            res = async { turn.as_mut().expect("guarded by if").await }, if turn.is_some() => {
+            res = async { match ready_turn.take() { Some(res) => res, None => turn.as_mut().expect("guarded by if").await } }, if turn.is_some() => {
+                let turn_position = res.as_ref().ok().map(|r| r.reader_position);
+                let res = res.map(|r| r.value);
                 turn = None;
+                ready_turn = None;
                 stop_deadline = None;
                 if res.is_err() && client.is_closed() {
                     break 'main;
@@ -5748,12 +5830,10 @@ async fn run_session(session: Session) {
                 // a full channel never parses the response): past it the call
                 // is abandoned and the steer redelivered.
                 if let Some((text, mut fut)) = steering_call.take() {
-                    let outcome = match tokio::time::timeout(
-                        Duration::from_millis(1000),
-                        &mut fut,
-                    )
-                    .await
-                    {
+                    let response = match ready_steer.take() { Some(res) => Ok(res), None => tokio::time::timeout(
+                        Duration::from_millis(1000), &mut fut).await };
+                    let position = response.as_ref().ok().and_then(|r|r.as_ref().ok()).map(|r|r.reader_position);
+                    let outcome = match response {
                         Ok(Ok(resp)) => resp
                             .get("outcome")
                             .and_then(Value::as_str)
@@ -5764,7 +5844,11 @@ async fn run_session(session: Session) {
                     if interrupted || stopping {
                         // Winding down; abandoned like any queued steer.
                     } else if outcome != "promptRequired" {
+                        if !drain_before_boundary(&mut pending_incoming, &mut incoming, position,
+                            &client, &session_id, &request_input, &mut questions, access, agent_name,
+                            &mut subagents, &event_tx).await { break 'main; }
                         let (prev, next) = rotate(&mut assistant_message_id);
+                        turn_control.source_steered();
                         if !send(
                             &event_tx,
                             AgentEvent::Steered {
@@ -5788,44 +5872,9 @@ async fn run_session(session: Session) {
                 // Updates streamed before the prompt response are already
                 // queued in stdout order — fold them into the turn before
                 // closing it (responses bypass the incoming queue).
-                let mut consumer_gone = false;
-                while let Ok(inc) = incoming.try_recv() {
-                    match inc {
-                        Incoming::Notification { method, params } => {
-                            let events =
-                                session_update_events(&method, &params, &session_id, &mut subagents);
-                            for ev in events {
-                                if !send(&event_tx, ev).await {
-                                    consumer_gone = true;
-                                    break;
-                                }
-                            }
-                        }
-                        Incoming::Request { id, method, params } => {
-                            for ev in handle_server_request_live(
-                                &client,
-                                id,
-                                &method,
-                                &params,
-                                &request_input,
-                                &session_id, &mut questions,
-                                access, agent_name,
-                            ) {
-                                if !send(&event_tx, ev).await {
-                                    consumer_gone = true;
-                                    break;
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                    if consumer_gone {
-                        break;
-                    }
-                }
-                if consumer_gone {
-                    break 'main;
-                }
+                if !drain_before_boundary(&mut pending_incoming, &mut incoming, turn_position,
+                    &client, &session_id, &request_input, &mut questions, access, agent_name,
+                    &mut subagents, &event_tx).await { break 'main; }
                 let (prev, _next) = rotate(&mut assistant_message_id);
                 if !send(
                     &event_tx,
@@ -5892,6 +5941,7 @@ async fn run_session(session: Session) {
                     }
                     while let Some(steer) = queued_steers.pop_front() {
                         let (prev, next) = rotate(&mut assistant_message_id);
+                        turn_control.source_steered();
                         if !send(
                             &event_tx,
                             AgentEvent::Steered {
@@ -5914,6 +5964,7 @@ async fn run_session(session: Session) {
                     prompt_stall_deadline =
                         prompt_stall.map(|d| tokio::time::Instant::now() + d);
                     current_prompt = PromptInput::join(prompts);
+                    ready_turn = None;
                     turn = Some(prompt_turn(
                         client.clone(),
                         session_id.clone(),
@@ -5925,8 +5976,16 @@ async fn run_session(session: Session) {
                 }
             },
 
-            inc = incoming.recv() => match inc {
-                Some(Incoming::Notification { method, params }) => {
+            inc = next_held_incoming(&mut pending_incoming, &mut incoming),
+                if !(ready_turn.is_some() && turn.is_some()) && !(ready_steer.is_some() && steering_call.is_some()) => {
+                let pending_turn = cache_ready_response(turn.as_mut(), &mut ready_turn);
+                let pending_steer = cache_ready_response(steering_call.as_mut().map(|(_,f)|f), &mut ready_steer);
+                if pending_turn || pending_steer {
+                    if let Some(frame) = inc { pending_incoming.push_front(frame); }
+                    continue 'main;
+                }
+                match inc {
+                Some(Incoming::Notification { method, params, reader_position }) => {
                     if params.get("sessionId").and_then(Value::as_str).is_some_and(|id| id != session_id) {
                         continue;
                     }
@@ -6002,8 +6061,9 @@ async fn run_session(session: Session) {
                                     let _ = old.await;
                                 });
                             }
+                            ready_turn = None;
                             turn = Some(Box::pin(async move {
-                                Ok(json!({ "stopReason": stop }))
+                                Ok(OrderedResponse { value: json!({ "stopReason": stop }), reader_position })
                             }));
                         }
                     }
@@ -6028,7 +6088,7 @@ async fn run_session(session: Session) {
                         preempt_sent = true;
                     }
                 }
-                Some(Incoming::Request { id, method, params }) => {
+                Some(Incoming::Request { id, method, params, .. }) => {
                     prompt_stall_deadline = None;
                     for ev in handle_server_request_live(
                         &client,
@@ -6057,6 +6117,7 @@ async fn run_session(session: Session) {
                         && let Ok(res @ Ok(_)) =
                             tokio::time::timeout(Duration::from_millis(50), &mut fut).await
                     {
+                        let res = res.map(|r|r.value);
                         let (prev, _next) = rotate(&mut assistant_message_id);
                         let _ = send(
                             &event_tx,
@@ -6085,11 +6146,13 @@ async fn run_session(session: Session) {
                     }
                     break 'main;
                 }
+                }
             },
 
-            res = async { steering_call.as_mut().expect("guarded by if").1.as_mut().await },
+            res = async { match ready_steer.take() { Some(res) => res, None => steering_call.as_mut().expect("guarded by if").1.as_mut().await } },
                 if steering_call.is_some() =>
             {
+                let position = res.as_ref().ok().map(|r|r.reader_position);
                 let (text, _) = steering_call.take().expect("guarded by if");
                 let outcome = match &res {
                     Ok(resp) => resp
@@ -6128,45 +6191,11 @@ async fn run_session(session: Session) {
                         // CURRENT segment first, or text the agent streamed
                         // before the injection landed folds after the split —
                         // the transcript attributes it to the reply-to-steer.
-                        let mut consumer_gone = false;
-                        while let Ok(inc) = incoming.try_recv() {
-                            match inc {
-                                Incoming::Notification { method, params } => {
-                                    let events =
-                                        session_update_events(&method, &params, &session_id, &mut subagents);
-                                    for ev in events {
-                                        if !send(&event_tx, ev).await {
-                                            consumer_gone = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                                Incoming::Request { id, method, params } => {
-                                    for ev in handle_server_request_live(
-                                        &client,
-                                        id,
-                                        &method,
-                                        &params,
-                                        &request_input,
-                                &session_id, &mut questions,
-                                access, agent_name,
-                                    ) {
-                                        if !send(&event_tx, ev).await {
-                                            consumer_gone = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                            if consumer_gone {
-                                break;
-                            }
-                        }
-                        if consumer_gone {
-                            break 'main;
-                        }
+                        if !drain_before_boundary(&mut pending_incoming, &mut incoming, position,
+                            &client, &session_id, &request_input, &mut questions, access, agent_name,
+                            &mut subagents, &event_tx).await { break 'main; }
                         let (prev, next) = rotate(&mut assistant_message_id);
+                        turn_control.source_steered();
                         if !send(
                             &event_tx,
                             AgentEvent::Steered {
@@ -6208,6 +6237,7 @@ async fn run_session(session: Session) {
                     // boundary already passed — the steer becomes the next
                     // turn directly.
                     let (prev, next) = rotate(&mut assistant_message_id);
+                    turn_control.source_steered();
                     if !send(
                         &event_tx,
                         AgentEvent::Steered {
@@ -6228,6 +6258,7 @@ async fn run_session(session: Session) {
                     prompt_stall_deadline =
                         prompt_stall.map(|d| tokio::time::Instant::now() + d);
                     current_prompt = text;
+                    ready_turn = None;
                     turn = Some(prompt_turn(
                         client.clone(),
                         session_id.clone(),
@@ -6258,6 +6289,7 @@ async fn run_session(session: Session) {
                     && let Some(text) = queued_steers.pop_front()
                 {
                     let (prev, next) = rotate(&mut assistant_message_id);
+                    turn_control.source_steered();
                     if !send(
                         &event_tx,
                         AgentEvent::Steered {
@@ -6278,6 +6310,7 @@ async fn run_session(session: Session) {
                     prompt_stall_deadline =
                         prompt_stall.map(|d| tokio::time::Instant::now() + d);
                     current_prompt = text;
+                    ready_turn = None;
                     turn = Some(prompt_turn(
                         client.clone(),
                         session_id.clone(),
@@ -6306,6 +6339,7 @@ async fn run_session(session: Session) {
                 // Drop the dead future: a response that somehow arrives later
                 // resolves a closed channel harmlessly.
                 turn = None;
+                ready_turn = None;
                 stop_deadline = None;
                 let (prev, _next) = rotate(&mut assistant_message_id);
                 if !send(
@@ -6337,6 +6371,7 @@ async fn run_session(session: Session) {
                 }
                 if let Some(text) = queued_steers.pop_front() {
                     let (prev, next) = rotate(&mut assistant_message_id);
+                    turn_control.source_steered();
                     if !send(
                         &event_tx,
                         AgentEvent::Steered {
@@ -6357,6 +6392,7 @@ async fn run_session(session: Session) {
                     prompt_stall_deadline =
                         prompt_stall.map(|d| tokio::time::Instant::now() + d);
                     current_prompt = text;
+                    ready_turn = None;
                     turn = Some(prompt_turn(
                         client.clone(),
                         session_id.clone(),
@@ -6447,6 +6483,7 @@ async fn run_session(session: Session) {
                                 let (prev, next) = rotate(&mut assistant_message_id);
                                 let message = e.to_string();
                                 done_current = true;
+                                turn_control.source_steered();
                                 if !send(&event_tx, AgentEvent::Steered {
                                     assistant_message_id: Some(prev),
                                     next_assistant_message_id: Some(next),
@@ -6499,6 +6536,7 @@ async fn run_session(session: Session) {
                     } else if turn.is_none() {
                         // Idle between turns: a steer is simply the next turn.
                         let (prev, next) = rotate(&mut assistant_message_id);
+                        turn_control.source_steered();
                         if !send(
                             &event_tx,
                             AgentEvent::Steered {
@@ -6519,6 +6557,7 @@ async fn run_session(session: Session) {
                     prompt_stall_deadline =
                         prompt_stall.map(|d| tokio::time::Instant::now() + d);
                     current_prompt = prompt;
+                    ready_turn = None;
                     turn = Some(prompt_turn(
                         client.clone(),
                         session_id.clone(),
@@ -6569,6 +6608,7 @@ async fn run_session(session: Session) {
                 // (promptRequired, once the turn is cancelled) would queue it
                 // again and run the cancelled message after all.
                 steering_call = None;
+                ready_steer = None;
                 deferred.clear();
                 released = None;
                 preempt_pending = false;
@@ -6687,6 +6727,7 @@ async fn run_session(session: Session) {
                 // Once signal escalation starts, a late prompt response no longer
                 // owns this turn (including any usage attached to that response).
                 turn = None;
+                ready_turn = None;
                 if let Some(target) = &escalation_target {
                     send_signal(target, escalation_signal);
                 }
@@ -6759,6 +6800,141 @@ async fn run_session(session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn selected_frame_defers_to_reader_ack_that_became_ready() {
+        let (send_response, receive_response) = tokio::sync::oneshot::channel();
+        let mut future: BoxFuture<'static, Result<OrderedResponse, HarnessError>> =
+            Box::pin(async move { receive_response.await.unwrap() });
+        let (tx, mut incoming) = mpsc::channel(4);
+        tx.send(Incoming::Request {
+            id: json!(3),
+            method: "question".into(),
+            params: json!({}),
+            reader_position: 3,
+        })
+        .await
+        .unwrap();
+        let mut held = VecDeque::new();
+        let selected = next_held_incoming(&mut held, &mut incoming).await.unwrap();
+        send_response
+            .send(Ok(OrderedResponse {
+                value: json!({"outcome":"injected"}),
+                reader_position: 2,
+            }))
+            .unwrap();
+        let mut ready = None;
+        assert!(cache_ready_response(Some(&mut future), &mut ready));
+        held.push_front(selected);
+        let ack = ready.take().unwrap().unwrap();
+        assert!(
+            take_before_boundary(&mut held, &mut incoming, Some(ack.reader_position)).is_none()
+        );
+        assert_eq!(
+            next_held_incoming(&mut held, &mut incoming)
+                .await
+                .unwrap()
+                .reader_position(),
+            Some(3)
+        );
+    }
+
+    #[tokio::test]
+    async fn ordered_ack_cut_preserves_requests_on_both_sides() {
+        let (tx, mut rx) = mpsc::channel(8);
+        for position in [1, 3, 5] {
+            tx.send(Incoming::Request {
+                id: json!(position),
+                method: "question".into(),
+                params: json!({}),
+                reader_position: position,
+            })
+            .await
+            .unwrap();
+        }
+        let mut held = VecDeque::new();
+        assert_eq!(
+            take_before_boundary(&mut held, &mut rx, Some(2))
+                .unwrap()
+                .reader_position(),
+            Some(1)
+        );
+        assert!(take_before_boundary(&mut held, &mut rx, Some(2)).is_none());
+        assert_eq!(held.front().unwrap().reader_position(), Some(3));
+        assert_eq!(
+            take_before_boundary(&mut held, &mut rx, Some(4))
+                .unwrap()
+                .reader_position(),
+            Some(3)
+        );
+        assert!(take_before_boundary(&mut held, &mut rx, Some(4)).is_none());
+        assert_eq!(
+            next_held_incoming(&mut held, &mut rx)
+                .await
+                .unwrap()
+                .reader_position(),
+            Some(5)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_receipt_binds_before_spawn_and_source_steer() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (client, _incoming) =
+            RpcClient::new(child.stdin.take().unwrap(), child.stdout.take().unwrap());
+        let source = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let turn = crate::TurnControl::default();
+        let next = source.clone();
+        turn.set_source_steered(move || {
+            next.fetch_add(1, Ordering::SeqCst);
+        });
+        let (capture, stamp) = (seen.clone(), source.clone());
+        let input: Arc<RequestInputFn> = Arc::new(Box::new(move |_| {
+            capture.lock().unwrap().push(stamp.load(Ordering::SeqCst));
+            tokio::sync::oneshot::channel().1
+        }));
+        let mut pending = PendingQuestions::default();
+        let params = json!({"sessionId":"s", "toolCall":{"title":"Pick"}, "options":[{"kind":"pick","optionId":"a","name":"A"}]});
+        handle_server_request_live(
+            &client,
+            json!(1),
+            "session/request_permission",
+            &params,
+            &input,
+            "s",
+            &mut pending,
+            AccessMode::default(),
+            "agent",
+        );
+        assert_eq!(*seen.lock().unwrap(), vec![0]);
+        turn.source_steered();
+        handle_server_request_live(
+            &client,
+            json!(2),
+            "session/request_permission",
+            &params,
+            &input,
+            "s",
+            &mut pending,
+            AccessMode::default(),
+            "agent",
+        );
+        assert_eq!(*seen.lock().unwrap(), vec![0, 1]);
+        tokio::task::yield_now().await;
+        assert_eq!(*seen.lock().unwrap(), vec![0, 1]);
+        child.kill().await.unwrap();
+    }
 
     #[test]
     fn unix_browser_suppression_falls_back_to_zerons_noop_mode() {

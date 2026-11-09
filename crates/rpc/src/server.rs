@@ -180,6 +180,7 @@ pub async fn serve_ws_listener_scoped(listener: TcpListener, service: Arc<dyn Rp
 pub(crate) struct AgentGuard {
     pub(crate) inner: Arc<dyn RpcService>,
     pub(crate) chat: Option<String>,
+    pub(crate) run: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -192,7 +193,7 @@ impl RpcService for AgentGuard {
             )));
         }
         let caller = crate::Caller::Agent { chat: self.chat.clone() };
-        crate::with_caller(caller, self.inner.handle(method, params)).await
+        crate::with_agent_run(self.run.clone(), crate::with_caller(caller, self.inner.handle(method, params))).await
     }
 }
 
@@ -213,7 +214,7 @@ async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>, tokens
     // trait requires; it can't be boxed away here.
     // Set by the handshake when the agent-scoped token was presented: the
     // chat it says it serves.
-    let scope: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
+    let scope: std::sync::Mutex<Option<(Option<String>, Option<String>)>> = std::sync::Mutex::new(None);
     #[allow(clippy::result_large_err)]
     let authorize = |req: &HandshakeRequest, resp: HandshakeResponse| {
         if let Some(origin) = req.headers().get("origin") {
@@ -246,7 +247,10 @@ async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>, tokens
                 .get(crate::ipc_auth::CHAT_HEADER)
                 .and_then(|value| value.to_str().ok())
                 .map(|chat| chat.chars().take(128).collect::<String>());
-            *scope.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(chat);
+            let run = req.headers().get(crate::ipc_auth::RUN_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(|id| id.chars().take(128).collect::<String>());
+            *scope.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((chat, run));
         }
         Ok(resp)
     };
@@ -277,7 +281,7 @@ async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>, tokens
     });
 
     let service: Arc<dyn RpcService> = match scope.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
-        Some(chat) => Arc::new(AgentGuard { inner: service, chat }),
+        Some((chat, run)) => Arc::new(AgentGuard { inner: service, chat, run }),
         None => service,
     };
     serve_connection(service, out_tx, in_rx).await;

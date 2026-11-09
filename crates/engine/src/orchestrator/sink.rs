@@ -16,6 +16,35 @@ impl SessionsEngine {
         }
     }
 
+    fn capture_access_config(
+        &self, p: &Pending, access: zeron_proto::AccessMode, source: &str, origin: Option<&str>,
+    ) -> Result<(), EngineError> {
+        let Some(wire) = self.orchestrator().filter(|wire| wire.driver().mechanism_capture_enabled()) else {
+            return Ok(());
+        };
+        let host = self.host();
+        let Some(workspace) = host.as_ref().and_then(|host| host.workspace()) else {
+            return Ok(());
+        };
+        let row = workspace.chat(&p.chat)?;
+        let configured = row.as_ref().and_then(|row| row.config.as_ref()).map(|config| config.access);
+        let policy_source = if configured.is_some() { "workspace_row" }
+            else if source == "request_default" { "request_default" } else { "unknown" };
+        let configured = configured.or_else(|| (source == "request_default").then(zeron_proto::AccessMode::default));
+        let selected = super::wire::access_level(access);
+        let configured = configured.map(super::wire::access_level);
+        let submitted = matches!(source, "dispatch" | "prior_request").then_some(selected);
+        wire.driver().observe_mechanism(
+            &format!("access-config:{}:{}:{source}:{}:{selected}:{configured:?}", p.chat, p.message_id, origin.unwrap_or("unknown")),
+            "access_config", serde_json::json!({
+                "chat":p.chat, "access":selected, "configured_access":configured,
+                "submitted_access":submitted, "config_source":source, "policy_source":policy_source,
+                "workspace_row_present":row.is_some(), "origin_id":origin,
+                "message_id":p.message_id, "validated":true,
+            }),
+        ).map_err(|error| EngineError::Other(format!("orchestrator: {error}")))
+    }
+
     async fn fresh_start(
         &self,
         p: &Pending,
@@ -24,13 +53,14 @@ impl SessionsEngine {
         worktree: Option<zeron_proto::WorktreeSpec>,
     ) -> Result<String, EngineError> {
         let host = self.host();
-        let request = self.last_request(&p.chat).or_else(|| {
-            host.as_ref()
-                .and_then(|h| h.request_from_chat_row(&p.chat, prompt))
-        });
-        let Some(mut request) = request else {
-            return Err(EngineError::Other("no run config for this chat".into()));
+        let (mut request, source, origin) = if let Some((request, origin)) = self.last_request_source(&p.chat) {
+            (request, "prior_request", Some(origin))
+        } else {
+            let (request, configured) = host.as_ref().and_then(|h| h.request_from_chat_row_source(&p.chat, prompt))
+                .ok_or_else(|| EngineError::Other("no run config for this chat".into()))?;
+            (request, if configured { "workspace_row" } else { "request_default" }, Some(p.message_id.clone()))
         };
+        self.capture_access_config(p, request.access, source, origin.as_deref())?;
         if let Some(th) = self
             .orchestrator()
             .and_then(|wire| wire.thread_state(&p.chat))
@@ -97,6 +127,7 @@ impl RunEngine for SessionsEngine {
         self.settle_turn(&p.chat).await;
         match &p.via {
             Via::Dispatch { harness, request } => {
+                self.capture_access_config(p, request.access, "dispatch", Some(&p.message_id))?;
                 self.dispatch_with(
                     &p.chat,
                     *harness,
@@ -159,6 +190,10 @@ impl RunEngine for SessionsEngine {
         self.terminate(chat).await.unwrap_or(false)
     }
 
+    fn agent_attempt(&self, chat: &str) -> Option<super::wire::AgentRuntime> {
+        self.agent_attempt(chat)
+    }
+
     fn owns_run(&self, chat: &str) -> bool {
         self.has_run(chat) || self.reviving_any(chat)
     }
@@ -215,6 +250,10 @@ impl RunEngine for SessionsEngine {
         self.orch_respond_question(chat, request, answers)
     }
 
+    fn native_snapshot(&self, doc: &str) -> Result<Vec<u8>, EngineError> {
+        let host=self.host().ok_or_else(||EngineError::Other("native document host unavailable".into()))?;
+        Ok(host.open(doc)?.doc().export_snapshot()?)
+    }
     fn save_native_snapshot(&self, doc: &str, snapshot: &[u8]) -> Result<(), EngineError> {
         let host = self
             .host()
@@ -226,6 +265,9 @@ impl RunEngine for SessionsEngine {
             .import(snapshot)
             .map_err(|error| EngineError::Other(error.to_string()))?;
         host.persist_fork(&handle)
+    }
+    fn native_changed_task(&self, chat:&str,key:u64,tool:&str,status:&str)->Result<(),EngineError>{
+        self.orch_native_changed_task(chat,key,tool,status)
     }
     fn native_changed(&self, chat: &str, tool: &str, status: &str) -> Result<(), EngineError> {
         self.orch_native_changed(chat, tool, status)

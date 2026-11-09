@@ -31,7 +31,8 @@
     "descriptions": {
       "delegate_task": 422,
       "task_cancel": 122,
-      "task_status": 156
+      "task_status": 156,
+      "transfer_context": 262
     },
     "instructions": {
       "claudeSystemPrompt": 2205,
@@ -46,13 +47,14 @@
     "tools": {
       "delegate_task": 1062,
       "task_cancel": 298,
-      "task_status": 273
+      "task_status": 273,
+      "transfer_context": 580
     },
     "totals": {
       "descriptions": 7438,
       "inputSchemas": 5659,
-      "outputSchemas": 2488,
-      "toolCount": 19,
+      "outputSchemas": 2756,
+      "toolCount": 20,
       "tools": 13594
     }
   },

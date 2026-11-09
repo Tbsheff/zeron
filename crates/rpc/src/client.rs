@@ -476,6 +476,11 @@ async fn dial(url: &str, token: Option<&str>) -> Result<RpcClient, DialError> {
     {
         request.headers_mut().insert(crate::ipc_auth::CHAT_HEADER, value);
     }
+    if let Some(run) = std::env::var("ZERON_RUN_ID").ok().filter(|id| !id.is_empty())
+        && let Ok(value) = HeaderValue::from_str(&run)
+    {
+        request.headers_mut().insert(crate::ipc_auth::RUN_HEADER, value);
+    }
     let (ws, _) = tokio::time::timeout(
         CONNECT_TIMEOUT,
         // Nagle off: terminal keystrokes are tiny frames that must not wait

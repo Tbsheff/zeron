@@ -14,6 +14,24 @@ pub fn raised(
     request: &str,
     questions: &[UserInputQuestion],
 ) -> Result<(), DriverError> {
+    raised_inner(driver, child, request, questions, None)
+}
+pub fn raised_at(
+    driver: &Driver,
+    child: ThreadId,
+    request: &str,
+    questions: &[UserInputQuestion],
+    attempt: zeron_orch::AttemptId,
+) -> Result<(), DriverError> {
+    raised_inner(driver, child, request, questions, Some(attempt))
+}
+fn raised_inner(
+    driver: &Driver,
+    child: ThreadId,
+    request: &str,
+    questions: &[UserInputQuestion],
+    attempt: Option<zeron_orch::AttemptId>,
+) -> Result<(), DriverError> {
     if !driver.state()?.thread(child).is_ok_and(|t| t.is_live()) {
         return Ok(());
     }
@@ -22,10 +40,24 @@ pub fn raised(
         &format!("question-body:{qid}"),
         &serde_json::to_string(questions)?,
     )?;
-    driver.apply(
-        &format!("question-raise:{child:?}:{qid}"),
-        Event::Question(QuestionEvent::Raise { child, qid }),
-    )?;
+    let event = Event::Question(QuestionEvent::Raise { child, qid });
+    let receipt = format!("question-raise:{child:?}:{qid}");
+    if driver.mechanism_capture_enabled() {
+        driver.observe_mechanism(
+            &format!("question-route:{child:?}:{qid}:{attempt:?}"),
+            "question_input_route",
+            serde_json::json!({"child":child,"qid":qid,"request_id":request,"receipt":receipt,
+                "source_run":attempt.map(|a|a.run.ord),"source_attempt":attempt.map(|a|a.n)}),
+        )?;
+    }
+    if let Some(at) = attempt {
+        driver.apply_if(&receipt, event, &|state| {
+            state.thread(child).is_ok_and(|t| t.attempt_id() == at)
+                && zeron_orch::step(state, event).is_ok()
+        })?;
+    } else {
+        driver.apply(&receipt, event)?;
+    }
     Ok(())
 }
 pub fn answer(

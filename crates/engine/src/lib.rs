@@ -246,6 +246,21 @@ impl EngineCore {
         Self::assemble_with_profile(profile, registry, default_harness, edge)
     }
 
+    pub fn assemble_with_orchestrator(
+        data_dir: &Path,
+        registry: Arc<HarnessRegistry>,
+        default_harness: HarnessId,
+        edge: Option<EdgeConfig>,
+        opts: orchestrator::OrchOptions,
+    ) -> Result<Self, EngineError> {
+        let org_id = env_or("ZERON_ORG_ID", DEFAULT_ORG_ID);
+        let user_id = env_or("ZERON_USER_ID", DEFAULT_USER_ID);
+        let profile = EngineProfile::development(data_dir, &org_id, &user_id);
+        std::fs::create_dir_all(profile.device_root())?;
+        let lock = InstanceLock::acquire(profile.device_root())?;
+        Self::assemble_profile_options(profile, registry, default_harness, edge, lock, Some(opts))
+    }
+
     pub fn enable_orchestrator_v2(
         &self,
         opts: orchestrator::OrchOptions,
@@ -292,6 +307,17 @@ impl EngineCore {
         default_harness: HarnessId,
         edge: Option<EdgeConfig>,
         lock: InstanceLock,
+    ) -> Result<Self, EngineError> {
+        Self::assemble_profile_options(profile, registry, default_harness, edge, lock, None)
+    }
+
+    fn assemble_profile_options(
+        profile: EngineProfile,
+        registry: Arc<HarnessRegistry>,
+        default_harness: HarnessId,
+        edge: Option<EdgeConfig>,
+        lock: InstanceLock,
+        orch_options: Option<orchestrator::OrchOptions>,
     ) -> Result<Self, EngineError> {
         let data_dir = profile.device_root();
         std::fs::create_dir_all(data_dir)?;
@@ -392,8 +418,8 @@ impl EngineCore {
         }
         sessions.set_plugins(plugins.clone());
         sessions.set_doc_host(doc_host.clone());
-        let orch = orchestrator::flag_from_env()
-            .then(|| wire_orchestrator(&sessions, &doc_host, &device_id, Default::default()))
+        let orch = orch_options.or_else(|| orchestrator::flag_from_env().then(Default::default))
+            .map(|opts| wire_orchestrator(&sessions, &doc_host, &device_id, opts))
             .and_then(|r| {
                 r.inspect_err(|err| tracing::error!(error = %err, "orchestrator v2 not enabled"))
                     .ok()
@@ -401,16 +427,22 @@ impl EngineCore {
         // A new version on trial may yet be undone, and recovering clears the
         // journals' marks of what to resume, which a rollback doesn't restore.
         // It waits for the commit (`update_trial`), with all other new work.
-        if zeron_update::transaction::in_trial() {
+        let recovered = if zeron_update::transaction::in_trial() {
             doc_host.hold_work();
+            false
         } else {
             match sessions.recover_stale() {
-                Ok(0) => {}
-                Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
-                Err(err) => tracing::error!(error = %err, "stale-session recovery failed"),
+                Ok(recovered) => {
+                    if recovered > 0 { tracing::info!(recovered, "stale sessions recovered on boot"); }
+                    true
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, "stale-session recovery failed");
+                    false
+                }
             }
-        }
-        if let Some(wire) = orch {
+        };
+        if let Some(wire) = orch.filter(|_| recovered) {
             spawn_orchestrator_recovery(wire, sessions.clone());
         }
         doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
@@ -741,6 +773,12 @@ impl EngineCore {
     }
 
     pub async fn shutdown(&self) {
+        let lifecycle = self.sessions.orchestrator();
+        if let Some(wire) = &lifecycle {
+            if let Err(error) = wire.engine_stopping() {
+                tracing::error!(%error, "engine lifecycle capture failed");
+            }
+        }
         // Stop the runner heartbeat + credential refresher first.
         self.cloud
             .lock()
@@ -797,6 +835,11 @@ impl EngineCore {
         // Break the sessions ⇄ doc-host retain cycle so the replaced graph can
         // actually be freed once the last handle drops.
         self.sessions.clear_doc_host();
+        if let Some(wire) = &lifecycle {
+            if let Err(error) = wire.engine_stopped() {
+                tracing::error!(%error, "engine lifecycle capture failed");
+            }
+        }
     }
 }
 

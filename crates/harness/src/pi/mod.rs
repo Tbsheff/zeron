@@ -405,6 +405,7 @@ impl Harness for PiHarness {
         let idle_queue_timeout = self.idle_queue_timeout;
         tokio::spawn(async move {
             let mut runner = Runner {
+                source_turn: crate::TurnControl::default(),
                 store,
                 interrupted: false,
                 extension_commands: HashSet::new(),
@@ -437,8 +438,9 @@ impl Harness for PiHarness {
                 request_input,
                 mut steering,
                 interrupt,
-                turn: _,
+                turn,
             } = controls;
+            runner.source_turn = turn;
             runner.process.dialogs.input = Some(std::sync::Arc::from(request_input));
             let consumer = runner.tx.clone();
             let result = tokio::select! {
@@ -491,6 +493,7 @@ struct Delivery {
     opens_turn: bool,
 }
 struct Runner {
+    source_turn: crate::TurnControl,
     extension_commands: HashSet<String>,
     auto_compaction: bool,
     interrupted: bool,
@@ -524,6 +527,9 @@ struct Runner {
 }
 impl Runner {
     async fn emit(&self, event: AgentEvent) -> Result<(), HarnessError> {
+        if matches!(&event, AgentEvent::Steered { .. }) {
+            self.source_turn.source_steered();
+        }
         self.tx
             .send(Ok(event))
             .await

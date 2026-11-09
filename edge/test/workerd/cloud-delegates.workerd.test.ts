@@ -3,7 +3,9 @@
  * sessions for child chats (each on a machine of its own), sees and manages
  * those children, and nothing else — no other main chat, no grandchildren.
  */
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { cloudAccountName } from "../../src/cloud/policy";
 import { encodeHlc, type Op } from "../../src/registry-core";
 import {
   call,
@@ -13,6 +15,7 @@ import {
   readySession,
   runnerKey,
   runnerToken,
+  sessions,
   userBearer,
   waitForSession,
   type TestUser
@@ -146,6 +149,34 @@ describe("Cloud delegates", () => {
     // Account-level Cloud stays the user's.
     expect((await call("GET", `/cloud/${u.orgId}/sessions`, runner)).status).toBe(403);
     expect((await call("DELETE", `/cloud/${u.orgId}`, runner)).status).toBe(403);
+  });
+
+  it.each([
+    { name: "cyclic", cycle: true, message: "Invalid session ancestry." },
+    { name: "missing", cycle: false, message: "Unknown session ancestry." }
+  ])("rejects $name ancestry before child creation", async ({ cycle, message }) => {
+    const { u, user, main, runner } = await world();
+    const child = `refused-${rand()}`;
+    const ancestor = cycle ? main.chatId : `missing-${rand()}`;
+    const account = env.CLOUD_ACCOUNTS.get(env.CLOUD_ACCOUNTS.idFromName(cloudAccountName(u.orgId, u.userId)));
+    await runInDurableObject(account, (instance) => {
+      const records = (instance as unknown as { sessions: Map<string, { parentChatId?: string }> }).sessions;
+      records.get(main.chatId)!.parentChatId = ancestor;
+    });
+    const beforeSessions = (await sessions(u)).map((session) => session.chatId).sort();
+    const beforeDevices = (await rows(user)).filter((row) => row.kind === "devices").map((row) => row.id).sort();
+
+    const refused = await startChild(u, runner, child, main.chatId);
+
+    expect(refused.status).toBe(403);
+    expect(await refused.json()).toMatchObject({ error: "too_deep", message });
+    expect((await sessions(u)).map((session) => session.chatId).sort()).toEqual(beforeSessions);
+    const after = await rows(user);
+    expect(find(after, "chats", child)).toBeUndefined();
+    expect(after.filter((row) => row.kind === "devices").map((row) => row.id).sort()).toEqual(beforeDevices);
+    expect(await runInDurableObject(account, (instance) =>
+      (instance as unknown as { sessions: Map<string, unknown> }).sessions.has(child)
+    )).toBe(false);
   });
 
   it("starts children only for the chat it hosts, and caps descendants at depth two", async () => {

@@ -7,8 +7,8 @@ pub(super) fn catalog() -> Vec<ToolDef> {
     vec![ToolDef {
         name: NAME,
         title: "Transfer chat context",
-        description: "Pin completed messages from this chat for another chat. Use action fork to create a side chat, merge_back to queue this fork's result for its parent, or status to read transfers. Fork and transfer deliver context at the target's next run. Use a stable clientRequestId for retries. Native tools and attachments are not copied.",
-        input_schema: json!({"type":"object", "properties": {"action":{"type":"string","enum":["fork","merge_back","status","transfer"]},"targetChatId":{"type":"string"}, "clientRequestId":{"type":"string"}, "baseMessageId":{"type":"string"}, "pointMessageId":{"type":"string"}}, "required":["action"], "additionalProperties":false}),
+        description: "Pin completed messages for another chat. fork creates a side chat; merge_back queues this fork's result for its parent; status reads transfers. fork/transfer deliver at the next target run. Reuse clientRequestId on retries. Excludes native tools and attachments.",
+        input_schema: json!({"type":"object", "properties": {"action":{"enum":["fork","merge_back","status","transfer"]},"targetChatId":{"type":"string"}, "clientRequestId":{"type":"string"}, "baseMessageId":{"type":"string"}, "pointMessageId":{"type":"string"}}, "required":["action"], "additionalProperties":false}),
         output_schema: None,
         hints: Hints::WRITE.idempotent(),
         always_load: false,

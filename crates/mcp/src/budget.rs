@@ -15,7 +15,7 @@ const SHOW_VISUAL_MAX: usize = 3_072;
 const DESCRIPTION_MAX: usize = 1_024;
 const OPENCODE_UPFRONT_MAX: usize = 12_700;
 const OPENCODE_UPFRONT_ORCH_MAX: usize = 14_600;
-const DELEGATE_TOOLS: [&str; 3] = ["delegate_task", "task_status", "task_cancel"];
+const DELEGATE_TOOLS: [&str; 4] = ["delegate_task", "task_status", "task_cancel", "transfer_context"];
 
 fn bytes(value: &Value) -> usize {
     match value {

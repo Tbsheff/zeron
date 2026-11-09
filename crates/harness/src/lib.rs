@@ -80,11 +80,22 @@ impl SteerMessage {
 #[derive(Clone, Default)]
 pub struct TurnControl {
     stop: std::sync::Arc<tokio::sync::Notify>,
+    source_steered: std::sync::Arc<std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>>,
     background: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     processes: std::sync::Arc<background::BackgroundWork>,
 }
 
 impl TurnControl {
+    pub fn set_source_steered(&self, callback: impl Fn() + Send + Sync + 'static) {
+        *self.source_steered.lock().unwrap() = Some(Box::new(callback));
+    }
+
+    pub fn source_steered(&self) {
+        if let Some(callback) = self.source_steered.lock().unwrap().as_ref() {
+            callback();
+        }
+    }
+
     /// Host: end the in-flight turn, keeping the runtime and its background work.
     pub fn stop_turn(&self) {
         self.stop.notify_one();

@@ -4,6 +4,30 @@ use zeron_orch::questions::QuestionEvent;
 
 impl OrchWire {
     pub fn question_event(&self, chat: &str, event: &zeron_proto::AgentEvent) {
+        let source = self.known_thread(chat).ok().flatten().and_then(|t| {
+            self.driver
+                .state()
+                .ok()?
+                .thread(t)
+                .ok()
+                .map(|t| t.attempt_id())
+        });
+        self.question_event_at(chat, event, source);
+    }
+    pub(crate) fn question_attempt_current(&self, chat: &str, source: Option<AttemptId>) -> bool {
+        self.known_thread(chat).ok().flatten().is_some_and(|t| {
+            self.driver.state().ok().is_some_and(|s| {
+                s.thread(t)
+                    .is_ok_and(|t| t.is_live() && Some(t.attempt_id()) == source)
+            })
+        })
+    }
+    pub(crate) fn question_event_at(
+        &self,
+        chat: &str,
+        event: &zeron_proto::AgentEvent,
+        source: Option<AttemptId>,
+    ) {
         let out = (|| -> Result<(), DriverError> {
             let Some(t) = self.known_thread(chat)? else {
                 return Ok(());
@@ -12,7 +36,11 @@ impl OrchWire {
                 zeron_proto::AgentEvent::InputRequested {
                     request_id,
                     questions,
-                } => raised(&self.driver, t, request_id, questions)?,
+                } => {
+                    if let Some(at) = source {
+                        raised_at(&self.driver, t, request_id, questions, at)?;
+                    }
+                }
                 zeron_proto::AgentEvent::InputResolved {
                     request_id,
                     answers: Some(answers),
@@ -72,7 +100,9 @@ impl OrchWire {
         }
         let chat = self.chat_of(parent)?;
         let tool = crate::orchestrator::native::tool_id(&self.driver, key)?;
-        let doc = crate::orchestrator::native::doc_id(&chat, &tool);
+        let doc = crate::orchestrator::native::binding(&self.driver, key)?
+            .map(|binding| binding.doc_id)
+            .unwrap_or_else(|| crate::orchestrator::native::doc_id(&chat, &tool));
         let result = engine
             .result_text(&doc)
             .unwrap_or_else(|| "Native task ended. Read its transcript for the result.".into());
@@ -429,9 +459,10 @@ impl OrchWire {
         let s = self.driver.state()?;
         s.natives.iter().filter(|((p,_),_)|*p==parent).map(|((_,key),n)|{
             let tool=crate::orchestrator::native::tool_id(&self.driver,*key)?;
-            let doc=crate::orchestrator::native::doc_id(parent_chat,&tool);
+            let binding=crate::orchestrator::native::binding(&self.driver,*key)?;
+            let doc=binding.as_ref().map(|b|b.doc_id.clone()).unwrap_or_else(||crate::orchestrator::native::doc_id(parent_chat,&tool));
             let status=match n.status{zeron_orch::native::NativeStatus::Running=>"running",zeron_orch::native::NativeStatus::Completed=>"completed",zeron_orch::native::NativeStatus::Failed|zeron_orch::native::NativeStatus::Orphaned=>"failed"};
-            Ok(serde_json::json!({"taskId":doc,"childThreadId":doc,"origin":"native","status":status,"background":n.background,"delivery":n.delivery,"run":n.attempt.run.ord,"attempt":n.attempt.n,"sendable":false}))
+            Ok(serde_json::json!({"taskId":doc,"childThreadId":doc,"origin":"native","status":status,"background":n.background,"nativePath":binding.as_ref().map(|b|&b.path),"ownBackground":binding.as_ref().map(|b|b.own_background),"delivery":n.delivery,"run":n.attempt.run.ord,"attempt":n.attempt.n,"sendable":false}))
         }).collect()
     }
 }
@@ -716,15 +747,24 @@ impl OrchWire {
         snapshot: Vec<u8>,
         failed: bool,
     ) -> Result<(), DriverError> {
+        self.stage_native_terminal_path(chat, &[tool.to_owned()], doc, snapshot, failed)
+    }
+    pub(crate) fn stage_native_terminal_path(
+        &self,
+        chat: &str,
+        path: &[String],
+        doc: &str,
+        snapshot: Vec<u8>,
+        failed: bool,
+    ) -> Result<(), DriverError> {
         let Some(parent) = self.known_thread(chat)? else {
             return Ok(());
         };
-        let Some(key) = self.driver.meta(&format!("native-key:{parent:?}:{tool}"))? else {
+        let Some(key_id) = crate::orchestrator::native::path_key(&self.driver, parent, path)?
+        else {
             return Ok(());
         };
-        let key_id: u64 = key
-            .parse()
-            .map_err(|_| DriverError::Corrupt("invalid native key".into()))?;
+        let key = key_id.to_string();
         if !self
             .driver
             .state()?
@@ -732,6 +772,14 @@ impl OrchWire {
             .get(&(parent, key_id))
             .is_some_and(|n| n.status == zeron_orch::native::NativeStatus::Running)
         {
+            return Ok(());
+        }
+        if self
+            .driver
+            .meta(&format!("native-terminal:{parent:?}:{key}"))?
+            .is_some()
+        {
+            self.wake.notify_one();
             return Ok(());
         }
         self.driver.put_meta(
@@ -782,5 +830,115 @@ impl OrchWire {
             self.driver.delete_meta(&receipt)?;
         }
         Ok(())
+    }
+}
+
+impl OrchWire {
+    pub fn native_binding(
+        &self,
+        key: u64,
+    ) -> Result<Option<crate::orchestrator::native::NativeBinding>, DriverError> {
+        crate::orchestrator::native::binding(&self.driver, key)
+    }
+    pub(crate) fn native_path_running(
+        &self,
+        chat: &str,
+        path: &[String],
+    ) -> Result<bool, DriverError> {
+        let Some(parent) = self.known_thread(chat)? else {
+            return Ok(false);
+        };
+        let Some(key) = crate::orchestrator::native::path_key(&self.driver, parent, path)? else {
+            return Ok(false);
+        };
+        if self
+            .driver
+            .meta(&format!("native-terminal:{parent:?}:{key}"))?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .driver
+            .state()?
+            .natives
+            .get(&(parent, key))
+            .is_some_and(|n| n.status == zeron_orch::native::NativeStatus::Running))
+    }
+    pub(crate) fn native_path_known(
+        &self,
+        chat: &str,
+        path: &[String],
+    ) -> Result<bool, DriverError> {
+        let Some(parent) = self.known_thread(chat)? else {
+            return Ok(false);
+        };
+        Ok(crate::orchestrator::native::path_key(&self.driver, parent, path)?.is_some())
+    }
+}
+
+impl OrchWire {
+    pub(crate) fn native_activate_path(
+        &self,
+        chat: &str,
+        path: &[String],
+    ) -> Result<(), DriverError> {
+        if let Some(parent) = self.known_thread(chat)? {
+            for end in 1..=path.len() {
+                crate::orchestrator::native::activate(&self.driver, parent, &path[..end])?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl OrchWire {
+    pub(super) fn reconcile_absent_natives(
+        &self,
+        engine: &dyn RunEngine,
+        chat: &str,
+    ) -> Result<(), EngineError> {
+        let Some(parent) = self
+            .known_thread(chat)
+            .map_err(|e| EngineError::Other(e.to_string()))?
+        else {
+            return Ok(());
+        };
+        let state = self
+            .driver
+            .state()
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        for ((owner, key), task) in state.natives.iter() {
+            if *owner != parent || task.status != zeron_orch::native::NativeStatus::Running {
+                continue;
+            }
+            let Some(binding) = self
+                .native_binding(*key)
+                .map_err(|e| EngineError::Other(e.to_string()))?
+            else {
+                continue;
+            };
+            let snapshot = engine.native_snapshot(&binding.doc_id)?;
+            let raw = loro::LoroDoc::new();
+            raw.import(&snapshot)
+                .map_err(|e| EngineError::Other(e.to_string()))?;
+            let doc = zeron_doc::SessionDoc::from_doc(raw);
+            for entry in doc.read_entries()? {
+                if entry.status == Some(zeron_doc::MessageStatus::Streaming) {
+                    doc.set_message_status(&entry.id, zeron_doc::MessageStatus::Aborted)?;
+                }
+            }
+            let snapshot = doc.export_snapshot()?;
+            self.stage_native_terminal_path(chat, &binding.path, &binding.doc_id, snapshot, true)
+                .map_err(|e| EngineError::Other(e.to_string()))?;
+        }
+        self.retry_native_terminals(engine)
+            .map_err(|e| EngineError::Other(e.to_string()))
+    }
+}
+
+impl OrchWire {
+    pub(crate) fn native_documents_ready(&self) {
+        self.wake.notify_one();
     }
 }

@@ -25,6 +25,15 @@ def main():
     (out/'formal-source-sha256.json').write_text(json.dumps({str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(formal.glob('*.tla'))}, indent=2)+'\n')
     for proof in ['PlacementProof', 'PlacementS10Proof']:
         ok = verify.run(f'proof-{proof}', ['tlapm', '--strict', '--nofp', '--threads', '4', f'{proof}.tla'], out, rows, cwd=formal, cap=1200) and ok
+    runtime_runner = ROOT/'verification/orchestrator/runtime/RuntimePlanRun.py'
+    if runtime_runner.is_file():
+        for module in ['RuntimePlanRefinement', 'RuntimePlanLiveness']:
+            ok = verify.run(module, [sys.executable, str(runtime_runner), module,
+                '--out', str(out/module), '--cap', '300'], out, rows, cap=310) and ok
+    else:
+        rows.append(dict(name='joint runtime safety and fair liveness', result='MISSING'))
+        print('Blocked: joint runtime safety and fair liveness runner is missing')
+        ok = False
     full_proof = formal / 'proof-wrapper/FullDelegationS3Proof.tla'
     full_checker = ROOT / 'scripts/orch-trace-full.py'
     required = [(full_proof, 'full S3 proof'), (full_checker, 'full ZeronImpl runtime conformance')]
@@ -50,7 +59,7 @@ def main():
                             cwd=proof_out) and ok
     if full_checker.is_file():
         ok = verify.run('full-conformance', [sys.executable, str(full_checker),
-                        '--integration', str(ROOT/'target/orch-verify/traces'),
+                        '--integration', str(ROOT/'target/orch-verify/mechanism'),
                         '--dogfood', str(dogfood)], out, rows) and ok
     ok = verify.run('dogfood-week', [sys.executable, str(ROOT/'scripts/orch-dogfood.py'), 'status'], out, rows) and ok
     (out/'receipts.json').write_text(json.dumps(rows, indent=2)+'\n')

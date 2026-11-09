@@ -2417,6 +2417,7 @@ async fn run_session(session: Session) {
                 let mut consumer_gone = false;
                 for _ in &texts {
                     let (prev, next) = rotate(&mut assistant_message_id);
+                    turn_control.source_steered();
                     if !send(&event_tx, AgentEvent::Steered {
                         assistant_message_id: Some(prev),
                         next_assistant_message_id: Some(next),
@@ -2839,6 +2840,7 @@ async fn run_session(session: Session) {
                             // Between turns: the engine routes the next message
                             // of a parked session here — images included.
                             let (prev, next) = rotate(&mut assistant_message_id);
+                            turn_control.source_steered();
                             let _ = send(&event_tx, AgentEvent::Steered {
                                 assistant_message_id: Some(prev),
                                 next_assistant_message_id: Some(next),

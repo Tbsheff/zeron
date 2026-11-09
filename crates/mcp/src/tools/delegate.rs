@@ -41,9 +41,9 @@ const REASON_MAX: usize = 2_000;
 const RPC_MARGIN: Duration = Duration::from_secs(30);
 const RPC_LIMIT: Duration = Duration::from_secs(60);
 
-const DELEGATE_DESCRIPTION: &str = "Start one child agent on `task`. It gets only `task`, no history from this chat: put in what it needs, no secrets. isolation worktree: a separate checkout. Keep `taskId` for task_status and task_cancel. Default mode async: the result is pushed to you when the child ends, so end your turn. Mode wait only if this turn needs the answer. A child's question ends a wait; answer it with respond_to_input {chat: childThreadId}.";
+const DELEGATE_DESCRIPTION: &str = "Start one child with only `task`, no chat history. Include needed facts; exclude secrets. worktree uses a separate checkout. Keep taskId for status/cancel. Default async pushes the result when done; end your turn. Use wait if this turn needs the result. A child question ends wait; answer with respond_to_input {chat: childThreadId}.";
 
-const STATUS_DESCRIPTION: &str = "List your app and native tasks when taskId is absent. With taskId, read one task you delegated. Do not call it on a running task before its completion wakes you. `summary` is the final result; reading it marks it delivered.";
+const STATUS_DESCRIPTION: &str = "List app/native tasks, or read taskId. Wait for completion wake before reading a running task. Reading final summary marks it delivered.";
 
 const CANCEL_DESCRIPTION: &str = "Stop one delegated task by `taskId`: its running and queued turns and its own delegates. A finished task keeps its result.";
 
@@ -52,8 +52,8 @@ fn task_output() -> Value {
         "type": "object",
         "properties": {
             "taskId": { "type": "string" }, "childThreadId": { "type": "string" },
-            "status": { "type": "string", "enum": ["queued", "running", "waiting", "completed", "failed", "cancelled", "interrupted"] },
-            "origin": {"type":"string","enum":["app","native"]}, "background":{"type":["boolean","null"]},
+            "status": { "enum": ["queued", "running", "waiting", "completed", "failed", "cancelled", "interrupted"] },
+            "origin": {"enum":["app","native"]}, "background":{"type":["boolean","null"]},
             "summary": { "type": ["string", "null"] }, "hasPendingQuestion": { "type": "boolean" },
             "waitTimedOut": { "type": "boolean" }, "next": { "type": "string" }
         },
@@ -80,9 +80,9 @@ pub(super) fn catalog() -> Vec<ToolDef> {
                         "project": { "type": "string" }, "device": { "type": "string" }
                     } },
                     "title": { "type": "string" },
-                    "role": { "type": "string", "enum": ["implementation", "research", "review", "design", "test", "general"] },
-                    "isolation": { "type": "string", "enum": ["shared", "worktree"] },
-                    "mode": { "type": "string", "enum": ["async", "wait"] },
+                    "role": { "enum": ["implementation", "research", "review", "design", "test", "general"] },
+                    "isolation": { "enum": ["shared", "worktree"] },
+                    "mode": { "enum": ["async", "wait"] },
                     "timeoutMs": { "type": "integer", "description": "wait only; default 600000. A timeout does not cancel the child." },
                     "clientRequestId": { "type": "string" }
                 },
@@ -99,7 +99,7 @@ pub(super) fn catalog() -> Vec<ToolDef> {
             description: STATUS_DESCRIPTION,
             input_schema: json!({ "type": "object", "properties": task_id() }),
             output_schema: Some(
-                json!({"oneOf":[task_output(),{"type":"object","properties":{"tasks":{"type":"array","items":task_output()}},"required":["tasks"]}]}),
+                json!({"type":"object","$defs":{"task":task_output()},"oneOf":[{"$ref":"#/$defs/task"},{"properties":{"tasks":{"type":"array","items":{"$ref":"#/$defs/task"}}},"required":["tasks"]}]}),
             ),
             hints: Hints::WRITE.idempotent(),
             always_load: false,
@@ -121,7 +121,7 @@ pub(super) fn catalog() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "taskId": { "type": "string" },
-                    "status": { "type": "string", "enum": ["cancel_requested", "completed", "failed", "cancelled", "interrupted"] }
+                    "status": { "enum": ["cancel_requested", "completed", "failed", "cancelled", "interrupted"] }
                 },
                 "required": ["taskId", "status"]
             })),

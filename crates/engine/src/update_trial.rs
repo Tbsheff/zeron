@@ -167,11 +167,25 @@ pub(crate) fn prove_and_commit(core: &EngineCore, config: &EngineConfig) {
             updater.check_now();
         }
         // What every other start does during assembly.
-        match tokio::task::spawn_blocking(move || sessions.recover_stale()).await {
-            Ok(Ok(0)) => {}
-            Ok(Ok(recovered)) => tracing::info!(recovered, "stale sessions recovered after the update"),
-            Ok(Err(err)) => tracing::error!(error = %err, "stale-session recovery failed"),
-            Err(err) => tracing::error!(error = %err, "stale-session recovery panicked"),
+        let recovering = sessions.clone();
+        match tokio::task::spawn_blocking(move || recovering.recover_stale()).await {
+            Ok(Ok(recovered)) => {
+                if recovered > 0 { tracing::info!(recovered, "stale sessions recovered after the update"); }
+                if let Some(wire) = sessions.orchestrator()
+                    && let Err(err) = wire.recover(&sessions).await
+                {
+                    tracing::error!(error = %err, "orchestrator recovery failed after the update");
+                    return;
+                }
+            }
+            Ok(Err(err)) => {
+                tracing::error!(error = %err, "stale-session recovery failed");
+                if sessions.orchestrator().is_some() { return; }
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "stale-session recovery panicked");
+                if sessions.orchestrator().is_some() { return; }
+            }
         }
         doc_host.lift_quiesce();
         tokio::time::sleep(TIDY_AFTER).await;

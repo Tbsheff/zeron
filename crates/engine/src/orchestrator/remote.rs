@@ -4,9 +4,30 @@ use crate::orchestrator::{
     placement::{self, ChatRoute, Registry},
     store::Applied,
 };
+use sha2::{Digest, Sha256};
 use zeron_doc::{OrchBody, OrchMessage};
 use zeron_orch::remote::RemoteEvent;
 use zeron_orch::{Effect, Event, Message, RunStatus};
+
+fn wire_body_digest(body: &OrchBody) -> Result<String, DriverError> {
+    fn canonical(value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(values) => {
+                let sorted: std::collections::BTreeMap<_, _> = values
+                    .into_iter()
+                    .map(|(key, value)| (key, canonical(value)))
+                    .collect();
+                serde_json::Value::Object(sorted.into_iter().collect())
+            }
+            serde_json::Value::Array(values) => {
+                serde_json::Value::Array(values.into_iter().map(canonical).collect())
+            }
+            value => value,
+        }
+    }
+    let bytes = serde_json::to_vec(&canonical(serde_json::to_value(body)?))?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
 
 struct Routes<'a>(&'a dyn RunEngine);
 impl Registry for Routes<'_> {
@@ -145,7 +166,13 @@ impl OrchWire {
         &self,
         engine: &dyn RunEngine,
         message: &OrchMessage,
+        effect_id: &str,
     ) -> Result<(), DriverError> {
+        if message.sender_device != self.driver.device()
+            || route(engine, &message.sender_chat)?.host != self.driver.device()
+        {
+            return Err(error("remote retry on wrong sender host"));
+        }
         let target = route(engine, &message.target_chat)?;
         let room = if message.upward() {
             &message.sender_chat
@@ -156,7 +183,16 @@ impl OrchWire {
             .map_err(|e| error(e.to_string()))?;
         placement::require_capability(&Routes(engine), &target.host)
             .map_err(|e| error(e.to_string()))?;
+        let prepared_key = format!("remote-message:{effect_id}");
+        let encoded = serde_json::to_string(message)?;
+        match self.driver.meta(&prepared_key)? {
+            Some(old) if old != encoded => return Err(error("remote effect payload changed")),
+            Some(_) => {}
+            None => self.driver.put_meta(&prepared_key, &encoded)?,
+        }
+        let digest = self.driver.mechanism_capture_enabled().then(|| wire_body_digest(&message.body)).transpose()?;
         engine.orch_send(message).map_err(error)?;
+        if let Some(digest) = digest {
         let body = match &message.body {
             OrchBody::CreateChild {
                 depth,
@@ -197,14 +233,15 @@ impl OrchWire {
             }
         };
         self.driver.observe_mechanism(
-            &format!("doc:{}", message.id),
+            &format!("doc:{}:{effect_id}", message.id),
             "doc_commit",
             serde_json::json!({
-                "wire_id":message.id,"sender":message.sender_chat,"target":message.target_chat,
+                "wire_id":message.id,"effect_id":effect_id,"sender":message.sender_chat,"target":message.target_chat,
                 "device":self.driver.device(),"target_host":target.host,"room":room,
-                "upward":message.upward(),"body":body,"already_present":null,
+                "upward":message.upward(),"body":body,"already_present":null,"wire_body_digest":digest,
             }),
         )?;
+        }
         let sender = self
             .known_thread(&message.sender_chat)?
             .ok_or_else(|| error("send has no sender partition"))?;
@@ -219,7 +256,19 @@ impl OrchWire {
         &self,
         engine: &dyn RunEngine,
         effect: &Effect,
+        effect_id: &str,
     ) -> Result<bool, DriverError> {
+        if let Some(encoded) = self.driver.meta(&format!("remote-message:{effect_id}"))? {
+            let message: OrchMessage = serde_json::from_str(&encoded)?;
+            self.transmit(engine, &message, effect_id)?;
+            if let Effect::Send(local) = effect {
+                self.driver.apply(
+                    &format!("remote-sent:{}", message.id),
+                    Event::Remote(RemoteEvent::RemoteSent { message: *local }),
+                )?;
+            }
+            return Ok(true);
+        }
         match effect {
             Effect::CreateChild {
                 parent,
@@ -263,12 +312,12 @@ impl OrchWire {
                         spec: serde_json::to_value(spec)?,
                     },
                 )?;
-                self.transmit(engine, &message)?;
+                self.transmit(engine, &message, effect_id)?;
                 Ok(true)
             }
             Effect::Send(m) => {
                 if let Some(message) = self.remote_question_message(engine, *m)? {
-                    self.transmit(engine, &message)?;
+                    self.transmit(engine, &message, effect_id)?;
                     self.driver.apply(
                         &format!("remote-sent:{}", message.id),
                         Event::Remote(RemoteEvent::RemoteSent { message: *m }),
@@ -320,7 +369,7 @@ impl OrchWire {
                     _ => return Ok(false),
                 };
                 let message = self.remote_message(engine, &sender, &target, body)?;
-                self.transmit(engine, &message)?;
+                self.transmit(engine, &message, effect_id)?;
                 self.driver.apply(
                     &format!("remote-sent:{}", message.id),
                     Event::Remote(RemoteEvent::RemoteSent { message: *m }),
@@ -339,20 +388,31 @@ impl OrchWire {
                 let th = state
                     .thread(*t)
                     .map_err(|_| error("missing followup shadow"))?;
-                let body = match th.task {
-                    Some(task) if task.run > 1 && task.run > th.rord() => OrchBody::FollowUp {
-                        run: task.run,
+                let followup = effect_id
+                    .strip_prefix(&format!("remote-followup:{c}:"))
+                    .and_then(|suffix| suffix.split_once('#'))
+                    .map(|(run, _)| run.parse::<u32>())
+                    .transpose()
+                    .map_err(|_| error("invalid followup effect id"))?;
+                let body = if let Some(run) = followup {
+                    let task = th
+                        .task
+                        .filter(|task| task.run == run && run > th.rord())
+                        .ok_or_else(|| error("followup effect task changed"))?;
+                    OrchBody::FollowUp {
+                        run,
                         prompt: self.spec_of(&c)?.task,
                         access: *access,
                         cohort: task.cohort,
-                    },
-                    _ => OrchBody::Clamp {
+                    }
+                } else {
+                    OrchBody::Clamp {
                         epoch: u32::from(*access),
                         access: *access,
-                    },
+                    }
                 };
                 let message = self.remote_message(engine, &p, &c, body)?;
-                self.transmit(engine, &message)?;
+                self.transmit(engine, &message, effect_id)?;
                 Ok(true)
             }
             Effect::StartRun { run, .. }
@@ -375,6 +435,72 @@ impl OrchWire {
         }
     }
 
+    pub(super) fn record_root_ceiling(
+        &self,
+        engine: &dyn RunEngine,
+        chat: &str,
+    ) -> Result<(), DriverError> {
+        let Some(route) = engine.orch_route(chat) else {
+            return Ok(());
+        };
+        if route.parent.is_some() || route.host != self.driver.device() {
+            return Ok(());
+        }
+        let receipt = format!("open:{chat}");
+        if !matches!(
+            self.driver.receipt(&receipt)?,
+            Some(Applied::Accepted { .. })
+        ) {
+            return Ok(());
+        }
+        self.driver.observe_mechanism(
+            &format!("received-ceiling:root:{chat}"),
+            "received_ceiling",
+            serde_json::json!({"chat":chat,"access":2,"wire_id":null,"effect_id":null,
+                "origin_device":self.driver.device(),"receiver_device":self.driver.device(),
+                "source_kind":"root_initial","origin_id":receipt,"receipt_id":receipt,
+                "role":"root","epoch":null,"validated":true}),
+        )
+    }
+
+    pub(super) fn record_local_ceiling(
+        &self,
+        chat: &str,
+        access: u8,
+        receipt: &str,
+    ) -> Result<(), DriverError> {
+        self.driver.observe_mechanism(
+            &format!("received-ceiling:local:{receipt}"),
+            "received_ceiling",
+            serde_json::json!({"chat":chat,"access":access,"wire_id":null,"effect_id":null,
+                "origin_device":self.driver.device(),"receiver_device":self.driver.device(),
+                "source_kind":"local_config","origin_id":receipt,"receipt_id":receipt,
+                "epoch":null,"validated":true}),
+        )
+    }
+
+    fn record_received_ceiling(
+        &self,
+        message: &OrchMessage,
+        receipt: &str,
+        digest: Option<&str>,
+    ) -> Result<(), DriverError> {
+        if !self.driver.mechanism_capture_enabled() { return Ok(()); }
+        let (access, source, epoch) = match &message.body {
+            OrchBody::CreateChild { access, .. } => (*access, "create", None),
+            OrchBody::Clamp { access, epoch } => (*access, "clamp", Some(*epoch)),
+            OrchBody::FollowUp { access, .. } => (*access, "followup", None),
+            _ => return Ok(()),
+        };
+        self.driver.observe_mechanism(
+            &format!("received-ceiling:{}", message.id), "received_ceiling",
+            serde_json::json!({"chat":message.target_chat,"access":access,"wire_id":message.id,
+                "effect_id":null,"origin_device":message.sender_device,"receiver_device":self.driver.device(),
+                "source_kind":source,"receipt_id":receipt,"epoch":epoch,"validated":true,
+                "wire_body_digest":digest}),
+        )
+    }
+
     pub fn receive_remote(
         &self,
         engine: &dyn RunEngine,
@@ -392,7 +518,20 @@ impl OrchWire {
             .map_err(|e| error(e.to_string()))?;
         let key = format!("remote-recv:{}", message.id);
         let _g = lock(&self.gate);
-        if self.driver.has_receipt(&key)? {
+        let digest = self.driver.mechanism_capture_enabled().then(|| wire_body_digest(&message.body)).transpose()?;
+        if let Some(digest) = digest.as_deref() {
+        self.driver.observe_mechanism(
+            &format!("remote-receive:{}", message.id), "remote_receive",
+            serde_json::json!({"wire_id":message.id,"wire_body_digest":digest,
+                "origin_device":message.sender_device,"receiver_device":self.driver.device(),
+                "receipt_id":key,"validated":true,"effect_id":null}),
+        )?;
+        }
+        if let Some(receipt) = self.driver.receipt(&key)? {
+            if let Applied::Rejected { reason, .. } = receipt {
+                return Err(error(format!("remote transition rejected: {reason:?}")));
+            }
+            self.record_received_ceiling(message, &key, digest.as_deref())?;
             return Ok(());
         }
         let target = self.intern_thread(&message.target_chat)?;
@@ -521,6 +660,7 @@ impl OrchWire {
         if let Applied::Rejected { reason, .. } = result.applied {
             return Err(error(format!("remote transition rejected: {reason:?}")));
         }
+        self.record_received_ceiling(message, &key, digest.as_deref())?;
         let mut fx = accepted_ids(&result);
         self.pump(target, &message.target_chat, &mut fx)?;
         drop(_g);

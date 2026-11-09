@@ -78,6 +78,7 @@ pub fn join_event(act: &str, args: &Value) -> Result<Event, DriverError> {
     }
     let native_tag = match act {
         "NativeStart" => Some("Start"),
+        "NativeStartNested" => Some("StartNested"),
         "NativeEnd" => Some("End"),
         "NativeClaim" => Some("Claim"),
         "NativeDelivered" => Some("Delivered"),
@@ -287,6 +288,7 @@ pub const ACTION_NAMES: &[&str] = &[
     "ImportClosed",
     "ImportRelease",
     "NativeStart",
+    "NativeStartNested",
     "NativeEnd",
     "NativeClaim",
     "NativeDelivered",

@@ -1570,6 +1570,7 @@ async fn run_session(session: Session) {
                         for _ in 0..=at {
                             pending_steers.pop_front();
                             let (prev, next) = norm.rotate_for_steer();
+                            turn.source_steered();
                             if event_tx.send(Ok(AgentEvent::Steered {
                                 assistant_message_id: Some(prev), next_assistant_message_id: Some(next),
                             })).await.is_err() { break 'main; }
@@ -1862,7 +1863,8 @@ async fn run_session(session: Session) {
                 commands.cancel_waiting();
                 while pending_steers.pop_front().is_some() {
                     let (prev, next) = norm.rotate_for_steer();
-                    if event_tx.send(Ok(AgentEvent::Steered {
+                    turn.source_steered();
+                            if event_tx.send(Ok(AgentEvent::Steered {
                         assistant_message_id: Some(prev), next_assistant_message_id: Some(next),
                     })).await.is_err() { break 'main; }
                 }
@@ -2135,12 +2137,12 @@ fn handle_control_request(
         });
         return;
     }
-    let request_input = Arc::clone(request_input);
+    let request_id = req.request_id;
+    let input = req.request.input;
+    let questions = parse_questions(&input);
+    let answers = (request_input)(questions.clone());
     let stdin_tx = stdin_tx.clone();
     tokio::spawn(async move {
-        let request_id = req.request_id;
-        let input = req.request.input;
-        let questions = parse_questions(&input);
         // The engine's input bridge is the SOLE emitter of
         // `InputRequested`/`InputResolved`: it mints the request id, parks the
         // resolver for `respond_input`, and surfaces both events. Emitting our
@@ -2152,7 +2154,7 @@ fn handle_control_request(
         // (caller went away) — is a decline: deny the tool so the agent reads
         // that it went unanswered, rather than an empty pick, and is
         // unblocked rather than wedged.
-        let answers = (request_input)(questions.clone()).await.unwrap_or_default();
+        let answers = answers.await.unwrap_or_default();
         let response = if answers.is_empty() {
             serde_json::json!({ "behavior": "deny", "message": QUESTIONS_DISMISSED })
         } else {
@@ -2413,6 +2415,38 @@ mod access_tests {
             env: Default::default(),
             extra_mcp: Vec::new(),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_receipt_binds_before_spawn_and_source_steer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let source = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let turn = crate::TurnControl::default();
+        let next = source.clone();
+        turn.set_source_steered(move || {
+            next.fetch_add(1, Ordering::SeqCst);
+        });
+        let (capture, stamp) = (seen.clone(), source.clone());
+        let input: Arc<RequestInputFn> = Arc::new(Box::new(move |_| {
+            capture.lock().unwrap().push(stamp.load(Ordering::SeqCst));
+            tokio::sync::oneshot::channel().1
+        }));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = request(AccessMode::default(), false, false);
+        let make = || {
+            serde_json::from_value::<ControlRequestFrame>(json!({
+            "request_id":"q", "request":{"subtype":"can_use_tool", "tool_name":"AskUserQuestion",
+            "input":{"questions":[{"question":"Pick", "options":["A"]}]}}
+        })).unwrap()
+        };
+        handle_control_request(make(), false, &config, &input, &tx);
+        assert_eq!(*seen.lock().unwrap(), vec![0]);
+        turn.source_steered();
+        handle_control_request(make(), false, &config, &input, &tx);
+        assert_eq!(*seen.lock().unwrap(), vec![0, 1]);
+        tokio::task::yield_now().await;
+        assert_eq!(*seen.lock().unwrap(), vec![0, 1]);
     }
 
     /// The permission flags a request launches with.

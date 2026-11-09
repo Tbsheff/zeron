@@ -432,10 +432,8 @@ impl MessagePart {
                     .collect::<Vec<_>>()
                     .join("\n\n"),
             ),
-            Self::Handoff {
-                strategy, coverage, ..
-            } => Some(format!(
-                "Transferred context from {} ({strategy}): {} messages; {} omitted.",
+            Self::Handoff { coverage, .. } => Some(format!(
+                "Transferred context from {}: {} messages; {} omitted.",
                 coverage.source_chat_id,
                 coverage.selected_message_ids.len(),
                 coverage.omitted_count

@@ -61,3 +61,15 @@ pub fn caller() -> Caller {
 pub async fn with_caller<F: Future>(caller: Caller, f: F) -> F::Output {
     CALLER.scope(caller, f).await
 }
+
+tokio::task_local! {
+    static AGENT_RUN: Option<String>;
+}
+
+pub fn agent_run() -> Option<String> {
+    AGENT_RUN.try_with(Clone::clone).ok().flatten()
+}
+
+pub async fn with_agent_run<F: Future>(run: Option<String>, f: F) -> F::Output {
+    AGENT_RUN.scope(run, f).await
+}

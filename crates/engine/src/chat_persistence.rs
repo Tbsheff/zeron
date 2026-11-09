@@ -146,6 +146,22 @@ impl ChatPersistence {
         }
     }
 
+    pub(crate) fn save_snapshot_sync(&self) -> Result<Vec<u8>, String> {
+        let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        let generation = self.generation.load(Ordering::Acquire);
+        let doc = self.doc.upgrade().ok_or("chat document closed")?;
+        let cursor = self.cursor.load(Ordering::Acquire);
+        let bytes = doc.export_snapshot().map_err(|e|e.to_string())?;
+        self.store.save_verified_snapshot_with_cursor(&self.chat_id, &bytes, cursor,
+            super::chat2_host::CHAT2_DOC_EPOCH).map_err(|e|e.to_string())?;
+        self.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
+        self.cursor_verified.store(true, Ordering::Release);
+        self.saved.store(generation, Ordering::Release);
+        #[cfg(test)]
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        Ok(bytes)
+    }
+
     pub(crate) fn flush_sync(&self) {
         let flush = || {
             let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
@@ -433,4 +449,51 @@ mod tests {
         persistence.flush_sync();
         assert_eq!(store.snapshot_cursor("whale").unwrap(), 2);
     }
+    #[test]
+    fn exact_save_returns_its_own_durable_version() {
+        let (_dir, doc, store, persistence) = fixture();
+        doc.doc().get_map("test").insert("first", true).unwrap();
+        doc.doc().commit();
+        persistence.applied(1, false);
+        let first = persistence.save_snapshot_sync().unwrap();
+        assert_eq!(store.load_snapshot("whale").unwrap().unwrap(),first);
+        doc.doc().get_map("test").insert("second", true).unwrap();
+        doc.doc().commit();
+        persistence.applied(2, false);
+        let second = persistence.save_snapshot_sync().unwrap();
+        assert_ne!(first,second);
+        let old = loro::LoroDoc::new();
+        old.import(&first).unwrap();
+        assert!(old.get_map("test").get("first").is_some());
+        assert!(old.get_map("test").get("second").is_none());
+        assert_eq!(store.load_snapshot("whale").unwrap().unwrap(),second);
+        assert_eq!(store.snapshot_cursor("whale").unwrap(),2);
+        assert!(store.snapshot_cursor_verified("whale").unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exact_save_follows_blocked_background_save() {
+        let (_dir, doc, store, persistence) = fixture();
+        persistence.applied(1, false);
+        let (started_tx,started_rx) = std::sync::mpsc::channel();
+        let (release_tx,release_rx) = std::sync::mpsc::channel();
+        *persistence.before_export.lock().unwrap() = Some(Box::new(move || { started_tx.send(()).unwrap(); release_rx.recv().unwrap(); }));
+        let background = persistence.clone();
+        let job = tokio::task::spawn_blocking(move ||background.flush_sync());
+        started_rx.recv().unwrap();
+        doc.doc().get_map("test").insert("new",true).unwrap();
+        doc.doc().commit();
+        persistence.applied(2,false);
+        let forced = persistence.clone();
+        let exact = tokio::task::spawn_blocking(move ||forced.save_snapshot_sync().unwrap());
+        release_tx.send(()).unwrap();
+        job.await.unwrap();
+        let bytes = exact.await.unwrap();
+        assert_eq!(store.load_snapshot("whale").unwrap().unwrap(),bytes);
+        assert_eq!(store.snapshot_cursor("whale").unwrap(),2);
+        let saved = loro::LoroDoc::new();
+        saved.import(&bytes).unwrap();
+        assert!(saved.get_map("test").get("new").is_some());
+    }
+
 }

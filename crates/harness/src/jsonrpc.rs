@@ -30,6 +30,7 @@ pub(crate) enum Incoming {
     Notification {
         method: String,
         params: Value,
+        reader_position: u64,
     },
     /// Server→client request (approvals); must be answered via
     /// [`RpcClient::respond`] / [`RpcClient::respond_error`].
@@ -37,14 +38,43 @@ pub(crate) enum Incoming {
         id: Value,
         method: String,
         params: Value,
+        reader_position: u64,
     },
     /// stdout EOF: the app server exited. All pending requests fail.
     Eof,
 }
 
+impl Incoming {
+    pub fn reader_position(&self) -> Option<u64> {
+        match self {
+            Self::Notification {
+                reader_position, ..
+            }
+            | Self::Request {
+                reader_position, ..
+            } => Some(*reader_position),
+            Self::Eof => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct OrderedResponse {
+    pub value: Value,
+    pub reader_position: u64,
+}
+
+impl std::ops::Deref for OrderedResponse {
+    type Target = Value;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
 type StdoutObserver = Box<dyn Fn(&str) + Send>;
 
-type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
+type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<OrderedResponse, String>>>>>;
 
 /// How a request fails when the transport lost its answer: the app server
 /// exited first, or its stdin could not take the request (then with the
@@ -183,6 +213,14 @@ impl RpcClient {
         self.request_now(method, params).await
     }
 
+    pub async fn request_ordered(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<OrderedResponse, HarnessError> {
+        self.request_ordered_now(method, params).await
+    }
+
     /// [`Self::request`], but the line is queued for writing before this
     /// returns rather than on first poll — so a notification sent afterwards
     /// (a steer's `session/cancel`) can never overtake it on the wire.
@@ -191,6 +229,15 @@ impl RpcClient {
         method: &str,
         params: Value,
     ) -> futures::future::BoxFuture<'static, Result<Value, HarnessError>> {
+        let response = self.request_ordered_now(method, params);
+        Box::pin(async move { response.await.map(|response| response.value) })
+    }
+
+    pub fn request_ordered_now(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> futures::future::BoxFuture<'static, Result<OrderedResponse, HarnessError>> {
         let method = method.to_owned();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = oneshot::channel();
@@ -339,6 +386,7 @@ async fn read_loop(
     voice_router: Arc<Mutex<Option<VoiceRouter>>>,
 ) {
     let mut lines = crate::lossy_lines::lossy_lines(stdout);
+    let mut reader_position = 0_u64;
     // A read error ends the loop like EOF: either way the child's stdout is
     // unusable, pending requests must fail, and the session loop must know.
     while let Ok(Some(line)) = lines.next_line().await {
@@ -361,6 +409,7 @@ async fn read_loop(
         if !msg.is_object() || msg.get("jsonrpc").is_some_and(|version| version != "2.0") {
             continue;
         }
+        reader_position += 1;
         let method = msg.get("method").and_then(Value::as_str);
         let id = msg.get("id");
         match (method, id) {
@@ -383,10 +432,13 @@ async fn read_loop(
                 };
                 let outcome = match msg.get("error") {
                     Some(err) => Err(response_error(err)),
-                    None => Ok(msg
-                        .get_mut("result")
-                        .map(Value::take)
-                        .unwrap_or(Value::Null)),
+                    None => Ok(OrderedResponse {
+                        value: msg
+                            .get_mut("result")
+                            .map(Value::take)
+                            .unwrap_or(Value::Null),
+                        reader_position,
+                    }),
                 };
                 let _ = sender.send(outcome);
             }
@@ -395,6 +447,7 @@ async fn read_loop(
                 let incoming = Incoming::Request {
                     id: id.clone(),
                     method: method.to_owned(),
+                    reader_position,
                     params: msg
                         .get_mut("params")
                         .map(Value::take)
@@ -410,6 +463,7 @@ async fn read_loop(
                 let account_updated = method == "account/updated";
                 let incoming = Incoming::Notification {
                     method: method.to_owned(),
+                    reader_position,
                     params: msg
                         .get_mut("params")
                         .map(Value::take)
@@ -419,10 +473,16 @@ async fn read_loop(
                     if account_updated {
                         // An account change ends any call; the session still sees it below.
                         (router.abort_media)();
-                        if let Incoming::Notification { method, params } = &incoming {
+                        if let Incoming::Notification {
+                            method,
+                            params,
+                            reader_position,
+                        } = &incoming
+                        {
                             let copy = Incoming::Notification {
                                 method: method.clone(),
                                 params: params.clone(),
+                                reader_position: *reader_position,
                             };
                             if router.sender.try_send(copy).is_err() {
                                 router.overflow.store(true, Ordering::Release);
@@ -532,6 +592,73 @@ mod tests {
         let (client, incoming) =
             RpcClient::new(child.stdin.take().unwrap(), child.stdout.take().unwrap());
         (child, client, incoming)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordered_response_separates_queued_frames_and_preserves_legacy_requests() {
+        let (_child, client, mut incoming) = scripted_child(
+            r#"read line
+echo '{"jsonrpc":"2.0","id":"old","method":"approval","params":{"turn":"old"}}'
+echo '{"jsonrpc":"2.0","method":"account/updated","params":{}}'
+echo '{"jsonrpc":"2.0","id":1,"result":{"turn":"accepted"}}'
+echo '{"jsonrpc":"2.0","id":"new","method":"approval","params":{"turn":"new"}}'
+echo '{"jsonrpc":"2.0","method":"update","params":{}}'
+read line
+echo '{"jsonrpc":"2.0","id":2,"result":{"legacy":true}}'
+"#,
+        );
+        let (mut voice, _) = client.subscribe_voice(|| {});
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.request_ordered("turn/steer", json!({})),
+        )
+        .await
+        .expect("ordered response must resolve")
+        .unwrap();
+        let legacy = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.request("legacy", json!({})),
+        )
+        .await
+        .expect("legacy response must resolve after all queued frames")
+        .unwrap();
+        assert_eq!(response.value, json!({"turn": "accepted"}));
+        assert_eq!(response.reader_position, 3);
+        assert_eq!(legacy, json!({"legacy": true}));
+        let old = incoming.try_recv().unwrap();
+        let account = incoming.try_recv().unwrap();
+        let new = incoming.try_recv().unwrap();
+        let update = incoming.try_recv().unwrap();
+        assert!(matches!(&old, Incoming::Request { id, .. } if id == "old"));
+        assert!(matches!(&new, Incoming::Request { id, .. } if id == "new"));
+        assert_eq!(old.reader_position(), Some(1));
+        assert_eq!(account.reader_position(), Some(2));
+        assert_eq!(new.reader_position(), Some(4));
+        assert_eq!(update.reader_position(), Some(5));
+        assert!(old.reader_position().unwrap() < response.reader_position);
+        assert!(new.reader_position().unwrap() > response.reader_position);
+        assert_eq!(voice.try_recv().unwrap().reader_position(), Some(2));
+    }
+
+    #[test]
+    fn legacy_request_now_queues_before_a_later_notification() {
+        let (writer, mut receiver) = mpsc::unbounded_channel();
+        let client = RpcClient {
+            next_id: Arc::new(AtomicI64::new(0)),
+            pending: Arc::default(),
+            writer,
+            closed: Arc::new(AtomicBool::new(false)),
+            voice_router: Arc::default(),
+            close_stdin: Arc::default(),
+        };
+        let response = client.request_now("session/prompt", json!({}));
+        client.notify("session/cancel", None);
+        let request: Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+        let cancel: Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+        assert_eq!(request["method"], "session/prompt");
+        assert_eq!(cancel["method"], "session/cancel");
+        drop(response);
     }
 
     #[cfg(unix)]

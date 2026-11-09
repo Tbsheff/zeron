@@ -87,6 +87,9 @@ pub(crate) fn thread_stop(
             task.delivery = Delivery::Disposed;
         }
     }
+    let background_live = s.natives.iter().any(|((parent, _), native)| {
+        *parent == t && native.background && native.status == crate::native::NativeStatus::Running
+    });
     let th = s.thread_mut(t)?;
     let live = th.is_live();
     th.mark_interrupt();
@@ -96,7 +99,7 @@ pub(crate) fn thread_stop(
         run.cohort.del.clear();
     }
     th.queue.retain(|m| !matches!(m, Msg::Wake { .. }));
-    if live {
+    if live || (background_live && th.rord() > 0) {
         fx.push(Effect::InterruptRun { run: th.run_id() });
     }
     crate::questions::reroute(s, t, true, fx)?;
@@ -294,8 +297,9 @@ fn late_wait_ack(s: &mut OrchState, t: ThreadId) -> Result<(), Reject> {
     Ok(())
 }
 
-fn queued_wake(th: &Thread) -> Result<(Msg, u32, u32), Reject> {
-    let head = *th.queue.front().ok_or(Reject::QueueEmpty)?;
+fn queued_wake(th: &Thread) -> Result<(usize, Msg, u32, u32), Reject> {
+    let index=if th.held==Hold::Fail {th.queue.iter().position(|m|matches!(m,Msg::Wake{..})).unwrap_or(0)} else {0};
+    let head = *th.queue.get(index).ok_or(Reject::QueueEmpty)?;
     let Msg::Wake { run, generation } = head else {
         return Err(Reject::HeadNotWake);
     };
@@ -306,7 +310,7 @@ fn queued_wake(th: &Thread) -> Result<(Msg, u32, u32), Reject> {
         co.st == CohortSt::Queued && co.generation == generation,
         Reject::StaleWake,
     )?;
-    Ok((head, run, generation))
+    Ok((index, head, run, generation))
 }
 
 fn start_from_queue_wake(
@@ -315,7 +319,7 @@ fn start_from_queue_wake(
     fx: &mut Vec<Effect>,
 ) -> Result<(), Reject> {
     let th = s.thread(t)?;
-    let (head, r, _) = queued_wake(th)?;
+    let (index, head, r, _) = queued_wake(th)?;
     let co = th.cohort(r).ok_or(Reject::Corrupt)?;
     let open = co.disp == Disp::Open;
     let claimed: Slots<ThreadId> = co
@@ -343,7 +347,7 @@ fn start_from_queue_wake(
         co.st = CohortSt::None;
     }
     let th = s.thread_mut(t)?;
-    th.queue.pop_front();
+    th.queue.remove(index);
     begin_run(th, Start::Queued(head), delivered, fx);
     Ok(())
 }

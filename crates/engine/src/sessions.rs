@@ -39,6 +39,10 @@ use crate::orchestrator::wire::{OrchWire, Pending, Ran, SendKind, Via};
 
 #[path = "session_activity.rs"]
 mod activity;
+#[path = "sessions_provider_observer.rs"]
+mod provider_observer;
+#[path = "sessions_nested_native.rs"]
+mod nested_native;
 use crate::registry::{HarnessDescriptor, HarnessRegistry};
 use crate::run_journal::RunJournal;
 use crate::{EngineError, new_id, now_ms};
@@ -61,17 +65,72 @@ pub enum SteerOutcome {
     NotSteerable,
 }
 
-type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
+#[derive(Default)]
+struct InputSource {
+    attempt: Option<zeron_orch::AttemptId>,
+    confirmed: std::collections::HashSet<String>,
+    message_id: Option<String>,
+}
 
+impl InputSource {
+    fn confirm(&mut self, steers: &std::collections::VecDeque<RoutedSteer>) {
+        self.confirmed.retain(|id| steers.iter().any(|s| &s.message_id == id));
+        if let Some(next) = steers.iter().find(|s| !self.confirmed.contains(&s.message_id)) {
+            self.attempt = next.orch_attempt;
+            self.message_id = Some(next.message_id.clone());
+            self.confirmed.insert(next.message_id.clone());
+        }
+    }
+}
+
+struct InputIssuance {
+    inner: std::sync::Weak<Inner>,
+    chat: String,
+    runtime_id: String,
+    attempt: Option<zeron_orch::AttemptId>,
+    message_id: Option<String>,
+}
+
+impl InputIssuance {
+    fn record(&self, request: &str) {
+        let Some(inner) = self.inner.upgrade() else { return };
+        let Some(wire) = inner.orch.get() else { return };
+        if !wire.driver().mechanism_capture_enabled() { return; }
+        if let Err(error) = wire.driver().observe_mechanism(
+            &format!("question-input:{request}"), "question_input_issued",
+            serde_json::json!({"chat":self.chat,"runtime_id":self.runtime_id,"request_id":request,
+                "source_run":self.attempt.map(|a|a.run.ord),"source_attempt":self.attempt.map(|a|a.n),
+                "source_message_id":self.message_id}),
+        ) { tracing::warn!(%error,"question input observation failed"); }
+    }
+}
+
+struct PendingInput {
+    tx: oneshot::Sender<Vec<UserInputAnswer>>,
+    attempt: Option<zeron_orch::AttemptId>,
+}
+impl PendingInput {
+    fn send(self,answers:Vec<UserInputAnswer>)->Result<(),Vec<UserInputAnswer>>{self.tx.send(answers)}
+}
+type PendingInputs = Arc<Mutex<HashMap<String, PendingInput>>>;
+
+fn current_input(pending:&PendingInputs,request:&str,attempt:Option<zeron_orch::AttemptId>,wire:Option<&OrchWire>,chat:&str)->bool {
+    let current=lock(pending).get(request).is_some_and(|input|input.attempt==attempt && wire.is_none_or(|w|w.question_attempt_current(chat,input.attempt)));
+    if !current && let Some(input)=lock(pending).remove(request){let _=input.send(Vec::new());}
+    current
+}
 fn ask_person(
     pending: &PendingInputs,
     engine_tx: &mpsc::UnboundedSender<AgentEvent>,
     questions: Vec<UserInputQuestion>,
     mut tx: oneshot::Sender<Vec<UserInputAnswer>>,
+    attempt: Option<zeron_orch::AttemptId>,
+    issuance: Option<InputIssuance>,
 ) {
     let (answer_tx, answer_rx) = oneshot::channel();
     let request_id = new_id();
-    lock(pending).insert(request_id.clone(), answer_tx);
+    if let Some(issuance) = issuance { issuance.record(&request_id); }
+    lock(pending).insert(request_id.clone(), PendingInput{tx:answer_tx,attempt});
     let _ = engine_tx.send(AgentEvent::InputRequested {
         request_id: request_id.clone(),
         questions,
@@ -181,6 +240,9 @@ impl Drop for VoiceCall {
 }
 
 struct RunHandle {
+    binding_revision: std::sync::atomic::AtomicU64,
+    orch_origin: String,
+    orch_attempt: Option<zeron_orch::AttemptId>,
     voice: Option<zeron_harness::codex::realtime::RealtimeHandle>,
     voice_active: Arc<VoiceActivity>,
     run_id: String,
@@ -262,6 +324,7 @@ fn binary_identity(harness: &dyn Harness) -> Option<String> {
 /// One accepted-but-unconfirmed steer: enough to re-dispatch it verbatim.
 #[derive(Debug, Clone)]
 struct RoutedSteer {
+    orch_attempt: Option<zeron_orch::AttemptId>,
     prompt: String,
     message_id: String,
     /// The delivered text carried the fork's copied history: its delivery
@@ -321,6 +384,9 @@ struct Inner {
     doc_host: Mutex<Option<DocHost>>,
     /// chat_id → live run.
     runs: Mutex<HashMap<String, RunHandle>>,
+    binding_source: OnceLock<String>,
+    binding_revision: std::sync::atomic::AtomicU64,
+    provider_sources: Mutex<HashMap<String, provider_observer::StreamSource>>,
     /// chat_id → broadcast hub (retained across runs so subscribers survive turns).
     hubs: Mutex<HashMap<String, broadcast::Sender<JournaledEvent>>>,
     statuses: Mutex<HashMap<String, Session>>,
@@ -331,7 +397,7 @@ struct Inner {
     activity_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Last dispatched request per chat — the steer→new-turn fallback re-derives its
     /// run config from this (chat config rows land with the workspace doc in M4).
-    last_requests: Mutex<HashMap<String, RunRequest>>,
+    last_requests: Mutex<HashMap<String, (RunRequest, String)>>,
     /// Harness-native session ids per chat (resume continuity across turns) —
     /// the live-process cache over the durable copy on the workspace chat row
     /// (zeron kept the same pair on `chats.harness_session_id`). An empty
@@ -395,6 +461,9 @@ impl SessionsEngine {
                 registry,
                 doc_host: Mutex::new(None),
                 runs: Mutex::new(HashMap::new()),
+                binding_source: OnceLock::new(),
+                binding_revision: std::sync::atomic::AtomicU64::new(0),
+                provider_sources: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
                 statuses: Mutex::new(HashMap::new()),
                 sessions_tx,
@@ -419,6 +488,10 @@ impl SessionsEngine {
         if self.inner.orch.set(wire.clone()).is_err() {
             return false;
         }
+        provider_observer::initial_catalog(&self.inner, &wire);
+        if let Err(error) = wire.engine_started().and_then(|_| wire.admission_open()) {
+            tracing::error!(%error, "engine lifecycle capture failed");
+        }
         if let Some(host) = self.host() {
             let receiver = wire.clone();
             let engine = self.clone();
@@ -428,7 +501,7 @@ impl SessionsEngine {
                     .map_err(|e| e.to_string())
             }));
         }
-        wire.attach(Arc::new(self.clone()));
+        wire.attach_recovering(Arc::new(self.clone()));
         true
     }
 
@@ -966,6 +1039,10 @@ impl SessionsEngine {
 
     /// The last request dispatched for a chat (steer→new-turn fallback).
     pub fn last_request(&self, chat_id: &str) -> Option<RunRequest> {
+        self.last_request_source(chat_id).map(|(request, _)| request)
+    }
+
+    pub(crate) fn last_request_source(&self, chat_id: &str) -> Option<(RunRequest, String)> {
         lock(&self.inner.last_requests).get(chat_id).cloned()
     }
 
@@ -1147,6 +1224,7 @@ impl SessionsEngine {
                 "orchestrator requires a known local host row".into(),
             ));
         }
+        let dispatch_stops = self.inner.user_stop_count(chat_id);
         // Project-less chats store a home-relative cwd (the creating device
         // can't know the host's home); expand it here, on the host, where the
         // run spawns, creating a new chat's scratch folder.
@@ -1231,6 +1309,7 @@ impl SessionsEngine {
             let mut bootstrap = None;
             let same_runtime = route.is_some();
             let reconfigure = route == Some(true);
+            let mut accepted_binding = None;
             let accepted = if steerable && same_runtime {
                 bootstrap =
                     self.warm_fork_history(chat_id, harness_id, &request.prompt, &history_sent);
@@ -1258,20 +1337,43 @@ impl SessionsEngine {
                     // Commit the reserved slot atomically with the update
                     // marker. An accepted update releases the slot instead, and
                     // the prompt takes the fresh-run path behind the update.
-                    self.inner
-                        .registry
-                        .while_update_clear(harness_id, || {
+                    let commit = || {
+                        self.inner.registry.while_update_clear(harness_id, || {
+                            let mut runs = lock(&self.inner.runs);
+                            let Some(h) = runs.get_mut(chat_id).filter(|h| h.run_id == run_id
+                                && !h.retiring.load(std::sync::atomic::Ordering::Acquire)
+                                && !*h.cancel.borrow()) else {
+                                return Err(EngineError::Other("runtime changed before turn admission".into()));
+                            };
+                            if self.inner.user_stop_count(chat_id) != dispatch_stops
+                                || stops_seen.is_some_and(|seen| seen != dispatch_stops)
+                            {
+                                return Err(EngineError::Other("turn stopped before admission".into()));
+                            }
                             let mut pending = lock(&ledger);
                             pending.push_back(RoutedSteer {
+                                orch_attempt: crate::orchestrator::wire::starting_attempt(),
                                 prompt: request.prompt.clone(),
                                 message_id: user_id.clone(),
                                 fork_history: bootstrap.is_some(),
-                                after_stop: retiring.load(std::sync::atomic::Ordering::Acquire),
+                                after_stop: false,
                                 request: Some(Box::new(request.clone())),
                             });
+                            if reconfigure {
+                                h.runtime_config.request = request.clone();
+                                h.orch_origin = user_id.clone();
+                                accepted_binding = self.inner.binding_snapshot(chat_id, h, "config");
+                                lock(&self.inner.last_requests).insert(chat_id.to_string(), (request.clone(), user_id.clone()));
+                            }
                             permit.send(message);
-                        })
-                        .is_some()
+                            Ok(())
+                        }).transpose().map(|accepted| accepted.is_some())
+                    };
+                    if let Some(at) = crate::orchestrator::wire::starting_attempt()
+                        && let Some(wire) = self.orch_for(chat_id)
+                    {
+                        wire.with_runtime_admission(at, crate::orchestrator::wire::access_level(request.access), commit)?
+                    } else { commit()? }
                 } else {
                     false
                 }
@@ -1283,13 +1385,7 @@ impl SessionsEngine {
                     // The runtime runs this configuration from now on: later
                     // sends compare against it, and a re-dispatch of an
                     // orphaned steer starts from it.
-                    if let Some(h) = lock(&self.inner.runs)
-                        .get_mut(chat_id)
-                        .filter(|h| h.run_id == run_id)
-                    {
-                        h.runtime_config.request = request.clone();
-                    }
-                    lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
+                    self.inner.record_binding(accepted_binding);
                 }
                 let handle = self.doc_handle(chat_id)?;
                 handle.write_user_message(&user_id, &request.prompt, now_ms())?;
@@ -1347,6 +1443,12 @@ impl SessionsEngine {
             return Ok(String::new());
         }
         let harness = self.inner.registry.resolve(harness_id)?;
+        if let Some(wire) = self.inner.orch.get().filter(|wire| wire.driver().mechanism_capture_enabled()) {
+            crate::orchestrator::capabilities::record_selected(
+                wire.driver(), harness.as_ref(),
+                self.inner.registry.enabled_set().contains(&harness.id()),
+            ).map_err(|error| EngineError::Other(format!("capability capture: {error}")))?;
+        }
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
         let revival = {
@@ -1388,8 +1490,10 @@ impl SessionsEngine {
         // and starting the retry fresh silently dropped a good conversation.
         // An id the provider has rejected is skipped wherever it comes from.
         let mut resume_injected = false;
+        let uncertain = |id: &str| self.inner.orch.get().is_some() && crate::orchestrator::transfer::uncertain_for_other_input(handle.doc(),harness_id.as_str(),id,&user_id);
+        if request.resume.as_deref().is_some_and(uncertain) { request.resume=None; }
         if request.resume.is_none() {
-            let live = |id: &String| !self.inner.resume_was_rejected(chat_id, id);
+            let live = |id: &String| !self.inner.resume_was_rejected(chat_id, id) && !uncertain(id);
             request.resume = self
                 .inner
                 .resume_for(chat_id, &request.cwd, harness_id)
@@ -1407,13 +1511,14 @@ impl SessionsEngine {
             }
             revival
         });
-        lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
+        lock(&self.inner.last_requests).insert(chat_id.to_string(), (request.clone(), user_id.clone()));
 
         let run_id = new_id();
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let pending_inputs: PendingInputs = Arc::new(Mutex::new(HashMap::new()));
+        let input_source = Arc::new(Mutex::new(InputSource { attempt: crate::orchestrator::wire::starting_attempt(), message_id: Some(user_id.clone()), ..InputSource::default() }));
 
         // Input bridge: the harness asks questions; we mint the request id, park the
         // resolver for `respond_input`, and surface the event through the run pipeline.
@@ -1422,7 +1527,21 @@ impl SessionsEngine {
             let engine_tx = engine_tx.clone();
             let plugins = self.inner.plugins.get().cloned();
             let (chat, cwd) = (chat_id.to_owned(), request.cwd.clone());
+            let input_source = input_source.clone();
+            let (source_inner, source_runtime) = (Arc::downgrade(&self.inner), run_id.clone());
             Box::new(move |questions: Vec<UserInputQuestion>| {
+                let (attempt, message_id) = if !matches!(harness_id, HarnessId::Cursor | HarnessId::Mock) {
+                    let source = lock(&input_source);
+                    (source.attempt, source.message_id.clone())
+                } else {
+                    source_inner.upgrade().and_then(|inner| lock(&inner.runs).get(&chat)
+                        .filter(|h| h.run_id == source_runtime).map(|h| (h.orch_attempt, Some(h.orch_origin.clone()))))
+                        .unwrap_or((None, None))
+                };
+                let issuance = Some(InputIssuance {
+                    inner: source_inner.clone(), chat: chat.clone(), runtime_id: source_runtime.clone(),
+                    attempt, message_id,
+                });
                 let (tx, rx) = oneshot::channel();
                 let hooked = plugins
                     .as_ref()
@@ -1438,19 +1557,29 @@ impl SessionsEngine {
                             match answers {
                                 Some(answers) => drop(tx.send(answers)),
                                 None if !tx.is_closed() => {
-                                    ask_person(&pending, &engine_tx, questions, tx)
+                                    ask_person(&pending, &engine_tx, questions, tx, attempt, issuance)
                                 }
                                 None => {}
                             }
                         });
                     }
-                    None => ask_person(&pending, &engine_tx, questions, tx),
+                    None => ask_person(&pending, &engine_tx, questions, tx, attempt, issuance),
                 }
                 rx
             })
         };
         let interrupt_token = CancellationToken::new();
         let turn = TurnControl::default();
+        {
+            let (inner, chat, runtime) = (Arc::downgrade(&self.inner), chat_id.to_owned(), run_id.clone());
+            turn.set_source_steered(move || {
+                let Some(inner) = inner.upgrade() else { return };
+                let runs = lock(&inner.runs);
+                if let Some(handle) = runs.get(&chat).filter(|h| h.run_id == runtime) {
+                    lock(&input_source).confirm(&lock(&handle.routed_steers));
+                }
+            });
+        }
         let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let fork_history_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (voice_handle, realtime, _voice_events) = zeron_harness::codex::realtime::channel();
@@ -1481,6 +1610,11 @@ impl SessionsEngine {
         // (or the shutdown overtook) while no run was live, and a revival a
         // newer message has taken the chat from, end here instead of starting.
         let mut runs = lock(&self.inner.runs);
+        if let Some(at) = crate::orchestrator::wire::starting_attempt()
+            && self.orch_for(chat_id).is_some_and(|wire| !wire.runtime_attempt_current(at))
+        {
+            return Err(EngineError::Other("orchestrator attempt no longer admits a runtime".into()));
+        }
         let stops = self.inner.user_stop_count(chat_id);
         let moved_on = superseded || (revival.is_some() && runs.contains_key(chat_id));
         let stopped = stops_seen.is_some_and(|seen| seen != stops);
@@ -1503,9 +1637,12 @@ impl SessionsEngine {
         if !idle {
             self.inner.journal.clear_user_stop(chat_id);
         }
-        runs.insert(
+        let replaced = runs.insert(
             chat_id.to_string(),
             RunHandle {
+                binding_revision: std::sync::atomic::AtomicU64::new(0),
+                orch_origin: user_id.clone(),
+                orch_attempt: crate::orchestrator::wire::starting_attempt(),
                 voice: (harness_id == HarnessId::Codex).then_some(voice_handle),
                 voice_active: voice_active.clone(),
                 run_id: run_id.clone(),
@@ -1534,7 +1671,11 @@ impl SessionsEngine {
                 side_chats_only,
             },
         );
+        let removed_binding = replaced.and_then(|h| self.inner.binding_snapshot(chat_id, &h, "remove"));
+        let binding = runs.get(chat_id).and_then(|h| self.inner.binding_snapshot(chat_id, h, "install"));
         drop(runs);
+        self.inner.record_binding(removed_binding);
+        self.inner.record_binding(binding);
         self.set_status(
             chat_id,
             if idle {
@@ -1570,6 +1711,7 @@ impl SessionsEngine {
             engine_rx,
             cancel_rx,
             RunResumeState {
+                orch_attempt: crate::orchestrator::wire::starting_attempt(),
                 idle,
                 voice_active,
                 user_message_id: user_id,
@@ -1729,6 +1871,7 @@ impl SessionsEngine {
         message_id: Option<String>,
         issued_at: i64,
     ) -> Result<SteerOutcome, EngineError> {
+        let dispatch_stops = self.inner.user_stop_count(chat_id);
         let target = lock(&self.inner.runs)
             .get(chat_id)
             .filter(|h| h.steerable && !h.retiring.load(std::sync::atomic::Ordering::Acquire))
@@ -1772,21 +1915,34 @@ impl SessionsEngine {
         let Ok(permit) = steer_tx.reserve().await else {
             return Ok(SteerOutcome::NotSteerable);
         };
-        let accepted = self.inner.registry.while_update_clear(harness_id, || {
-            // Serialize mailbox acceptance with confirmation and Done-time
-            // inspection: a fast consumer must never outrun its ledger entry.
-            // The update marker is checked in the same critical section, so an
-            // accepted update releases the reserved slot instead.
-            let mut pending = lock(&ledger);
-            pending.push_back(RoutedSteer {
-                prompt: prompt.to_string(),
-                message_id: user_id.clone(),
-                fork_history: bootstrap.is_some(),
-                after_stop: retiring.load(std::sync::atomic::Ordering::Acquire),
-                request: sent_with,
-            });
-            permit.send(message);
-        });
+        let selected_access = sent_with.as_ref().map(|request| crate::orchestrator::wire::access_level(request.access));
+        let commit = || {
+            self.inner.registry.while_update_clear(harness_id, || {
+                let runs = lock(&self.inner.runs);
+                if crate::orchestrator::wire::starting_attempt().is_some()
+                    && (!runs.get(chat_id).is_some_and(|h| h.run_id == run_id
+                        && !h.retiring.load(std::sync::atomic::Ordering::Acquire) && !*h.cancel.borrow())
+                        || self.inner.user_stop_count(chat_id) != dispatch_stops)
+                {
+                    return Err(EngineError::Other("runtime changed before steer admission".into()));
+                }
+                let mut pending = lock(&ledger);
+                pending.push_back(RoutedSteer {
+                    orch_attempt: crate::orchestrator::wire::starting_attempt(),
+                    prompt: prompt.to_string(), message_id: user_id.clone(),
+                    fork_history: bootstrap.is_some(),
+                    after_stop: retiring.load(std::sync::atomic::Ordering::Acquire),
+                    request: sent_with,
+                });
+                permit.send(message);
+                Ok(())
+            }).transpose()
+        };
+        let accepted = if let Some(at) = crate::orchestrator::wire::starting_attempt()
+            && let Some(wire) = self.orch_for(chat_id)
+        {
+            wire.with_runtime_admission(at, selected_access.unwrap_or(u8::MAX), commit)?
+        } else { commit()? };
         if accepted.is_none() {
             return Ok(SteerOutcome::DeferredByUpdate);
         }
@@ -1979,13 +2135,23 @@ impl SessionsEngine {
     /// conversation in a fresh process. (Sending, steering and switching
     /// models never come here: they keep the runtime and its work.)
     pub async fn interrupt(&self, chat_id: &str) -> Result<bool, EngineError> {
+        let run_id = lock(&self.inner.runs)
+            .get(chat_id)
+            .map(|h| h.run_id.clone());
         self.note_user_stop(chat_id);
-        if let Some(wire) = self.orch_for(chat_id)
-            && let Some(done) = Box::pin(wire.interrupt(self, chat_id)).await?
-        {
-            return Ok(done);
-        }
-        self.terminate(chat_id).await
+        let handled = if let Some(wire) = self.orch_for(chat_id) {
+            Box::pin(wire.interrupt(self, chat_id))
+                .await
+                .map(|done| done.unwrap_or(false))
+        } else {
+            Ok(false)
+        };
+        let terminated = if let Some(run_id) = run_id {
+            self.terminate_runtime(chat_id, Some(&run_id)).await?
+        } else {
+            false
+        };
+        Ok(handled? || terminated)
     }
 
     /// A Stop from the user, noted before it looks for the run to stop: it
@@ -2059,7 +2225,17 @@ impl SessionsEngine {
     /// streaming entry stamped `aborted`; this waits (bounded) for that
     /// settlement. Background work the runtime held dies with it.
     pub async fn terminate(&self, chat_id: &str) -> Result<bool, EngineError> {
-        let target = lock(&self.inner.runs).get(chat_id).map(|h| {
+        self.terminate_runtime(chat_id, None).await
+    }
+
+    async fn terminate_runtime(
+        &self,
+        chat_id: &str,
+        expected_run: Option<&str>,
+    ) -> Result<bool, EngineError> {
+        let target = lock(&self.inner.runs).get(chat_id).filter(|h| {
+            expected_run.is_none_or(|id| h.run_id == id)
+        }).map(|h| {
             (
                 h.run_id.clone(),
                 h.interrupt_token.clone(),
@@ -2074,10 +2250,14 @@ impl SessionsEngine {
         };
         // From here the runtime takes no prompt: a send now starts a fresh
         // runtime, and one that raced into this mailbox is re-dispatched.
-        {
+        let binding = {
+            let runs = lock(&self.inner.runs);
             let _order = lock(&ledger);
             retiring.store(true, std::sync::atomic::Ordering::Release);
-        }
+            runs.get(chat_id).filter(|h| h.run_id == run_id)
+                .and_then(|h| self.inner.binding_snapshot(chat_id, h, "retire"))
+        };
+        self.inner.record_binding(binding);
         // Publish cancellation BEFORE waking the harness. Otherwise a fast
         // EOF after token.cancel() can beat this watch notification and be
         // classified as an error instead of an interrupted turn.
@@ -2099,6 +2279,18 @@ impl SessionsEngine {
         Ok(true)
     }
 
+    pub(crate) fn agent_attempt(&self, chat: &str) -> Option<crate::orchestrator::wire::AgentRuntime> {
+        lock(&self.inner.runs).get(chat).filter(|h| {
+            !h.retiring.load(std::sync::atomic::Ordering::Acquire) && !*h.cancel.borrow()
+        }).and_then(|h| Some(crate::orchestrator::wire::AgentRuntime {
+            runtime_id: h.run_id.clone(), attempt: h.orch_attempt?,
+            effective_access: Some(crate::orchestrator::wire::access_level(h.runtime_config.request.access)),
+            origin_id: Some(h.orch_origin.clone()),
+            source_id: self.inner.binding_source.get().cloned(),
+            source_revision: self.inner.binding_source.get().map(|_| h.binding_revision.load(std::sync::atomic::Ordering::Acquire)),
+        }))
+    }
+
     /// Whether the chat has a run on this device (one `inject_event` can reach).
     pub fn has_run(&self, chat_id: &str) -> bool {
         lock(&self.inner.runs).contains_key(chat_id)
@@ -2117,6 +2309,17 @@ impl SessionsEngine {
     /// it unanswered — the harness answers with its own decline. Returns
     /// `false` when no such request is pending (unknown id, or the run
     /// already settled).
+    pub(crate) fn orch_native_changed_task(&self,chat:&str,key:u64,tool:&str,status:&str)->Result<(),EngineError>{
+        let Some(binding)=self.orchestrator().map(|wire|wire.native_binding(key)).transpose().map_err(|e|EngineError::Other(e.to_string()))?.flatten() else {return self.orch_native_changed(chat,tool,status);};
+        let host=self.host().ok_or_else(||EngineError::Other("native document host unavailable".into()))?;
+        let owner=host.open(&binding.chip_doc_id)?;
+        if !owner.doc().update_subagent_chip(&binding.tool_id,Some(&binding.doc_id),Some(status),None)? {return Err(EngineError::Other("native spawn chip is not saved yet".into()));}
+        let owner_bytes=host.persist_fork_snapshot(&owner)?;
+        let native=host.open(&binding.doc_id)?;
+        let native_bytes=host.persist_fork_snapshot(&native)?;
+        provider_observer::native_doc_commit(&self.inner,chat,key,&binding,&owner_bytes,&native_bytes)?;
+        Ok(())
+    }
     pub(crate) fn orch_native_changed(
         &self,
         chat: &str,
@@ -2392,15 +2595,23 @@ impl SessionsEngine {
             // again if no session resumes.
             let continuation = (tail.reached_provider && answered_in(&entries, &user_id))
                 .then(|| revival_prompt(&prompt_text));
-            lock(&self.inner.revivals).insert(
-                chat_id.clone(),
-                Revival {
-                    message_id: user_id.clone(),
-                    continuation,
-                },
-            );
+            let revival = Revival {
+                message_id: user_id.clone(),
+                continuation,
+            };
             request.resume = None; // dispatch re-injects the remembered session
             request.attachments = Vec::new();
+            if let Some(wire) = self.orch_for(&chat_id) {
+                let pending = Pending { chat: chat_id.clone(), message_id: user_id.clone(),
+                    via: Via::Dispatch { harness: harness_id, request: Box::new(request) } };
+                if let Err(err) = wire.recover_start(self, pending) {
+                    self.inner.drop_revival(&chat_id, &user_id);
+                    return Err(err);
+                }
+                lock(&self.inner.revivals).insert(chat_id.clone(), revival);
+                continue;
+            }
+            lock(&self.inner.revivals).insert(chat_id.clone(), revival);
             let sessions = self.clone();
             tokio::spawn(async move {
                 let Some(host) = sessions.inner.doc_host() else {
@@ -2414,16 +2625,10 @@ impl SessionsEngine {
                     tracing::info!(chat = %chat_id, "auto-resume skipped: the chat moved on");
                     return;
                 }
-                match host
-                    .dispatch_with_source_context(
-                        &sessions,
-                        &chat_id,
-                        harness_id,
-                        request,
-                        Some(user_id.clone()),
-                    )
-                    .await
-                {
+                let result = host.dispatch_with_source_context(
+                    &sessions, &chat_id, harness_id, request, Some(user_id.clone()),
+                ).await;
+                match result {
                     // Empty: dispatch found the chat had moved on.
                     Ok(run_id) if run_id.is_empty() => {}
                     Ok(_) => {
@@ -2636,8 +2841,13 @@ impl Inner {
     }
 
     fn publish(&self, chat_id: &str, event: &AgentEvent) -> u64 {
+        let at = lock(&self.runs).get(chat_id).and_then(|h| h.orch_attempt);
+        self.publish_at(at, chat_id, event)
+    }
+
+    fn publish_at(&self, at: Option<zeron_orch::AttemptId>, chat_id: &str, event: &AgentEvent) -> u64 {
         if let Some(wire) = self.orch.get() {
-            wire.question_event(chat_id, event);
+            wire.question_event_at(chat_id, event, at);
             wire.native_event(chat_id, event);
         }
         let seq = match self.journal.append(chat_id, event) {
@@ -2660,7 +2870,7 @@ impl Inner {
                 .load(std::sync::atomic::Ordering::Acquire)
             && let Some(wire) = self.orch.get()
         {
-            wire.provider_done(chat_id, *status, *failure);
+            if let Some(at) = at { wire.provider_done_at(chat_id, *status, *failure, at); }
         }
         if matches!(
             event,
@@ -3390,11 +3600,40 @@ impl Inner {
         }
     }
 
-    fn remove_run(&self, chat_id: &str, run_id: &str) {
-        let mut runs = lock(&self.runs);
-        if runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
-            runs.remove(chat_id);
+    fn binding_snapshot(&self, chat: &str, h: &RunHandle, operation: &'static str) -> Option<crate::orchestrator::runtime_binding::RuntimeBinding> {
+        let wire = self.orch.get()?;
+        if !wire.driver().mechanism_capture_enabled() { return None; }
+        let source_revision = self.binding_revision.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        h.binding_revision.store(source_revision, std::sync::atomic::Ordering::Release);
+        Some(crate::orchestrator::runtime_binding::RuntimeBinding {
+            chat: chat.into(), runtime_id: h.run_id.clone(),
+            run: h.orch_attempt.map(|at| at.run.ord), attempt: h.orch_attempt.map(|at| at.n),
+            effective_access: crate::orchestrator::wire::access_level(h.runtime_config.request.access),
+            origin_id: h.orch_origin.clone(), operation,
+            source_id: self.binding_source.get_or_init(new_id).clone(),
+            source_revision,
+            validated: true,
+        })
+    }
+
+    fn record_binding(&self, binding: Option<crate::orchestrator::runtime_binding::RuntimeBinding>) {
+        if let Some(binding) = binding {
+            if let Some(wire) = self.orch.get() {
+                if let Err(error) = crate::orchestrator::runtime_binding::record(wire.driver(), &binding) {
+                    tracing::warn!(chat = %binding.chat, %error, "runtime binding capture failed");
+                }
+            }
         }
+    }
+
+    fn remove_run(&self, chat_id: &str, run_id: &str) {
+        let binding = {
+            let mut runs = lock(&self.runs);
+            if runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
+                runs.remove(chat_id).and_then(|h| self.binding_snapshot(chat_id, &h, "remove"))
+            } else { None }
+        };
+        self.record_binding(binding);
     }
 }
 
@@ -3923,16 +4162,16 @@ struct SubagentSink {
 }
 
 impl SubagentSink {
-    fn flush(&mut self, device_id: &str) {
+    fn flush(&mut self, device_id: &str) -> bool {
         if !self.dirty {
-            return;
+            return false;
         }
         // An empty fold still counts as flushed: leaving dirty set would hold
         // the run loop's coalesced-commit guard open on a deadline already in
         // the past, spinning it until the subagent emits real content.
         self.dirty = false;
         if self.folded.is_empty() {
-            return;
+            return false;
         }
         let rendered = render_parts(&self.folded);
         let result = match self.entry_index {
@@ -3961,7 +4200,9 @@ impl SubagentSink {
             // Fail soft: a broken subagent doc degrades to chip-only, never
             // errors the chat.
             tracing::warn!(doc = %self.doc_id, error = %err, "subagent sink flush failed");
+            return false;
         }
+        true
     }
 
     /// A parent→subagent steer ([`AgentEvent::UserMessage`], tagged): close
@@ -4153,6 +4394,7 @@ fn finish_segment<'a>(
 /// engine-injected resumes retry — a caller-specified resume fails loudly),
 /// and whether this run already IS the retry (one attempt only).
 struct RunResumeState {
+    orch_attempt: Option<zeron_orch::AttemptId>,
     idle: bool,
     voice_active: Arc<VoiceActivity>,
     user_message_id: String,
@@ -4302,19 +4544,13 @@ fn persist_transfer_doc(inner: &Inner, chat: &str) -> Result<(), String> {
         .doc_host()
         .ok_or_else(|| "document host is unavailable".to_owned())?;
     let handle = host.open(chat).map_err(|e| e.to_string())?;
-    host.persist_fork(&handle).map_err(|e| e.to_string())?;
+    let bytes = host.persist_fork_snapshot(&handle).map_err(|e|e.to_string())?;
     if let Some(wire) = inner.orch.get().filter(|wire| wire.driver().mechanism_capture_enabled()) {
-        use sha2::{Digest, Sha256};
-        let bytes = host.docs_store().load_snapshot(chat)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "saved transfer snapshot is missing".to_owned())?;
-        let raw = loro::LoroDoc::new();
-        raw.import(&bytes).map_err(|e| e.to_string())?;
-        let saved = SessionDoc::from_doc(raw);
-        let data = crate::orchestrator::transfer::durable_fact(&saved, chat);
-        let encoded = serde_json::to_vec(&data).map_err(|e| e.to_string())?;
-        let id = format!("transfer:{chat}:{:x}", Sha256::digest(&encoded));
-        wire.driver().observe_mechanism(&id, "transfer_state", data).map_err(|e| e.to_string())?;
+        use sha2::{Digest,Sha256};
+        let data = crate::orchestrator::transfer::fact_from_snapshot(&bytes, chat)?;
+        let encoded = serde_json::to_vec(&data).map_err(|e|e.to_string())?;
+        let id = format!("transfer:{chat}:{:x}",Sha256::digest(encoded));
+        wire.driver().observe_mechanism(&id,"transfer_state",data).map_err(|e|e.to_string())?;
     }
     Ok(())
 }
@@ -4341,6 +4577,8 @@ fn bind_transfer_session(
     session_id: &str,
     cwd: &str,
     through: Option<&str>,
+    provider_event: &'static str,
+    provider_success: bool,
 ) -> Result<(), String> {
     let before = begin_transfer_operation(inner, chat)?;
     let entries = doc.read_entries().map_err(|e| e.to_string())?;
@@ -4352,7 +4590,7 @@ fn bind_transfer_session(
         &zeron_doc::ProviderSessionMark {
             session_id: session_id.to_owned(),
             cwd: cwd.to_owned(),
-            seen,
+            seen: seen.clone(),
         },
     )
     .map_err(|e| e.to_string())?;
@@ -4364,10 +4602,20 @@ fn bind_transfer_session(
             session_id,
         )?;
     }
+    if provider_event == "Done" && provider_success {
+        crate::orchestrator::transfer::confirm_delivery(doc,harness.as_str(),session_id,input_id)?;
+    } else if provider_event == "SessionStarted" && crate::orchestrator::transfer::has_delivery_packet(doc,harness.as_str(),session_id,input_id) {
+        crate::orchestrator::transfer::reject_delivery(doc,harness.as_str(),session_id,input_id)?;
+    } else {
+        crate::orchestrator::transfer::mark_uncertain_delivery(doc,harness.as_str(),session_id,input_id)?;
+    }
     persist_transfer_doc(inner, chat)?;
-    end_transfer_operation(inner, chat, before, "BindProvider", serde_json::json!({
-        "harness":harness.as_str(),"input":input_id,"session":session_id,"seen":through,"validated_local":true
-    }), true)
+    let args = if before.is_some() {
+        use sha2::{Digest,Sha256};
+        serde_json::json!({"harness":harness.as_str(),"input":input_id,"session":session_id,
+            "seen":seen,"provider_event":provider_event,"provider_success":provider_success,"cwd_digest":format!("{:x}",Sha256::digest(cwd.as_bytes())),"validated_local":true})
+    } else { serde_json::Value::Null };
+    end_transfer_operation(inner, chat, before, "BindProvider", args, true)
 }
 
 async fn drive_run(
@@ -4380,7 +4628,7 @@ async fn drive_run(
     mut controls: RunControls,
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
     mut cancel_rx: watch::Receiver<bool>,
-    resume_state: RunResumeState,
+    mut resume_state: RunResumeState,
     turn: TurnControl,
     side_chats_only: bool,
 ) {
@@ -4415,6 +4663,7 @@ async fn drive_run(
         .map(crate::plugins::Plugins::native_mcp_servers)
         .unwrap_or_default();
     if let Some(mcp) = request.mcp.as_mut() {
+        mcp.env.insert("ZERON_RUN_ID".into(), run_id.clone());
         let mut delivery = match inner.plugins.get() {
             Some(plugins) => plugins.agent_context(&chat_id, harness_id).await,
             None => Default::default(),
@@ -4687,8 +4936,22 @@ async fn drive_run(
                     .prepare_run(harness_id, &mut wire_request)
                     .await
                 {
-                    Ok(()) if resume_state.idle => harness.start_idle(wire_request, controls).await,
-                    Ok(()) => harness.run(wire_request, controls).await,
+                    Ok(()) => {
+                        let binding = {
+                            let runs = lock(&inner.runs);
+                            runs.get(&chat_id).filter(|h| h.run_id == run_id).and_then(|h| {
+                                let mut binding = inner.binding_snapshot(&chat_id, h, "issue")?;
+                                binding.effective_access = crate::orchestrator::wire::access_level(wire_request.access);
+                                Some(binding)
+                            })
+                        };
+                        inner.record_binding(binding);
+                        if resume_state.idle {
+                            harness.start_idle(wire_request, controls).await
+                        } else {
+                            harness.run(wire_request, controls).await
+                        }
+                    },
                     Err(message) => Err(zeron_harness::HarnessError::NotSignedIn(message)),
                 }
             } else {
@@ -4787,7 +5050,7 @@ async fn drive_run(
             let cut = stopped && inner.mark_shutdown_cut(&chat_id, &run_id);
             inner.remove_run(&chat_id, &run_id);
             if stopped {
-                inner.publish(
+                inner.publish_at(resume_state.orch_attempt,
                     &chat_id,
                     &AgentEvent::Done {
                         status: DoneStatus::Interrupted,
@@ -4875,13 +5138,13 @@ async fn drive_run(
             ) {
                 tracing::warn!(chat = %chat_id, error = %err, "start failure entry failed");
             }
-            inner.publish(
+            inner.publish_at(resume_state.orch_attempt,
                 &chat_id,
                 &AgentEvent::Error {
                     message: message.clone(),
                 },
             );
-            inner.publish(
+            inner.publish_at(resume_state.orch_attempt,
                 &chat_id,
                 &AgentEvent::Done {
                     status: DoneStatus::Errored,
@@ -5032,9 +5295,12 @@ async fn drive_run(
     // spawned it, and its traffic never un-parks the chat, so the idle reaper
     // measures from here as well as from the park.
     let mut last_subagent_activity: Option<tokio::time::Instant> = None;
+    let mut nested_subagents:HashMap<Vec<String>,SubagentSink>=HashMap::new();
+    let mut observed_native_paths=std::collections::HashSet::<Vec<String>>::new();
 
     let mut final_completed_turn = None;
     let mut final_outcome = None;
+    let mut provider_observer = provider_observer::Observer::open(inner.clone(), &chat_id, &run_id, resumed_session.is_some());
     let final_status = loop {
         let event: AgentEvent = if let Some(event) = prepared_events.pop_front() {
             event
@@ -5198,20 +5464,46 @@ async fn drive_run(
                 }
                 // Engine-made events are final: a `show_image` image is
                 // already in uploads, outside the generated-image intake root.
-                Some(event) = engine_rx.recv() => {
-                    prepared_events.push_back(event);
+                _ = tokio::time::sleep_until(flush_at), if dirty || subagents.values().any(|s| s.dirty) || nested_subagents.values().any(|s|s.dirty) => {
+                    #[cfg(test)]
+                    FLUSH_TICKS.with(|t| t.set(t.get() + 1));
+
+
+                    if dirty {
+                        if let Err(err) = sync_segment(
+                            doc_ref, &mut writer, &entry_id, &device_id, segment_started, &folded,
+                        ) {
+                            tracing::warn!(chat = %chat_id, error = %err, "segment sync failed");
+                        }
+                        dirty = false;
+                    }
+                    let mut native_saved=false;
+                    for sink in subagents.values_mut().chain(nested_subagents.values_mut()) {
+                        if sink.flush(&device_id) && let Some(host)=inner.doc_host() {
+                            match host.open(&sink.doc_id).and_then(|handle|host.persist_fork(&handle)) {
+                                Ok(())=>native_saved=true,
+                                Err(error)=>tracing::warn!(%error,"native coalesced save failed"),
+                            }
+                        }
+                    }
+                    if native_saved && let Some(wire)=inner.orch.get(){wire.native_documents_ready();}
                     continue;
                 }
                 next = stream.next() => match next {
-                    Some(Ok(event)) => event,
+                    Some(Ok(event)) => {
+                        provider_observer.event(&event);
+                        event
+                    },
                     // A stream error while PARKED is a post-turn child death —
                     // the turn was already finalized, so the run ends clean
                     // instead of stamping a completed session Errored.
                     Some(Err(err)) if idle_since.is_some() => {
+                        provider_observer.close(true);
                         tracing::warn!(chat = %chat_id, error = %err, "parked session child died; ending clean");
                         break SessionStatus::Idle;
                     }
                     Some(Err(err)) => {
+                        provider_observer.close(true);
                         let error = err.to_string();
                         AgentEvent::Done {
                             status: DoneStatus::Errored,
@@ -5221,42 +5513,35 @@ async fn drive_run(
                             session_id: None,
                         }
                     }
-                    None if interrupted => AgentEvent::Done {
+                    None if interrupted => {
+                        provider_observer.close(false);
+                        AgentEvent::Done {
                         status: DoneStatus::Interrupted,
                         result: None,
                         error: None,
                         session_id: None,
                         failure: None,
-                    },
+                    }},
                     // Stream end while PARKED idle: a per-turn adapter closing
                     // after its final Done — a clean end, not a crash (the turn
                     // was already finalized). Persistent adapters keep the
                     // stream open and never hit this.
-                    None if idle_since.is_some() => break SessionStatus::Idle,
-                    None => AgentEvent::Done {
+                    None if idle_since.is_some() => {
+                        provider_observer.close(false);
+                        break SessionStatus::Idle;
+                    },
+                    None => {
+                        provider_observer.close(true);
+                        AgentEvent::Done {
                         status: DoneStatus::Errored,
                         result: None,
                         error: Some("harness stream ended without Done".into()),
                         session_id: None,
                         failure: Some(zeron_proto::FailureClass::Unknown),
-                    },
+                    }},
                 },
-                _ = tokio::time::sleep_until(flush_at), if dirty || subagents.values().any(|s| s.dirty) => {
-                    #[cfg(test)]
-                    FLUSH_TICKS.with(|t| t.set(t.get() + 1));
-                    // Coalesced STREAM_COMMIT_MS tick: one doc commit per window
-                    // (parent + any dirty subagent docs).
-                    if dirty {
-                        if let Err(err) = sync_segment(
-                            doc_ref, &mut writer, &entry_id, &device_id, segment_started, &folded,
-                        ) {
-                            tracing::warn!(chat = %chat_id, error = %err, "segment sync failed");
-                        }
-                        dirty = false;
-                    }
-                    for sink in subagents.values_mut() {
-                        sink.flush(&device_id);
-                    }
+                Some(event) = engine_rx.recv() => {
+                    prepared_events.push_back(event);
                     continue;
                 }
                 // Turn-quiesce watchdog (see the knob above). Armed only when the
@@ -5349,14 +5634,36 @@ async fn drive_run(
         // subagent spoke). Handled BEFORE the parked gate so a parked
         // session's background traffic still reaches the subagent doc
         // without un-parking the chat.
+        {
+            let mut path=Vec::new();
+            let mut leaf=&event;
+            while let AgentEvent::Subagent{parent_tool_use_id,event}=leaf {path.push(parent_tool_use_id.clone());leaf=event;}
+            if let AgentEvent::ToolCall{id,call}=leaf {if call.is_subagent_spawn(){path.push(id.clone());observed_native_paths.insert(path);}}
+        }
         if let AgentEvent::Subagent {
             parent_tool_use_id,
             event: sub_event,
         } = &event
         {
-            let terminal = matches!(sub_event.as_ref(), AgentEvent::Done { .. });
-            if !terminal {
-                inner.publish(&chat_id, &event);
+            let mut native_path=vec![parent_tool_use_id.clone()];
+            let mut native_leaf=sub_event.as_ref();
+            while let AgentEvent::Subagent{parent_tool_use_id,event}=native_leaf {
+                native_path.push(parent_tool_use_id.clone());
+                native_leaf=event;
+            }
+            let terminal = matches!(native_leaf, AgentEvent::Done { .. });
+            if let Some(wire)=inner.orch.get() {
+                if let Err(error)=wire.native_activate_path(&chat_id,&[parent_tool_use_id.clone()]) {
+                    tracing::warn!(%error,"native activation failed");
+                }
+            }
+            let nested_saved=match nested_native::fold(&inner,&chat_id,&native_path,native_leaf,&mut nested_subagents,&device_id) {
+                Ok(saved)=>saved,
+                Err(error)=>{tracing::warn!(%error,"nested native fold failed");continue;}
+            };
+            if terminal && native_path.len()>1 && !nested_saved {continue;}
+            if !terminal || native_path.len() > 1 {
+                inner.publish_at(resume_state.orch_attempt, &chat_id, &event);
             }
             last_subagent_activity = Some(tokio::time::Instant::now());
             // Background subagents can outlive the turn and be the only
@@ -5555,8 +5862,8 @@ async fn drive_run(
                     );
                 }
             }
-            if terminal {
-                inner.publish(&chat_id, &event);
+            if terminal && native_path.len() == 1 {
+                inner.publish_at(resume_state.orch_attempt, &chat_id, &event);
             }
             continue;
         }
@@ -5578,7 +5885,7 @@ async fn drive_run(
             let pending = lock(&inner.runs)
                 .get(&chat_id)
                 .map(|h| h.pending_inputs.clone());
-            let known = pending.is_some_and(|p| lock(&p).contains_key(request_id));
+            let known = pending.as_ref().is_some_and(|p|current_input(p,request_id,resume_state.orch_attempt,inner.orch.get().map(Arc::as_ref),&chat_id));
             if !known {
                 tracing::warn!(
                     chat = %chat_id,
@@ -5808,17 +6115,22 @@ async fn drive_run(
             if matches!(&event, AgentEvent::Done { error: Some(e), .. } if resume_rejected(e)) {
                 inner.reject_resume(&chat_id, resumed_session.as_deref(), harness_id, &run_cwd);
                 let replacement_before = begin_transfer_operation(&inner, &chat_id);
-                if let Err(error) = replacement_before.and_then(|before| crate::orchestrator::transfer::replace_provider_session(
+                if let Err(error) = replacement_before.and_then(|before| {
+                    if let Some(session)=resumed_session.as_deref() { crate::orchestrator::transfer::reject_delivery(&doc,harness_id.as_str(),session,&resume_state.user_message_id)?; }
+                    crate::orchestrator::transfer::replace_provider_session(
                     &doc,
                     &chat_id,
                     harness_id.as_str(),
                     &resume_state.user_message_id,
                 )
                 .and_then(|()| persist_transfer_doc(&inner, &chat_id))
-                .and_then(|()| end_transfer_operation(&inner, &chat_id, before, "RejectResume", serde_json::json!({
-                    "harness":harness_id.as_str(),"input":resume_state.user_message_id,"rejected_session":resumed_session,
-                    "explicit_rejection":true,"source":crate::orchestrator::transfer::source_fact(&doc.read_entries().unwrap_or_default())
-                }), true)))
+                .and_then(|()| {
+                    let args = if before.is_some() { serde_json::json!({
+                        "chat":chat_id,"harness":harness_id.as_str(),"input":resume_state.user_message_id,"rejected_session":resumed_session,
+                        "explicit_rejection":true,"source":crate::orchestrator::transfer::source_fact(&doc.read_entries().unwrap_or_default())
+                    }) } else {serde_json::Value::Null};
+                    end_transfer_operation(&inner, &chat_id, before, "RejectResume", args, true)
+                })})
                 {
                     tracing::warn!(chat = %chat_id, %error, "replacement context snapshot save failed");
                 }
@@ -5917,7 +6229,7 @@ async fn drive_run(
             ..
         } = &event
         {
-            inner.publish(&chat_id, &event);
+            inner.publish_at(resume_state.orch_attempt, &chat_id, &event);
             // A steer boundary means a real prompt owns the turn again — its
             // Done will come; the short self-continued window stands down.
             self_continued_turn = false;
@@ -5947,6 +6259,18 @@ async fn drive_run(
                 .get(&chat_id)
                 .filter(|h| h.run_id == run_id)
                 .and_then(|h| lock(&h.routed_steers).pop_front());
+            if let Some(confirmed) = &confirmed {
+                resume_state.orch_attempt = confirmed.orch_attempt;
+                let binding = {
+                    let mut runs = lock(&inner.runs);
+                    runs.get_mut(&chat_id).filter(|h| h.run_id == run_id).and_then(|h| {
+                        h.orch_attempt = confirmed.orch_attempt;
+                        h.orch_origin = confirmed.message_id.clone();
+                        inner.binding_snapshot(&chat_id, h, "rebind")
+                    })
+                };
+                inner.record_binding(binding);
+            }
             // Consumed: a steer carrying the fork history delivered it to
             // this runtime's provider session.
             if confirmed.is_some_and(|steer| steer.fork_history)
@@ -5992,6 +6316,8 @@ async fn drive_run(
                         session_id,
                         cwd,
                         Some(&resume_state.user_message_id),
+                        "SessionStarted",
+                        true,
                     ) {
                         tracing::warn!(chat = %chat_id, %error, "context transfer session receipt save failed");
                         transfer_interrupt.cancel();
@@ -6022,7 +6348,7 @@ async fn drive_run(
             _ => {}
         }
 
-        inner.publish(&chat_id, &event);
+        inner.publish_at(resume_state.orch_attempt, &chat_id, &event);
 
         // Defensive rule from zeron: a mid-run SessionStarted re-emission (Claude SDK
         // background re-invocations) must not wipe the segment being written.
@@ -6107,6 +6433,8 @@ async fn drive_run(
                         session_id,
                         cwd,
                         None,
+                        "Done",
+                        *status == DoneStatus::Completed,
                     ) {
                         tracing::warn!(chat = %chat_id, %error, "context transfer done receipt save failed");
                     }
@@ -6237,22 +6565,33 @@ async fn drive_run(
 
     // Any subagent still streaming when the run ends freezes as-is: the
     // parent process is gone, so nothing more can arrive on this stream.
-    for (parent_id, sink) in subagents.drain() {
-        let doc_id = sink.doc_id.clone();
-        let _ = doc_ref.update_subagent_chip(&parent_id, None, Some("failed"), None);
-        if let Some(json) = sink.finish(&device_id, MessageStatus::Aborted)
-            && let Some(host) = inner.doc_host()
-        {
-            host.upload_tool_sidecar(
-                &chat_id,
-                zeron_doc::SidecarPayload {
-                    part_id: doc_id,
-                    output: Some(json),
-                    diff: None,
-                },
-            );
+    for (parent_id,sink) in subagents.drain() {
+        let _=doc_ref.update_subagent_chip(&parent_id,None,Some("failed"),None);
+        if let Err(error)=nested_native::finish(&inner,&chat_id,&[parent_id],sink,&device_id,MessageStatus::Aborted,true) {
+            tracing::warn!(%error,"native session-end save remains pending");
         }
     }
+    for (path,sink) in nested_subagents.drain() {
+        if let Err(error)=nested_native::finish(&inner,&chat_id,&path,sink,&device_id,MessageStatus::Aborted,true) {
+            tracing::warn!(%error,"nested native session-end save remains pending");
+        }
+    }
+    for path in observed_native_paths {
+        if let Some(wire)=inner.orch.get() {
+            if wire.native_path_running(&chat_id,&path).unwrap_or(false) {
+                let result=(||->Result<(),EngineError>{
+                    let host=inner.doc_host().ok_or_else(||EngineError::Other("native document host unavailable".into()))?;
+                    let doc_id=crate::orchestrator::native::doc_id_path(&chat_id,&path);
+                    let handle=host.open(&doc_id)?;
+                    wire.stage_native_terminal_path(&chat_id,&path,&doc_id,handle.doc().export_snapshot()?,true).map_err(|e|EngineError::Other(e.to_string()))?;
+                    host.persist_fork(&handle)?;
+                    Ok(())
+                })();
+                if let Err(error)=result {tracing::warn!(%error,"spawn-only native terminal remains pending");}
+            }
+        }
+    }
+
     inner.set_running_subagents(&chat_id, 0);
     // The runtime is gone, and its background processes with it.
     inner.set_background_tasks(&chat_id, Vec::new());
@@ -7720,3 +8059,11 @@ mod tests {
 #[cfg(test)]
 #[path = "sessions_transfer_tests.rs"]
 mod transfer_tests;
+
+#[cfg(test)]
+#[path = "sessions_stop_tests.rs"]
+mod stop_tests;
+
+#[cfg(test)]
+#[path="sessions_question_source_tests.rs"]
+mod question_source_tests;

@@ -262,7 +262,7 @@ pub(super) fn attach(
                             // before a successor can relabel old notifications with a new generation.
                             let closed=tokio::time::timeout(Duration::from_secs(3),async {
                                 while let Some(notification)=wire.recv().await {
-                                    if let Incoming::Notification{method,params}=notification {
+                                    if let Incoming::Notification{method,params,..}=notification {
                                         if params["threadId"]!=thread{continue;}
                                         if method=="thread/realtime/closed" && params["reason"]=="requested"{server_live.store(false,Ordering::Release);return Ok::<_,VoiceRejection>(());}
                                         if let Some(event)=normalize(&thread,generation,&mut sequence,&method,&params){let _=events.send(event);}
@@ -289,7 +289,7 @@ pub(super) fn attach(
                     }}
                 },
                 notification=wire.recv()=>match notification {
-                    Some(Incoming::Notification{method,params})=>{
+                    Some(Incoming::Notification{method,params,..})=>{
                         if method=="thread/realtime/closed" && params["threadId"]==thread {server_live.store(false,Ordering::Release);}
                         if method=="account/updated" {native=None;starting=None;external_active=false;if let Some(reply)=external_reply.take(){let _=reply.send(Err(VoiceRejection::ChatgptRequired));}if let Some(reply)=start_reply.take(){let _=reply.send(Err(VoiceRejection::ChatgptRequired));}let _=events.send(VoiceEvent::Closed{generation,reason:Some(VoiceRejection::ChatgptRequired)});continue;}
                         if params["threadId"]==thread && starting.is_some() {

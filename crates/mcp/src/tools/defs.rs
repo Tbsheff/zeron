@@ -13,7 +13,7 @@ pub(super) const ARCHIVE_CHAT: &str = "archive_chat";
 pub(super) const RESPOND_TO_INPUT: &str = "respond_to_input";
 
 fn chat_key() -> Value {
-    json!({ "type": "string", "description": "Id, id prefix, or exact title." })
+    json!({ "type": "string", "description": "Id, prefix, or exact title." })
 }
 
 fn timeout() -> Value {
@@ -65,15 +65,15 @@ fn turn_output() -> Value {
     })
 }
 
-const CATALOG_DESCRIPTION: &str = "Where chats can run. kind: self (your chat and device), devices, projects (folders on a device), harnesses (agent providers; connected ones take work from any provider), models (needs harness). Read-only. No device: the local engine. Use ids when names repeat.";
+const CATALOG_DESCRIPTION: &str = "Read where chats run: self (your chat/device), devices, projects (device folders), harnesses (providers; connected ones accept any provider), models (needs harness). No device: local engine. Use ids for repeated names.";
 
-const LIST_CHATS_DESCRIPTION: &str = "List chats, newest activity first: id, title, project, device, harness, model, status (working, awaitingInput, completed, errored, idle), parent. Read-only. Default 30, no archived. parent \"me\": the chats you created.";
+const LIST_CHATS_DESCRIPTION: &str = "List chats by newest activity: id, title, project, device, harness, model, status, parent. Default 30; excludes archived. parent \"me\": chats you created.";
 
-const READ_CHAT_DESCRIPTION: &str = "A chat's status and newest messages (tool calls one line each), plus pendingInput when it asks a question. Read-only. Default 20 messages; limit 0: status only; offset pages back. To wait for a reply, use wait_for_turn; do not poll this.";
+const READ_CHAT_DESCRIPTION: &str = "Read status, newest messages (one line per tool call), and pendingInput questions. Default 20; limit 0: status only; offset pages back. Use wait_for_turn for replies; do not poll.";
 
-const CREATE_CHATS_DESCRIPTION: &str = "Start 1-32 chats at once, a prompt each; they run in parallel. No kind: a subagent of your chat. No harness: a connected one, claude-code first. No wait: returns at once; collect replies with wait_for_turn. Results keep request order; one failure undoes nothing. Subagents cannot create chats. A repeated clientRequestId returns the first result. For chats that exist: message_chats.";
+const CREATE_CHATS_DESCRIPTION: &str = "Start 1-32 chats in parallel. Default subagent; harness connected, claude-code first. Collect with wait_for_turn. Results keep order; failures keep other chats. Subagents cannot create chats. clientRequestId retries reuse results. side: person's chat; chat: standalone. cwd: worktree. cloud: own Codex/Claude machine. Sandbox access <= yours. Existing chats: message_chats.";
 
-const MESSAGE_CHATS_DESCRIPTION: &str = "Message other Zeron chats that exist: 1-32 messages at once, from your chat. No mode: auto (starts an idle chat, steers a busy one); queue holds it. No wait: returns at once; collect with wait_for_turn. Results keep request order. A repeated clientRequestId returns the first result. Not for a chat awaiting input (respond_to_input), nor two dependent messages to one chat.";
+const MESSAGE_CHATS_DESCRIPTION: &str = "Send 1-32 messages to existing chats. Default auto starts idle chats or steers busy chats; queue holds messages. Returns at once; collect with wait_for_turn. Results keep request order. clientRequestId retries return the first result. Use respond_to_input for blocked chats. Do not batch dependent messages to one chat.";
 
 const WAIT_FOR_TURN_DESCRIPTION: &str = "Block until a chat's turn ends (completed, awaitingInput, interrupted, errored, timedOut) and return its new replies. After create_chats or message_chats it waits for that turn. Read-only. Default 600 s, max 3600. On awaitingInput, use respond_to_input. Stale or offline is not done.";
 
@@ -82,7 +82,7 @@ const INTERRUPT_CHAT_DESCRIPTION: &str =
 
 const ARCHIVE_CHAT_DESCRIPTION: &str = "Hide a chat from the sidebar; archived false restores it. Use it to tidy chats you created. Deletes nothing.";
 
-const RESPOND_TO_INPUT_DESCRIPTION: &str = "Answer the question a blocked chat asks (pendingInput in read_chat or wait_for_turn). labels: option labels, or free text for an open question. No request_id: the current question.";
+const RESPOND_TO_INPUT_DESCRIPTION: &str = "Answer pendingInput. labels: options or open text. No request_id: current question.";
 
 pub(super) fn catalog() -> Vec<ToolDef> {
     vec![
@@ -93,7 +93,7 @@ pub(super) fn catalog() -> Vec<ToolDef> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "kind": { "type": "string", "enum": ["self", "devices", "projects", "harnesses", "models"] },
+                    "kind": { "enum": ["self", "devices", "projects", "harnesses", "models"] },
                     "device": { "type": "string" },
                     "harness": { "type": "string" }
                 },
@@ -163,19 +163,19 @@ pub(super) fn catalog() -> Vec<ToolDef> {
                 "properties": {
                     "prompt": { "type": "string" },
                     "title": { "type": "string" },
-                    "kind": { "type": "string", "enum": ["subagent", "side", "chat"], "description": "side: the person's side chat. chat: standalone." },
+                    "kind": { "enum": ["subagent", "side", "chat"] },
                     "harness": { "type": "string" },
                     "model": { "type": "string" },
                     "reasoning": { "type": "string" },
                     "project": { "type": "string" },
                     "device": { "type": "string" },
                     "parent": { "type": "string" },
-                    "access": { "type": "string", "enum": ["supervised", "auto-accept-edits", "full-access"], "description": "With sandbox: capped at yours." },
-                    "sandbox": { "type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"] },
+                    "access": { "enum": ["supervised", "auto-accept-edits", "full-access"] },
+                    "sandbox": { "enum": ["read-only", "workspace-write", "danger-full-access"] },
                     "plan": { "type": "boolean" },
-                    "cwd": { "type": "string", "description": "Worktree path." },
+                    "cwd": { "type": "string" },
                     "branch": { "type": "string" },
-                    "cloud": { "type": "boolean", "description": "Own Cloud machine (Codex, Claude Code)." },
+                    "cloud": { "type": "boolean" },
                     "wait": { "type": "boolean" },
                     "timeout_secs": timeout(),
                     "clientRequestId": { "type": "string" }
@@ -195,7 +195,7 @@ pub(super) fn catalog() -> Vec<ToolDef> {
                 "properties": {
                     "chat": chat_key(),
                     "text": { "type": "string" },
-                    "mode": { "type": "string", "enum": ["auto", "run", "steer", "queue"] },
+                    "mode": { "enum": ["auto", "run", "steer", "queue"] },
                     "wait": { "type": "boolean" },
                     "timeout_secs": timeout(),
                     "clientRequestId": { "type": "string" }
@@ -243,7 +243,7 @@ pub(super) fn catalog() -> Vec<ToolDef> {
             description: RESPOND_TO_INPUT_DESCRIPTION,
             input_schema: with_chat(json!({
                 "request_id": { "type": "string" },
-                "epoch": { "type": "integer", "description": "Required for a delegated child question; copy its question epoch." },
+                "epoch": { "type": "integer", "description": "Copy the delegated question epoch." },
                 "answers": {
                     "type": "array",
                     "items": {

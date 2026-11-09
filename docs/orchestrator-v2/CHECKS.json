@@ -1,0 +1,42 @@
+{
+  "checked_on": "2026-11-09",
+  "scope": "Local tests and isolated app build only",
+  "tested_source_manifest_sha256": "04d5c3220c702aee838fd426b737dcbf0595705e95f9b12945f0765e16b0f17e",
+  "source_and_binaries_unchanged": true,
+  "tests": {
+    "orchestrator": 54,
+    "transfer": 25,
+    "runtime_integration": 68,
+    "harness_library": 547,
+    "compact_recordings": 75,
+    "strict_resume": "PASS"
+  },
+  "app": {
+    "bundle": "target/macos-dev/Zeron Dev.app",
+    "bundle_id": "sh.zeron.app.orch-v2",
+    "profile": "~/.zeron-orch-v2",
+    "ipc_port": 27872,
+    "opened": false,
+    "codesign_strict": "PASS",
+    "build_scope": "app-build-only",
+    "source_before_equals_after": true,
+    "binaries": [
+      {
+        "target": "zeron",
+        "sha256": "5f49d1942be6a440f6c6f15fd4f75e5a346bc4a3af6e508e8bfc907e0f3b45cf"
+      },
+      {
+        "target": "Zeron Engine",
+        "sha256": "b4955ab10237236550b37cc952c22161f113c87be4b055595238f1168f3b1118"
+      }
+    ]
+  },
+  "full_release": "OPEN",
+  "open": [
+    "Full runtime Composition refinement",
+    "Independent free/fair product proof",
+    "All engine guard and mutant coverage",
+    "Deployed Cloud and provider checks",
+    "Real seven-day use"
+  ]
+}

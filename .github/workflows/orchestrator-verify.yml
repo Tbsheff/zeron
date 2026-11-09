@@ -23,6 +23,9 @@ jobs:
         run: scripts/orch-setup.sh
       - name: Verify executable checks
         run: python3 scripts/orch-verify.py fast
+      - name: Seal private same-run evidence
+        if: always()
+        run: python3 scripts/orch-ci-private.py seal
       - name: Save fast receipts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -30,8 +33,13 @@ jobs:
           name: orchestrator-fast-${{ github.sha }}
           path: |
             target/orch-verify
-            !target/orch-verify/**/mechanism*.jsonl
-            !target/orch-verify/mechanism/**
+            !target/orch-verify/**/*.jsonl
+            !target/orch-verify/**/mechanism*/**
+            !target/orch-verify/**/*private*/**
+            !target/orch-verify/**/*.tla
+            !target/orch-verify/**/*.cfg
+            !target/orch-verify/**/context*.json
+            !target/orch-verify/**/provenance*.json
             !target/orch-verify/**/dogfood/**
   orchestrator-verify:
     # This separate acceptance check stays red while the dogfood week is open.
@@ -50,6 +58,8 @@ jobs:
         with:
           name: orchestrator-fast-${{ github.sha }}
           path: target/orch-verify
+      - name: Restore private same-run evidence
+        run: python3 scripts/orch-ci-private.py restore
       - name: Require release evidence
         run: python3 scripts/orch-release-check.py
       - name: Save release receipts
@@ -57,4 +67,12 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: orchestrator-release-${{ github.sha }}
-          path: target/orch-verify/release
+          path: |
+            target/orch-verify/release
+            !target/orch-verify/**/*.jsonl
+            !target/orch-verify/**/mechanism*/**
+            !target/orch-verify/**/*private*/**
+            !target/orch-verify/**/*.tla
+            !target/orch-verify/**/*.cfg
+            !target/orch-verify/**/context*.json
+            !target/orch-verify/**/provenance*.json

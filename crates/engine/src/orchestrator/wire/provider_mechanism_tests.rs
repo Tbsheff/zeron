@@ -73,6 +73,10 @@ fn export(wire: &OrchWire, name: &str) {
         std::fs::create_dir_all(&dir).unwrap();
         let rows = wire.driver.mechanism_lines().unwrap();
         std::fs::write(dir.join("mechanism-test.jsonl"), rows.join("\n") + "\n").unwrap();
+        std::fs::write(dir.join("capture.json"), serde_json::to_vec(&serde_json::json!({
+            "test_name":std::thread::current().name().expect("test thread name"),
+            "devices":["mechanism-test"], "filenames":["mechanism-test.jsonl"], "capture":"present"
+        })).unwrap()).unwrap();
     }
 }
 
@@ -208,4 +212,25 @@ async fn provider_start_intent_without_journal_replaces_attempt_instead_of_repla
     let th = reopened.thread_state("synthetic-chat").unwrap();
     assert!(th.attempt.n > at.n || !th.is_live());
     assert!(reopened.driver.pending().unwrap().iter().filter_map(|r| match &r.effect { Effect::StartAttempt { attempt, .. } => Some(attempt.n), _ => None }).all(|n| n > at.n));
+}
+
+#[tokio::test]
+async fn complete_failure_releases_claim_and_retries_without_second_start() {
+    let (dir, wire, engine, p, _) = fixture(false, true, false);
+    wire.stash(1, &p).unwrap();
+    let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+    store.transact(|tx| {
+        tx.execute_batch("CREATE TRIGGER fail_complete BEFORE UPDATE OF status ON orch_outbox WHEN NEW.status='done' BEGIN SELECT RAISE(FAIL,'complete fault'); END;")?;
+        Ok::<_, DriverError>(())
+    }).unwrap();
+    assert!(wire.run_effects(&engine, None).await.iter().any(Result::is_err));
+    assert_eq!(engine.calls.load(Ordering::SeqCst), 1);
+    assert!(!lock(&wire.claimed).contains("fixture-start#0"));
+    store.transact(|tx| {
+        tx.execute_batch("DROP TRIGGER fail_complete")?;
+        Ok::<_, DriverError>(())
+    }).unwrap();
+    assert!(wire.run_effects(&engine, None).await.iter().all(Result::is_ok));
+    assert_eq!(engine.calls.load(Ordering::SeqCst), 1);
+    assert!(!wire.driver.pending().unwrap().iter().any(|r| r.effect_id == "fixture-start#0"));
 }

@@ -162,6 +162,14 @@ pub fn pending_outbox(tx: &Transaction<'_>) -> Result<Vec<OutboxRow>, DriverErro
     outbox_rows(tx, true)
 }
 
+pub fn effect_pending(tx: &Transaction<'_>, effect_id: &str) -> Result<bool, DriverError> {
+    Ok(tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM orch_outbox WHERE effect_id = ?1 AND status = 'pending')",
+        params![effect_id],
+        |row| row.get(0),
+    )?)
+}
+
 pub fn all_outbox(tx: &Transaction<'_>) -> Result<Vec<OutboxRow>, DriverError> {
     outbox_rows(tx, false)
 }

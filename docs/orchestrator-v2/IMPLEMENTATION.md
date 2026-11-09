@@ -20,6 +20,20 @@ not prove a deployed Cloud service or a real provider connection. The desktop
 captures show synthetic saved parts through the app's transcript. They do not
 prove the whole task flow through the UI.
 
+## Record local checks
+
+Checked on 2026-11-09. Passed 54 orchestrator unit tests, 25 transfer tests,
+and all 68 runtime integration tests after the final boot fixes. Passed all
+547 harness library tests, strict resume, and compact replay of 75 recordings.
+The harness receipt uses the same unchanged harness source. These tests use
+provider stand-ins; they do not prove deployed provider or Cloud behavior.
+
+The final engine gate kept its source and binary hashes unchanged. Its source
+manifest is `04d5c3220c702aee838fd426b737dcbf0595705e95f9b12945f0765e16b0f17e`.
+The isolated app built and passed the signature check. It has not been opened.
+See `CHECKS.json` for the build and test receipt summary. The full release gate
+remains open.
+
 ## Keep proof scope clear
 
 - Check all 73,134 transitions in the saved delegation graph through the Rust
@@ -40,6 +54,10 @@ limits, and [remaining conformance work](../orchestrator-v2-conformance-gap.md)
 for the full trace contract. The approved source documents and their hashes
 remain unchanged in this directory.
 
+See [the isolated build guide](TRY.md) for the staging profile, local port and
+manual use cases. Use that profile for the real-use window; automated trials
+alone do not start it.
+
 ## Keep release blocked
 
 The fast job can pass while the separate acceptance job stays red. The latter
@@ -51,6 +69,12 @@ The local runner is `zeron-orchestrator-mac`, with the `orchestrator-verify`
 label. The user launchd job `com.zeron.orchestrator-nightly` is set for 02:10
 local time. It uses a separate checkout and only fast-forwards the approved
 branch. Runner setup does not count as a successful workflow or nightly run.
+The first manual job passed runner, checkout and tool setup. It passed the
+formal, reducer, selected Kani, S3 projection and trace merge checks at
+`1f85467b`. Integration and capture inventory failures keep that run red;
+the next source batch fixes them. Strict branch checks require
+`orchestrator-fast` and `orchestrator-verify`. The owner can still push
+development checkpoints; that bypass does not approve a release.
 
 The Mac workflow accepts branch pushes and manual runs. It has no pull-request
 trigger: a fork can change the workflow file used by that event. See
@@ -65,3 +89,68 @@ must then stop with a visible reason. The older budget text that skips large
 items applies only when the required anchors remain intact. This follows the
 checked ContextTransfer rules and L5a; it does not permit a provider to run with
 silently missing context.
+
+**R44: Keep reporting loss separate from process death.** A closed provider
+stream proves that this connection cannot report more results. It does not
+prove that the provider process died. The new operational native model keeps
+those facts separate and binds task closure to its source runtime. It checks
+root ownership, orphan closure, background lifetime and saved task documents.
+The old process model and its results remain separate. The new product and
+its full refinement are still being checked. Concurrent old and new runtime
+ownership remains an unproved candidate; normal replacement waits for teardown.
+
+**R45: Buffer a terminal event before closing its run.** A provider can report
+completion while a wait call is still open. The engine first saves that event,
+abandons the open wait, then ingests the terminal event. Permit observation
+into the inbox while the wait is open. Keep the guard that prevents the run
+from closing until the wait clears. The model update and its checks are in
+progress.
+
+**R46: Bind calls to the issued attempt.** A live logical run alone does not
+authorize an old MCP process. Require its actual runtime id, accepted attempt
+and current access. Install, request issue, reconfigure and accepted steer are
+distinct events. A real tool call can occur inside `Harness::run` before that
+call returns its stream. That call does not prove provider context acceptance.
+The operational model must permit this order without inventing that proof.
+
+**R47: Recover uncertain context with a fresh provider identity.** Providers
+report session identity at different points in prompt submission. Neither a
+missing nor a present `SessionStarted` proves context acceptance. Keep an
+unconfirmed packet intact, retain external source ranges outside the target
+transcript, and retry uncertain delivery with a fresh provider identity. Keep
+same-input packet bytes stable. Apply one total budget to recovered and new
+ranges. A saved budget failure must keep failing on retry. Only a saved
+successful-turn delivery receipt confirms delivery under the adapter contract;
+it does not prove what an opaque language model retained internally.
+
+**R48: Prepare context after the logical run starts.** The reducer starts a
+logical run before the engine selects its provider and prepares its context
+packet. Model these as separate steps. A prepared request records its provider,
+source ranges and packet. A saved successful-turn delivery receipt confirms
+delivery under the adapter contract. The logical terminal can arrive first; a
+failed confirmation save must leave delivery uncertain. Stream life and session
+identity do not prove that context was accepted. Keep the earlier
+ContextTransfer proof separate from this operational model. Its joint safety,
+progress and actual trace checks remain in progress.
+
+**R49: Recheck effect ownership and retire observed effects atomically.** An old
+pending snapshot must not execute an effect that another worker has completed.
+Check its durable state after claiming it. Keep per-thread order while an older
+effect remains pending. Publish and retire an already-satisfied interrupt effect
+in one transaction; separate cleanup can let a claimed interrupt stop a newer
+runtime. Boot recovery uses the same host, journal, attempt, input and Stop
+checks as normal dispatch. Register a lost attempt before adding its revival
+marker; that marker must not make recovery reject itself as an existing runtime.
+Keep workers and direct drains blocked until recovery succeeds. A failed scan
+must keep that gate closed. The boot and effect regression tests pass.
+
+**R50: Pin a question before its callback is queued.** A provider request must
+keep the source attempt that issued it. An async approval hook or spawned task
+must not let it use a later turn. Accepted steers need an ordered source cursor;
+the engine stream can consume their notices later. Record the read position of
+both provider requests and successful steering replies before they enter
+separate queues. Keep requests on the correct side of that reply. Validate the
+pinned attempt again when applying the question. This proves order against the
+adapter acknowledgment; it does not prove an opaque provider-internal turn
+identity. The harness order checks and engine source-binding regressions pass.
+These checks do not close full implementation refinement.

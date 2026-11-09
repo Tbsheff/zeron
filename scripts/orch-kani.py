@@ -18,8 +18,12 @@ FAST = ['s1_restart_bound3', 's3_stop_bound3', 's5a_narrow']
 
 def source_digest():
     digest = hashlib.sha256()
-    for p in sorted((ROOT/'crates/orch/src').rglob('*.rs')) + [ROOT/'Cargo.lock', ROOT/'rust-toolchain.toml']:
-        digest.update(str(p.relative_to(ROOT)).encode()+b'\0'+p.read_bytes())
+    files = set((ROOT/'crates/orch/src').rglob('*.rs')) | set((ROOT/'crates').rglob('Cargo.toml'))
+    files.update([ROOT/'Cargo.toml', ROOT/'Cargo.lock', ROOT/'rust-toolchain.toml', ROOT/'scripts/orch-kani.py', ROOT/'scripts/orch-verify.py'])
+    files.update(p for p in (ROOT/'.cargo').rglob('*') if p.is_file())
+    for p in sorted(files):
+        if p.is_file():
+            digest.update(str(p.relative_to(ROOT)).encode()+b'\0'+p.read_bytes())
     return digest.hexdigest()
 
 

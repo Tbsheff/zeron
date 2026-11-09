@@ -1,9 +1,12 @@
+pub(crate) mod capabilities;
+pub mod command;
 pub mod driver;
 pub mod fake;
 pub mod mechanism;
 pub mod native;
 pub mod placement;
 pub mod questions;
+pub(crate) mod runtime_binding;
 mod sink;
 pub mod store;
 pub mod trace;
@@ -11,10 +14,13 @@ pub mod transfer;
 pub mod wire;
 
 #[cfg(test)]
+mod mechanism_tests;
+#[cfg(test)]
 mod faults_tests;
 #[cfg(test)]
 mod trace_tests;
 
+pub use command::{CommandDisposition, CommandReceipt, CommandRefusal, CommandSource};
 pub use driver::{ApplyResult, Driver, EffectSink, FaultPoint, SinkError, effect_id};
 pub use fake::RecordingSink;
 pub use store::{Applied, OutboxRow};

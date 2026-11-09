@@ -1,9 +1,9 @@
 use super::{DriverError, store};
-use rusqlite::{Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 
 pub fn init(tx: &Transaction<'_>) -> Result<(), DriverError> {
-    tx.execute_batch("CREATE TABLE IF NOT EXISTS orch_mechanism(seq INTEGER PRIMARY KEY,line TEXT NOT NULL); CREATE TABLE IF NOT EXISTS orch_mechanism_facts(id TEXT PRIMARY KEY,kind TEXT NOT NULL,data TEXT NOT NULL);")?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS orch_mechanism(seq INTEGER PRIMARY KEY,line TEXT NOT NULL); CREATE TABLE IF NOT EXISTS orch_mechanism_facts(id TEXT PRIMARY KEY,kind TEXT NOT NULL,data TEXT NOT NULL); CREATE TABLE IF NOT EXISTS orch_mechanism_effect_origins(effect_id TEXT PRIMARY KEY,seq INTEGER NOT NULL);")?;
     Ok(())
 }
 
@@ -12,6 +12,18 @@ pub fn lines(tx: &Transaction<'_>) -> Result<Vec<String>, DriverError> {
     Ok(stmt
         .query_map([], |r| r.get(0))?
         .collect::<Result<Vec<_>, _>>()?)
+}
+
+fn next_sequence(tx: &Transaction<'_>) -> Result<i64, DriverError> {
+    Ok(tx.query_row("SELECT COALESCE(MAX(seq)+1,0) FROM orch_mechanism", [], |row| row.get(0))?)
+}
+
+pub fn begin_capture_group(tx: &Transaction<'_>, dev: &str) -> Result<(), DriverError> {
+    store::put_meta(tx, "mechanism_transaction", &format!("sqlite:{dev}:{}", next_sequence(tx)?))
+}
+
+pub fn end_capture_group(tx: &Transaction<'_>) -> Result<(), DriverError> {
+    store::delete_meta(tx, "mechanism_transaction")
 }
 
 pub fn fact(tx: &Transaction<'_>, id: &str, kind: &str, data: &Value) -> Result<(), DriverError> {
@@ -46,11 +58,7 @@ pub fn capture(
     action: &str,
     args: Value,
 ) -> Result<(), DriverError> {
-    let seq: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(seq)+1,0) FROM orch_mechanism",
-        [],
-        |r| r.get(0),
-    )?;
+    let seq = next_sequence(tx)?;
     let mut stmt = tx.prepare("SELECT key,seq,result FROM orch_receipts ORDER BY seq,key")?;
     let raw = stmt
         .query_map([], |r| {
@@ -103,7 +111,20 @@ pub fn capture(
             Ok(json!({"id":id,"kind":kind,"data":serde_json::from_str::<Value>(&data)?}))
         })
         .collect::<Result<Vec<_>, serde_json::Error>>()?;
-    let row = json!({"v":2,"dev":dev,"seq":seq,"action":action,"args":args,"origin":{"kind":"sqlite","commit":format!("sqlite:{dev}:{seq}"),"parents":if seq > 0 {vec![format!("sqlite:{dev}:{}",seq-1)]} else {Vec::<String>::new()}},"snapshot":{"state":store::load_state(tx)?,"receipts":receipts,"outbox":store::all_outbox(tx)?,"processed":processed,"threads":threads,"facts":facts}});
+    let outbox = store::all_outbox(tx)?;
+    let mut parents = if seq > 0 { vec![format!("sqlite:{dev}:{}", seq-1)] } else { Vec::new() };
+    if let Some(effect) = args.get("effect_id").and_then(Value::as_str) {
+        let producer: Option<i64> = tx.query_row("SELECT seq FROM orch_mechanism_effect_origins WHERE effect_id=?1", [effect], |r| r.get(0)).optional()?;
+        if let Some(producer) = producer {
+            let parent = format!("sqlite:{dev}:{producer}");
+            if !parents.contains(&parent) { parents.push(parent); }
+        }
+    }
+    for effect in &outbox {
+        tx.execute("INSERT OR IGNORE INTO orch_mechanism_effect_origins VALUES(?1,?2)", params![effect.effect_id,seq])?;
+    }
+    let transaction = store::meta(tx, "mechanism_transaction")?.unwrap_or_else(|| format!("sqlite:{dev}:{seq}"));
+    let row = json!({"v":2,"dev":dev,"seq":seq,"action":action,"args":args,"origin":{"kind":"sqlite","commit":format!("sqlite:{dev}:{seq}"),"transaction":transaction,"parents":parents},"snapshot":{"state":store::load_state(tx)?,"receipts":receipts,"outbox":outbox,"processed":processed,"command_receipts":super::command::all(tx)?,"threads":threads,"facts":facts}});
     tx.execute(
         "INSERT INTO orch_mechanism VALUES(?1,?2)",
         params![seq, serde_json::to_string(&row)?],

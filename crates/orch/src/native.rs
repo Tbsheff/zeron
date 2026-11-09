@@ -13,6 +13,8 @@ pub enum NativeStatus {
 pub struct NativeTask {
     pub attempt: AttemptId,
     pub background: bool,
+    #[serde(default)]
+    pub ancestor: Option<u64>,
     pub status: NativeStatus,
     pub delivery: Delivery,
     pub generation: u32,
@@ -23,6 +25,12 @@ pub enum NativeEvent {
     Start {
         parent: ThreadId,
         key: u64,
+        background: bool,
+    },
+    StartNested {
+        parent: ThreadId,
+        key: u64,
+        ancestor: u64,
         background: bool,
     },
     End {
@@ -48,6 +56,7 @@ impl NativeEvent {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Start { .. } => "NativeStart",
+            Self::StartNested { .. } => "NativeStartNested",
             Self::End { .. } => "NativeEnd",
             Self::Claim { .. } => "NativeClaim",
             Self::Delivered { .. } => "NativeDelivered",
@@ -73,6 +82,40 @@ pub(crate) fn apply(s: &mut OrchState, e: NativeEvent, fx: &mut Vec<Effect>) -> 
                 NativeTask {
                     attempt,
                     background,
+                    ancestor: None,
+                    status: NativeStatus::Running,
+                    delivery: Delivery::Pending,
+                    generation: 0,
+                },
+            );
+            fx.push(Effect::NativeChanged { parent, key });
+        }
+        NativeEvent::StartNested {
+            parent,
+            key,
+            ancestor,
+            background,
+        } => {
+            if s.natives.contains_key(&(parent, key)) {
+                return Ok(());
+            }
+            ensure(key != ancestor, Reject::NotKid)?;
+            let owner = *s.natives.get(&(parent, ancestor)).ok_or(Reject::NotKid)?;
+            ensure(owner.status == NativeStatus::Running, Reject::NotLive)?;
+            let root = s.thread(parent)?;
+            ensure(
+                owner.background
+                    || (root.is_live()
+                        && !root.attempt.emitted
+                        && root.attempt_id() == owner.attempt),
+                Reject::NotLive,
+            )?;
+            s.natives.insert(
+                (parent, key),
+                NativeTask {
+                    attempt: owner.attempt,
+                    background: background || owner.background,
+                    ancestor: Some(ancestor),
                     status: NativeStatus::Running,
                     delivery: Delivery::Pending,
                     generation: 0,
@@ -151,9 +194,31 @@ pub(crate) fn reconcile(s: &mut OrchState, fx: &mut Vec<Effect>) {
     for ((parent, key), n) in s.natives.iter() {
         if n.status == NativeStatus::Running
             && !n.background
-            && s.threads
+            && (s
+                .threads
                 .get(parent)
                 .is_none_or(|th| !th.is_live() || th.attempt_id() != n.attempt)
+                || {
+                    let mut ancestor = n.ancestor;
+                    let mut invalid = false;
+                    let mut depth = 0;
+                    while let Some(id) = ancestor {
+                        depth += 1;
+                        match s.natives.get(&(*parent, id)) {
+                            Some(owner)
+                                if owner.status == NativeStatus::Running
+                                    && depth <= s.natives.len() =>
+                            {
+                                ancestor = owner.ancestor
+                            }
+                            _ => {
+                                invalid = true;
+                                break;
+                            }
+                        }
+                    }
+                    invalid
+                })
         {
             changed.push((*parent, *key));
         }

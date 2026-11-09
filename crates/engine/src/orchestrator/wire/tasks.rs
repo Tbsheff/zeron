@@ -254,7 +254,11 @@ impl OrchWire {
             access: access_level(access),
         });
         let key = format!("narrow:{chat}:{}", self.driver.bump("narrows")?);
-        self.driver.apply_if(&key, ev, &enabled(ev))?;
+        if let Some(result) = self.driver.apply_if(&key, ev, &enabled(ev))?
+            && matches!(result.applied, Applied::Accepted { .. })
+        {
+            self.record_local_ceiling(chat, access_level(access), &key)?;
+        }
         self.wake.notify_one();
         Ok(())
     }
@@ -282,12 +286,13 @@ impl OrchWire {
         let key = format!("mcp:{origin}:followup:{request_id}");
         let fx = {
             let _g = lock(&self.gate);
+            self.admit_agent(engine, origin)?;
             if self.driver.has_receipt(&key)? {
                 let first = self
                     .driver
                     .meta(&format!("task:{key}"))?
                     .ok_or_else(|| err("orchestration_error", "No task for receipt."))?;
-                return self.task_status(engine, origin, &first);
+                return self.task_status_view(engine, origin, &first);
             }
             let (p, c) = self.ids(origin, child)?;
             let state = self.driver.state()?;
@@ -334,6 +339,48 @@ impl OrchWire {
         self.view_of(engine, origin, child, false)
     }
 
+    pub(crate) fn with_agent_admission<T>(
+        &self,
+        engine: &dyn RunEngine,
+        chat: &str,
+        on_error: impl FnOnce(OrchError) -> T,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let _g = lock(&self.gate);
+        match self.admit_agent(engine, chat) {
+            Ok(()) => f(),
+            Err(error) => on_error(error),
+        }
+    }
+
+    pub(crate) fn admit_agent(&self, engine: &dyn RunEngine, chat: &str) -> Result<(), OrchError> {
+        if !matches!(zeron_rpc::caller(), zeron_rpc::Caller::Agent { .. }) {
+            return Ok(());
+        }
+        let current = self.thread_state(chat).filter(|th| th.is_live()).map(|th| th.attempt_id());
+        let handle = engine.agent_attempt(chat);
+        let claimed = zeron_rpc::agent_run();
+        let accepted = handle.as_ref().is_some_and(|handle| {
+            claimed.as_ref() == Some(&handle.runtime_id) && current == Some(handle.attempt)
+        });
+        if self.driver.mechanism_capture_enabled() {
+            self.driver.observe_mechanism(&format!("agent-admission:{}", uuid::Uuid::new_v4()), "agent_admission", serde_json::json!({
+                "chat":chat,"tool_call_id":null,"runtime_id":claimed,
+                "provider_run_id":handle.as_ref().map(|h| &h.runtime_id),
+                "handle_source_id":handle.as_ref().and_then(|h|h.source_id.as_deref()),
+                "handle_source_revision":handle.as_ref().and_then(|h|h.source_revision),
+                "handle_run":handle.as_ref().map(|h|h.attempt.run.ord),"handle_attempt":handle.as_ref().map(|h|h.attempt.n),
+                "current_run":current.map(|at|at.run.ord),"current_attempt":current.map(|at|at.n),
+                "effective_access":handle.as_ref().and_then(|h|h.effective_access),"origin_id":handle.as_ref().and_then(|h|h.origin_id.as_deref()),
+                "disposition":if accepted {"accepted"} else {"refused"},"reason":if accepted {"current_runtime_attempt"} else {"runtime_attempt_mismatch"},"validated":true
+            }))?;
+        }
+        if !accepted {
+            return Err(err("parent_not_active", "This MCP handle does not own the current attempt."));
+        }
+        Ok(())
+    }
+
     pub async fn delegate(
         &self,
         engine: &dyn RunEngine,
@@ -344,7 +391,7 @@ impl OrchWire {
         }
         let wait = req.mode.as_deref() == Some("wait");
         self.validate_placement(engine, &req)?;
-        let (child, fx) = self.place(&req, wait).map_err(|e| match e {
+        let (child, fx) = self.place(engine, &req, wait).map_err(|e| match e {
             PlaceError::Refused(e) => e,
             PlaceError::Driver(e) => self.fail(e).into(),
         })?;
@@ -357,7 +404,7 @@ impl OrchWire {
                 .unwrap_or(&req.child.chat_id);
             let key = format!("mcp:{}:delegate:{id}", req.origin_chat_id);
             if let Some(task) = self.driver.meta(&format!("task:{key}"))? {
-                return self.task_status(engine, &req.origin_chat_id, &task);
+                return self.task_status_view(engine, &req.origin_chat_id, &task);
             }
             return self.view_of(engine, &req.origin_chat_id, &child, false);
         }
@@ -368,12 +415,14 @@ impl OrchWire {
 
     fn place(
         &self,
+        engine: &dyn RunEngine,
         req: &DelegateRequest,
         wait: bool,
     ) -> Result<(String, Vec<String>), PlaceError> {
         self.alive()?;
         let _g = lock(&self.gate);
         let origin = &req.origin_chat_id;
+        self.admit_agent(engine, origin).map_err(PlaceError::Refused)?;
         let id = req
             .client_request_id
             .as_deref()
@@ -477,13 +526,17 @@ impl OrchWire {
                 if settled && waiting && !engine.reports_mcp_results(origin) {
                     self.apply_wait(origin, child, guard.attempt, "return")?;
                 }
-                return self.view_of(engine, origin, child, false);
+                let view = self.view_of(engine, origin, child, false)?;
+                self.record_tool_reply(origin, "delegate_task", &view)?;
+                return Ok(view);
             }
             let now = tokio::time::Instant::now();
             if now >= deadline {
                 guard.armed = false;
                 self.apply_wait(origin, child, guard.attempt, "timeout")?;
-                return self.view_of(engine, origin, child, true);
+                let view = self.view_of(engine, origin, child, true)?;
+                self.record_tool_reply(origin, "delegate_task", &view)?;
+                return Ok(view);
             }
             let nap = WAIT_POLL.min(deadline - now);
             let _ = tokio::time::timeout(nap, self.task_events.notified()).await;
@@ -569,7 +622,22 @@ impl OrchWire {
         origin: &str,
         task_id: &str,
     ) -> Result<TaskView, OrchError> {
-        if task_id.contains("--sub--") {
+        {
+            let _g = lock(&self.gate);
+            self.admit_agent(engine, origin)?;
+        }
+        let view = self.task_status_view(engine, origin, task_id)?;
+        self.record_tool_reply(origin, "task_status", &view)?;
+        Ok(view)
+    }
+
+    fn task_status_view(
+        &self,
+        engine: &dyn RunEngine,
+        origin: &str,
+        task_id: &str,
+    ) -> Result<TaskView, OrchError> {
+        if task_id.contains("--sub--") || task_id.contains("--native-path--") {
             return self.native_view(engine, origin, task_id);
         }
         let (child, _) =
@@ -587,7 +655,7 @@ impl OrchWire {
                 Some("interrupted") => "interrupted",
                 _ => "completed",
             };
-            return Ok(TaskView {
+            let archived = TaskView {
                 origin: "app",
                 background: None,
                 task_id: task_id.to_owned(),
@@ -598,7 +666,8 @@ impl OrchWire {
                 question: None,
                 wait_timed_out: false,
                 next: None,
-            });
+            };
+            return Ok(archived);
         }
         Ok(view)
     }
@@ -610,7 +679,7 @@ impl OrchWire {
         task_id: &str,
         request: Option<&str>,
     ) -> Result<(String, &'static str), OrchError> {
-        if task_id.contains("--sub--") {
+        if task_id.contains("--sub--") || task_id.contains("--native-path--") {
             return Err(err(
                 "task_not_cancellable",
                 "The harness owns native task cancellation.",
@@ -619,20 +688,23 @@ impl OrchWire {
         let key = format!("mcp:{origin}:cancel:{}", request.unwrap_or(task_id));
         let view = {
             let _g = lock(&self.gate);
+            self.admit_agent(engine, origin)?;
             let target = self
                 .driver
                 .meta(&format!("target:{key}"))?
                 .unwrap_or_else(|| task_id.to_owned());
-            let view = self.task_status(engine, origin, &target)?;
+            let view = self.task_status_view(engine, origin, &target)?;
             self.driver.put_meta(&format!("target:{key}"), &target)?;
             view
         };
         if !matches!(view.status, "running" | "queued" | "waiting") {
+            self.record_tool_reply(origin, "task_cancel", &view)?;
             return Ok((view.task_id, view.status));
         }
         let (_, c) = self.ids(origin, &view.child_thread_id)?;
         let fx = {
             let _g = lock(&self.gate);
+            self.admit_agent(engine, origin)?;
             let r = self
                 .driver
                 .apply_command(
@@ -649,6 +721,7 @@ impl OrchWire {
         };
         let _ = self.run_effects(engine, Some(&fx)).await;
         self.wake.notify_one();
+        self.record_tool_reply(origin, "task_cancel", &view)?;
         Ok((view.task_id, "cancel_requested"))
     }
 
@@ -718,7 +791,11 @@ impl OrchWire {
                         tool,
                         input,
                     },
-            } if server == "zeron" && is_task_tool(tool) => {
+            } if server == "zeron"
+                && (is_task_tool(tool)
+                    || (self.driver.mechanism_capture_enabled()
+                        && tool.ends_with("task_cancel"))) =>
+            {
                 if let Some(th) = self
                     .thread_state(chat)
                     .filter(|th| th.is_live() && !th.attempt.emitted)
@@ -730,6 +807,16 @@ impl OrchWire {
                 }
             }
             AgentEvent::ToolResult { id, is_error, .. } => {
+                if !is_error {
+                    if let Some(th) = self
+                        .thread_state(chat)
+                        .filter(|th| th.is_live() && !th.attempt.emitted)
+                    {
+                        if let Err(error) = self.record_tool_observed(chat, th.attempt_id(), id) {
+                            tracing::warn!(chat, %error, "tool observation capture failed");
+                        }
+                    }
+                }
                 let call = lock(&self.calls).remove(&(chat.to_owned(), id.clone()));
                 if let Some((at, tool, input)) = call.filter(|(at, _, _)| {
                     !is_error
@@ -752,6 +839,9 @@ impl OrchWire {
         tool: &str,
         input: Option<&serde_json::Value>,
     ) -> Result<(), DriverError> {
+        if tool.ends_with("task_cancel") {
+            return Ok(());
+        }
         let field = |k: &str| input.and_then(|i| i.get(k)).and_then(|v| v.as_str());
         if tool.ends_with("delegate_task") && field("mode") == Some("wait") {
             let run = self.thread_state(chat).map_or(0, |th| th.rord());
@@ -1074,6 +1164,8 @@ impl OrchWire {
         engine: &dyn RunEngine,
         origin: &str,
     ) -> Result<Vec<TaskView>, OrchError> {
+        let _g = lock(&self.gate);
+        self.admit_agent(engine, origin)?;
         let Some(parent) = self.known_thread(origin)? else {
             return Ok(Vec::new());
         };
@@ -1091,6 +1183,9 @@ impl OrchWire {
             if let Some(id) = native["taskId"].as_str() {
                 views.push(self.native_view(engine, origin, id)?);
             }
+        }
+        for view in &views {
+            self.record_tool_reply(origin, "task_status", view)?;
         }
         Ok(views)
     }
@@ -1126,5 +1221,196 @@ impl OrchWire {
             wait_timed_out: false,
             next: None,
         })
+    }
+}
+
+impl OrchWire {
+    fn record_tool_reply(
+        &self,
+        parent: &str,
+        tool: &str,
+        view: &TaskView,
+    ) -> Result<(), DriverError> {
+        if !self.driver.mechanism_capture_enabled() {
+            return Ok(());
+        }
+        let Some(th) = self
+            .thread_state(parent)
+            .filter(|th| th.is_live() && !th.attempt.emitted)
+        else {
+            return Ok(());
+        };
+        let Some((_, task_run)) = split_task(&view.task_id) else {
+            return Ok(());
+        };
+        let at = th.attempt_id();
+        let calls: Vec<_> = lock(&self.calls)
+            .iter()
+            .filter(|((chat, _), (attempt, name, input))| {
+                if chat != parent || *attempt != at || !name.ends_with(tool) {
+                    return false;
+                }
+                if tool == "delegate_task" {
+                    let request = input
+                        .as_ref()
+                        .and_then(|v| v.get("clientRequestId"))
+                        .and_then(|v| v.as_str());
+                    request.is_some_and(|request| {
+                        self.driver
+                            .meta(&format!("crid:mcp:{parent}:delegate:{request}"))
+                            .ok()
+                            .flatten()
+                            .as_deref()
+                            == Some(view.child_thread_id.as_str())
+                    })
+                } else {
+                    input
+                        .as_ref()
+                        .and_then(|v| v.get("taskId"))
+                        .and_then(|v| v.as_str())
+                        .map_or(tool == "task_status", |id| id == view.task_id)
+                }
+            })
+            .map(|((_, id), _)| id.clone())
+            .collect();
+        if calls.len() != 1 {
+            return Ok(());
+        }
+        let reply_id = &calls[0];
+        let data = serde_json::json!({"parent":parent,"parent_run":at.run.ord,"parent_attempt":at.n,"child":view.child_thread_id,"task_run":task_run,"reply_id":reply_id,"tool":tool});
+        let key = format!("tool-reply:{parent}:{}:{}:{reply_id}", at.run.ord, at.n);
+        let mut replies: Vec<serde_json::Value> = self
+            .driver
+            .meta(&key)?
+            .map(|raw| serde_json::from_str(&raw))
+            .transpose()?
+            .unwrap_or_default();
+        if !replies.contains(&data) {
+            replies.push(data.clone());
+        }
+        self.driver
+            .put_meta(&key, &serde_json::to_string(&replies)?)?;
+        self.driver.observe_mechanism(
+            &format!("{key}:{}:{task_run}", view.child_thread_id),
+            "tool_reply",
+            data,
+        )
+    }
+    fn record_tool_observed(
+        &self,
+        parent: &str,
+        at: zeron_orch::AttemptId,
+        reply_id: &str,
+    ) -> Result<(), DriverError> {
+        if !self.driver.mechanism_capture_enabled() {
+            return Ok(());
+        }
+        let key = format!("tool-reply:{parent}:{}:{}:{reply_id}", at.run.ord, at.n);
+        let Some(raw) = self.driver.meta(&key)? else {
+            return Ok(());
+        };
+        let replies: Vec<serde_json::Value> = serde_json::from_str(&raw)?;
+        for data in replies {
+            let child = data["child"]
+                .as_str()
+                .ok_or_else(|| DriverError::Corrupt("missing reply child".into()))?;
+            let task_run = data["task_run"]
+                .as_u64()
+                .ok_or_else(|| DriverError::Corrupt("missing reply task run".into()))?;
+            self.driver.observe_mechanism(
+                &format!(
+                    "tool-observed:{parent}:{}:{}:{reply_id}:{child}:{task_run}",
+                    at.run.ord, at.n
+                ),
+                "tool_observed",
+                data,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tool_fact_tests {
+    use super::*;
+    use std::sync::Arc;
+    use crate::orchestrator::{Driver, OrchOptions};
+    use zeron_orch::{Config, RunEvent};
+    use zeron_sync::DocsStore;
+    #[test]
+    fn tool_observed_requires_real_reply_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        drop(Driver::open_with_capture(store.clone(), "device", Config::default(), true).unwrap());
+        let wire = OrchWire::open(store.clone(), "device", OrchOptions::default()).unwrap();
+        let t = wire.thread("parent").unwrap();
+        wire.driver
+            .apply("send", Event::Run(RunEvent::ServerEnqueue { t, msg: 1 }))
+            .unwrap();
+        wire.driver
+            .apply("start", Event::Run(RunEvent::StartFromQueue { t }))
+            .unwrap();
+        let at = wire.thread_state("parent").unwrap().attempt_id();
+        let view = TaskView {
+            origin: "app",
+            background: None,
+            task_id: "child:3".into(),
+            child_thread_id: "child".into(),
+            status: "completed",
+            summary: Some("done".into()),
+            has_pending_question: false,
+            question: None,
+            wait_timed_out: false,
+            next: None,
+        };
+        wire.record_tool_reply("parent", "task_status", &view)
+            .unwrap();
+        assert!(
+            wire.driver
+                .meta(&format!(
+                    "tool-reply:parent:{}:{}:real-call",
+                    at.run.ord, at.n
+                ))
+                .unwrap()
+                .is_none()
+        );
+        wire.tool_event(
+            "parent",
+            &AgentEvent::ToolCall {
+                id: "real-call".into(),
+                call: ToolCall::Mcp {
+                    server: "zeron".into(),
+                    tool: "task_status".into(),
+                    input: Some(serde_json::json!({"taskId":"child:3"})),
+                },
+            },
+        );
+        wire.record_tool_reply("parent", "task_status", &view)
+            .unwrap();
+        drop(wire);
+        let wire = OrchWire::open(store, "device", OrchOptions::default()).unwrap();
+        for id in ["unknown-call", "real-call", "real-call"] {
+            wire.tool_event(
+                "parent",
+                &AgentEvent::ToolResult {
+                    id: id.into(),
+                    is_error: false,
+                    output: None,
+                    diff: None,
+                    exit_code: None,
+                },
+            );
+        }
+        let rows = wire.driver.mechanism_lines().unwrap();
+        let row: serde_json::Value = serde_json::from_str(rows.last().unwrap()).unwrap();
+        let facts = row["snapshot"]["facts"].as_array().unwrap();
+        for kind in ["tool_reply", "tool_observed"] {
+            let selected: Vec<_> = facts.iter().filter(|f| f["kind"] == kind).collect();
+            assert_eq!(selected.len(), 1);
+            assert_eq!(selected[0]["data"]["reply_id"], "real-call");
+            assert_eq!(selected[0]["data"]["parent"], "parent");
+            assert_eq!(selected[0]["data"]["child"], "child");
+            assert_eq!(selected[0]["data"]["task_run"], 3);
+        }
     }
 }

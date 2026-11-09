@@ -1324,6 +1324,13 @@ fn command_request(
 }
 
 async fn start_turn(client: &RpcClient, params: Value) -> Result<String, HarnessError> {
+    start_turn_ordered(client, params).await.map(|(id, _)| id)
+}
+
+async fn start_turn_ordered(
+    client: &RpcClient,
+    params: Value,
+) -> Result<(String, u64), HarnessError> {
     let text = params
         .pointer("/input/0/text")
         .and_then(Value::as_str)
@@ -1340,8 +1347,11 @@ async fn start_turn(client: &RpcClient, params: Value) -> Result<String, Harness
         ));
     }
     let (method, params) = native.unwrap_or(("turn/start", params));
-    let started = client.request(method, params).await?;
-    Ok(started["turn"]["id"].as_str().unwrap_or("").to_owned())
+    let started = client.request_ordered(method, params).await?;
+    Ok((
+        started["turn"]["id"].as_str().unwrap_or("").to_owned(),
+        started.reader_position,
+    ))
 }
 
 /// What `thread/start` / `thread/resume` reports the thread runs with: the
@@ -1355,6 +1365,60 @@ struct ThreadMode {
 
 /// The per-run event loop: one task multiplexing app-server messages, the
 /// steering mailbox, the interrupt token, and consumer liveness.
+enum QueuedProviderInput {
+    Frame(Incoming),
+    Boundary {
+        reader_position: u64,
+        event: AgentEvent,
+    },
+}
+
+async fn next_provider_input(
+    queued: &mut VecDeque<QueuedProviderInput>,
+    incoming: &mut mpsc::Receiver<Incoming>,
+) -> Option<QueuedProviderInput> {
+    match queued.pop_front() {
+        Some(frame) => Some(frame),
+        None => incoming.recv().await.map(QueuedProviderInput::Frame),
+    }
+}
+
+fn queue_source_boundary(
+    queued: &mut VecDeque<QueuedProviderInput>,
+    incoming: &mut mpsc::Receiver<Incoming>,
+    reader_position: u64,
+    boundary: AgentEvent,
+) {
+    let mut later = VecDeque::new();
+    while let Some(frame) = queued.pop_front() {
+        let position = match &frame {
+            QueuedProviderInput::Frame(raw) => raw.reader_position(),
+            QueuedProviderInput::Boundary {
+                reader_position, ..
+            } => Some(*reader_position),
+        };
+        if position.is_some_and(|p| p < reader_position) {
+            later.push_back(frame);
+        } else {
+            queued.push_front(frame);
+            break;
+        }
+    }
+    while let Ok(frame) = incoming.try_recv() {
+        if frame.reader_position().is_none_or(|p| p >= reader_position) {
+            queued.push_back(QueuedProviderInput::Frame(frame));
+            break;
+        }
+        later.push_back(QueuedProviderInput::Frame(frame));
+    }
+    later.push_back(QueuedProviderInput::Boundary {
+        reader_position,
+        event: boundary,
+    });
+    later.append(queued);
+    *queued = later;
+}
+
 async fn run_session(session: Session) {
     let Session {
         executable,
@@ -1880,10 +1944,21 @@ async fn run_session(session: Session) {
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut torn_down: Vec<crate::process::Tracked> = Vec::new();
 
+    let mut queued_provider = VecDeque::new();
     'main: loop {
         tokio::select! {
-            inc = incoming.recv() => match inc {
-                Some(Incoming::Notification { method, params }) => {
+            input = next_provider_input(&mut queued_provider, &mut incoming) => {
+                let inc = match input {
+                    Some(QueuedProviderInput::Frame(frame)) => Some(frame),
+                    Some(QueuedProviderInput::Boundary { event, .. }) => {
+                        turn.source_steered();
+                        if !send(&event_tx, event).await { break 'main; }
+                        continue 'main;
+                    }
+                    None => None,
+                };
+                match inc {
+                Some(Incoming::Notification { method, params, .. }) => {
                 // Foreign-thread traffic FIRST: a child thread's turn/thread
                 // bookkeeping must never reach the parent turn router below
                 // (a child's turn/completed would settle the PARENT turn).
@@ -1916,6 +1991,7 @@ async fn run_session(session: Session) {
                         if done_current && !id.is_empty() && !router.is_completed(&id) {
                             done_current = false;
                             let (prev, next) = rotate(&mut assistant_message_id);
+                            turn.source_steered();
                             if !send(&event_tx, AgentEvent::Steered {
                                 assistant_message_id: Some(prev),
                                 next_assistant_message_id: Some(next),
@@ -2000,7 +2076,8 @@ async fn run_session(session: Session) {
                             for _ in 0..=at {
                                 accepted_steers.pop_front();
                                 let (prev, next) = rotate(&mut assistant_message_id);
-                                if !send(&event_tx, AgentEvent::Steered {
+                                turn.source_steered();
+                            if !send(&event_tx, AgentEvent::Steered {
                                     assistant_message_id: Some(prev),
                                     next_assistant_message_id: Some(next),
                                 }).await {
@@ -2120,6 +2197,7 @@ async fn run_session(session: Session) {
                         // joined this turn: confirm them before its end.
                         while accepted_steers.pop_front().is_some() {
                             let (prev, next) = rotate(&mut assistant_message_id);
+                            turn.source_steered();
                             if !send(&event_tx, AgentEvent::Steered {
                                 assistant_message_id: Some(prev),
                                 next_assistant_message_id: Some(next),
@@ -2194,6 +2272,8 @@ async fn run_session(session: Session) {
                                 &event_tx,
                                 &mut assistant_message_id,
                                 &mut done_current,
+                                &mut incoming,
+                                &mut queued_provider,
                             )
                             .await
                             {
@@ -2330,7 +2410,7 @@ async fn run_session(session: Session) {
                 }
                 }
 
-                Some(Incoming::Request { id, method, params }) => {
+                Some(Incoming::Request { id, method, params, .. }) => {
                     handle_server_request(
                         &client,
                         id,
@@ -2344,6 +2424,7 @@ async fn run_session(session: Session) {
 
                 // stdout EOF or reader gone: the app server exited.
                 Some(Incoming::Eof) | None => break 'main,
+                }
             },
 
             steer = steering.recv(), if steering_open && !interrupted => match steer {
@@ -2397,7 +2478,7 @@ async fn run_session(session: Session) {
                                     current_native = command_request(&text, &thread_id).ok().flatten().is_some();
                                     if !steer_as_new_turn(
                                         &client, turn_params(&live, &text), &mut router, &event_tx,
-                                        &mut assistant_message_id, &mut done_current,
+                                        &mut assistant_message_id, &mut done_current, &mut incoming, &mut queued_provider,
                                     ).await { break 'main; }
                                 }
                             }
@@ -2406,7 +2487,7 @@ async fn run_session(session: Session) {
                         current_native = command_request(&text, &thread_id).ok().flatten().is_some();
                         if !steer_as_new_turn(
                             &client, turn_params(&live, &text), &mut router, &event_tx,
-                            &mut assistant_message_id, &mut done_current,
+                            &mut assistant_message_id, &mut done_current, &mut incoming, &mut queued_provider,
                         ).await { break 'main; }
                     }
                 }
@@ -2789,20 +2870,24 @@ async fn steer_as_new_turn(
     event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
     assistant_message_id: &mut String,
     done_current: &mut bool,
+    incoming: &mut mpsc::Receiver<Incoming>,
+    queued: &mut VecDeque<QueuedProviderInput>,
 ) -> bool {
-    match start_turn(client, params).await {
-        Ok(id) => {
+    match start_turn_ordered(client, params).await {
+        Ok((id, reader_position)) => {
             router.adopt_started(id);
             *done_current = false;
             let (prev, next) = rotate(assistant_message_id);
-            send(
-                event_tx,
+            queue_source_boundary(
+                queued,
+                incoming,
+                reader_position,
                 AgentEvent::Steered {
                     assistant_message_id: Some(prev),
                     next_assistant_message_id: Some(next),
                 },
-            )
-            .await
+            );
+            true
         }
         Err(e) => {
             let _ = send(
@@ -2876,11 +2961,11 @@ fn handle_server_request(
         }
         let Some(permit) = slot() else { return };
         let client = client.clone();
-        let request_input = Arc::clone(request_input);
+        let asked: Vec<UserInputQuestion> = questions.iter().map(|(_, q)| q.clone()).collect();
+        let answers = (request_input)(asked);
         tokio::spawn(async move {
             let _permit = permit;
-            let asked: Vec<UserInputQuestion> = questions.iter().map(|(_, q)| q.clone()).collect();
-            let answers = (request_input)(asked).await.unwrap_or_default();
+            let answers = answers.await.unwrap_or_default();
             let mut by_id = serde_json::Map::new();
             for (wire_id, q) in &questions {
                 let labels: Vec<Value> = answers
@@ -2909,12 +2994,10 @@ fn handle_server_request(
         };
         let Some(permit) = slot() else { return };
         let client = client.clone();
-        let request_input = Arc::clone(request_input);
+        let answers = (request_input)(form.questions.clone());
         tokio::spawn(async move {
             let _permit = permit;
-            let answers = (request_input)(form.questions.clone())
-                .await
-                .unwrap_or_default();
+            let answers = answers.await.unwrap_or_default();
             client.respond(&id, form.response(&answers));
         });
         return;
@@ -2950,7 +3033,7 @@ fn handle_server_request(
     let question = approval_question(method, params);
     let params = params.clone();
     let client = client.clone();
-    let request_input = Arc::clone(request_input);
+    let answers = (request_input)(vec![question.clone()]);
     tokio::spawn(async move {
         let _permit = permit;
         // The engine's input bridge owns the `InputRequested`/`InputResolved`
@@ -2960,9 +3043,7 @@ fn handle_server_request(
         //
         // A dropped sender (caller went away) degrades to a decline so the
         // agent is unblocked — never silently allowed.
-        let answers = (request_input)(vec![question.clone()])
-            .await
-            .unwrap_or_default();
+        let answers = answers.await.unwrap_or_default();
         let accept = crate::approval::approved(&question, &answers);
         client.respond(&id, reply(&params, accept));
     });
@@ -3101,6 +3182,104 @@ use crate::{Signal, send_signal, shutdown_child};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ordered_start_cut_keeps_old_request_before_source_boundary() {
+        let (tx, mut rx) = mpsc::channel(8);
+        for position in [1, 3, 5] {
+            tx.send(Incoming::Request {
+                id: json!(position),
+                method: "question".into(),
+                params: json!({}),
+                reader_position: position,
+            })
+            .await
+            .unwrap();
+        }
+        let mut queued = VecDeque::new();
+        queue_source_boundary(
+            &mut queued,
+            &mut rx,
+            2,
+            AgentEvent::Steered {
+                assistant_message_id: None,
+                next_assistant_message_id: None,
+            },
+        );
+        queue_source_boundary(
+            &mut queued,
+            &mut rx,
+            4,
+            AgentEvent::Steered {
+                assistant_message_id: None,
+                next_assistant_message_id: None,
+            },
+        );
+        let mut positions = Vec::new();
+        for _ in 0..5 {
+            positions.push(
+                match next_provider_input(&mut queued, &mut rx).await.unwrap() {
+                    QueuedProviderInput::Frame(frame) => frame.reader_position().unwrap(),
+                    QueuedProviderInput::Boundary {
+                        reader_position, ..
+                    } => reader_position,
+                },
+            );
+        }
+        assert_eq!(positions, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_receipt_binds_before_spawn_and_source_steer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (client, _incoming) =
+            RpcClient::new(child.stdin.take().unwrap(), child.stdout.take().unwrap());
+        let source = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let turn = crate::TurnControl::default();
+        let next = source.clone();
+        turn.set_source_steered(move || {
+            next.fetch_add(1, Ordering::SeqCst);
+        });
+        let (capture, stamp) = (seen.clone(), source.clone());
+        let input: Arc<RequestInputFn> = Arc::new(Box::new(move |_| {
+            capture.lock().unwrap().push(stamp.load(Ordering::SeqCst));
+            tokio::sync::oneshot::channel().1
+        }));
+        let slots = Arc::new(tokio::sync::Semaphore::new(8));
+        let params = json!({"questions":[{"id":"q","header":"Pick","question":"Pick", "options":[{"label":"A","description":"A"}]}]});
+        handle_server_request(
+            &client,
+            json!(1),
+            "item/tool/requestUserInput",
+            &params,
+            AccessMode::default(),
+            &input,
+            &slots,
+        );
+        assert_eq!(*seen.lock().unwrap(), vec![0]);
+        turn.source_steered();
+        handle_server_request(
+            &client,
+            json!(2),
+            "item/tool/requestUserInput",
+            &params,
+            AccessMode::default(),
+            &input,
+            &slots,
+        );
+        assert_eq!(*seen.lock().unwrap(), vec![0, 1]);
+        tokio::task::yield_now().await;
+        assert_eq!(*seen.lock().unwrap(), vec![0, 1]);
+        child.kill().await.unwrap();
+    }
 
     /// Codex takes a steer mid-command in its own turn, so a steer must not
     /// interrupt: a backgrounded command's call stays open for the rest of

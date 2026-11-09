@@ -3189,6 +3189,10 @@ impl RpcService for EngineRpc {
                     parent_chat_id: Option<String>,
                 }
                 let p: ForkParams = parse_params(params)?;
+                let execute = || -> Result<RpcReply,RpcError> {
+                if let zeron_rpc::Caller::Agent {chat}=zeron_rpc::caller() {
+                    if chat.as_deref()!=Some(p.source_chat_id.as_str()) { return Err(RpcError::Failed("capability_denied: fork source must be the calling chat".into())); }
+                }
                 let parent_chat_id = p
                     .parent_chat_id
                     .clone()
@@ -3216,8 +3220,9 @@ impl RpcService for EngineRpc {
                     return Err(RpcError::Failed("Chat id already exists".into()));
                 }
                 let source_doc = self.doc_host.open(&p.source_chat_id).map_err(failed)?;
-                let entries = source_doc
-                    .doc()
+                let frozen_source = self.sessions.orchestrator().filter(|wire|wire.driver().mechanism_capture_enabled()).map(|wire|crate::orchestrator::transfer::freeze_source(wire.driver(),&self.doc_host,&source_doc,&p.source_chat_id)).transpose().map_err(RpcError::Failed)?;
+                let source_view = frozen_source.as_ref().unwrap_or(source_doc.doc());
+                let entries = source_view
                     .read_entries()
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let boundary = entries
@@ -3328,12 +3333,17 @@ impl RpcService for EngineRpc {
                         &entries[..=boundary],
                     )
                     .map_err(RpcError::Failed)?;
+                    if wire.driver().mechanism_capture_enabled() { crate::orchestrator::transfer::record_lineage(target.doc(),source_view,&format!("fork:{}",chat.id),"fork",&source.id,&chat.id,&entries[boundary].id,None,&entries[..=boundary]).map_err(RpcError::Failed)?; }
                     self.doc_host.persist_fork(&target).map_err(failed)?;
                     crate::orchestrator::transfer::end_operation(wire.driver(), &self.doc_host, &chat.id, before, "ForkPin", args, true).map_err(RpcError::Failed)?;
                 }
                 self.doc_host.persist_fork(&target).map_err(failed)?;
                 self.workspace.import_chat_row(&chat).map_err(failed)?;
                 RpcReply::value(&chat)
+                };
+                if let (zeron_rpc::Caller::Agent {chat:Some(chat)},Some(wire))=(zeron_rpc::caller(),self.sessions.orchestrator()) {
+                    wire.with_agent_admission(&self.sessions,&chat,|error|Err(RpcError::Failed(error.to_string())),execute)
+                } else { execute() }
             }
             methods::POST_NOTIFICATION => {
                 #[derive(serde::Deserialize)]

@@ -25,7 +25,7 @@ pub mod ipc_auth;
 mod server;
 mod ws;
 
-pub use caller::{Caller, caller, with_caller};
+pub use caller::{Caller, agent_run, caller, with_agent_run, with_caller};
 pub use client::{RpcClient, RpcSubscription, connect_ipc, connect_ipc_as_agent, connect_ws};
 pub use device_room::{
     CallerProof, CallerProofFn, DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig,

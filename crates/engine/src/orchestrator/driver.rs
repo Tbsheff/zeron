@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rusqlite::Transaction;
-use zeron_orch::{Config, Effect, Event, OrchState, step};
+use zeron_orch::{AttemptId, Config, DelEvent, Effect, Event, OrchState, step};
 use zeron_sync::DocsStore;
 
 use super::DriverError;
@@ -97,15 +97,26 @@ impl Driver {
             let existing = store::load_state(tx)?.is_some();
             init(tx, device, config)?;
             super::mechanism::init(tx)?;
+            super::command::init(tx)?;
             let capture = capture || store::meta(tx, "mechanism_capture")?.as_deref() == Some("1");
             if capture {
                 store::put_meta(tx, "mechanism_capture", "1")?;
-                super::mechanism::capture(
-                    tx,
-                    &store::meta(tx, "device")?.ok_or_else(|| DriverError::Corrupt("missing device".into()))?,
-                    if existing { "RecoveryOpen" } else { "Init" },
-                    serde_json::json!({}),
-                )?;
+                let dev = store::meta(tx, "device")?.ok_or_else(|| DriverError::Corrupt("missing device".into()))?;
+                super::mechanism::begin_capture_group(tx, &dev)?;
+                if existing {
+                    super::mechanism::capture(tx, &dev, "RecoveryOpen", serde_json::json!({}))?;
+                    let before: i64 = tx.query_row("SELECT COUNT(*) FROM orch_mechanism_facts", [], |r| r.get(0))?;
+                    let fact_id = super::transfer::capture_initial_catalog(tx)?;
+                    let after: i64 = tx.query_row("SELECT COUNT(*) FROM orch_mechanism_facts", [], |r| r.get(0))?;
+                    if after != before {
+                        if after != before + 1 { return Err(DriverError::Corrupt("catalog changed more than one fact".into())); }
+                        super::mechanism::capture(tx, &dev, "ObserveCatalog", serde_json::json!({"fact_id":fact_id,"kind":"transfer_catalog","source":"durable_snapshots"}))?;
+                    }
+                } else {
+                    super::transfer::capture_initial_catalog(tx)?;
+                    super::mechanism::capture(tx, &dev, "Init", serde_json::json!({}))?;
+                }
+                super::mechanism::end_capture_group(tx)?;
             }
             Ok::<bool, DriverError>(capture)
         })?;
@@ -138,7 +149,7 @@ impl Driver {
         }
         self.store.transact(|tx| {
             super::mechanism::fact(tx, id, kind, &data)?;
-            self.capture_tx(tx, "Observe", serde_json::json!({"fact_id":id,"kind":kind}))
+            self.capture_tx(tx, "Observe", serde_json::json!({"fact_id":id,"kind":kind,"effect_id":data.get("effect_id").and_then(serde_json::Value::as_str)}))
         })
     }
 
@@ -152,6 +163,22 @@ impl Driver {
             super::mechanism::capture(tx, &self.device, action, args)?;
         }
         Ok(())
+    }
+
+    pub fn record_command_decision(&self, id: &str, receipt: super::CommandReceipt) -> Result<super::CommandReceipt, DriverError> {
+        self.store.transact(|tx| {
+            let previous = super::command::get(tx, id, receipt.phase())?;
+            let duplicate = previous.is_some();
+            let stored = previous.unwrap_or_else(|| receipt.clone());
+            if !duplicate { super::command::put(tx, id, &stored)?; }
+            store::put_meta(tx, &format!("cmd:{id}"), "1")?;
+            self.capture_tx(tx, "CommandDecision", serde_json::json!({"command_id":id,"phase":receipt.phase(),"duplicate":duplicate,"observed":receipt,"receipt":stored}))?;
+            Ok(stored)
+        })
+    }
+
+    pub fn command_decision(&self, id: &str, phase: &str) -> Result<Option<super::CommandReceipt>, DriverError> {
+        self.store.transact(|tx| super::command::get(tx, id, phase))
     }
 
     pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -176,6 +203,36 @@ impl Driver {
 
     pub fn apply(&self, key: &str, event: Event) -> Result<ApplyResult, DriverError> {
         self.apply_cmd(key, None, event)
+    }
+
+    pub(crate) fn record_engine_interrupt(&self, key: &str, at: AttemptId) -> Result<(), DriverError> {
+        let duplicate = self.store.transact(|tx| {
+            if store::receipt(tx, key)?.is_none() && !loaded(tx)?.thread(at.run.thread).is_ok_and(|thread|
+                thread.is_live() && !thread.int_req && thread.attempt_id() == at)
+            {
+                return Ok(true);
+            }
+            if self.capture { super::mechanism::begin_capture_group(tx, &self.device)?; }
+            let out = self.apply_tx(tx, key, None, &Event::Del(DelEvent::InterruptChat { t: at.run.thread }))?;
+            if let Applied::Accepted { effects, .. } = &out.applied && !out.duplicate {
+                for id in effects {
+                    let payload: String = tx.query_row("SELECT payload FROM orch_outbox WHERE effect_id = ?1", [id], |row| row.get(0))?;
+                    if !matches!(serde_json::from_str::<Effect>(&payload)?, Effect::InterruptRun { run } if run == at.run) {
+                        continue;
+                    }
+                    self.faults.hit(FaultPoint::Fp2EffectRunNotMarked)?;
+                    store::mark_done(tx, id)?;
+                    self.capture_tx(tx, "CompleteEffect", serde_json::json!({"effect_id":id}))?;
+                }
+            }
+            if self.capture { super::mechanism::end_capture_group(tx)?; }
+            Ok::<bool, DriverError>(out.duplicate)
+        })?;
+        self.changed();
+        if !duplicate {
+            self.faults.hit(FaultPoint::Fp1StepCommittedEffectNotRun)?;
+        }
+        Ok(())
     }
 
     pub fn apply_if(
@@ -349,6 +406,10 @@ impl Driver {
         self.apply_cmd(key, cmd, event)
     }
 
+    pub fn receipt(&self, key: &str) -> Result<Option<Applied>, DriverError> {
+        self.store.transact(|tx| store::receipt(tx, key))
+    }
+
     pub fn has_receipt(&self, key: &str) -> Result<bool, DriverError> {
         Ok(self.store.transact(|tx| store::receipt(tx, key))?.is_some())
     }
@@ -372,6 +433,10 @@ impl Driver {
 
     pub fn pending(&self) -> Result<Vec<OutboxRow>, DriverError> {
         self.store.transact(store::pending_outbox)
+    }
+
+    pub fn effect_pending(&self, effect_id: &str) -> Result<bool, DriverError> {
+        self.store.transact(|tx| store::effect_pending(tx, effect_id))
     }
 
     pub fn outbox(&self) -> Result<Vec<OutboxRow>, DriverError> {

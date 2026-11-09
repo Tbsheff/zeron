@@ -16,9 +16,10 @@ mod question_wire;
 pub mod remote;
 mod tasks;
 
+pub use super::runtime_binding::AgentRuntime;
 pub use tasks::{ChildSpec, DelegateRequest, OrchError, RUNNING_NEXT, TaskView, access_level};
 
-use super::DriverError;
+use super::{CommandDisposition, CommandReceipt, CommandRefusal, CommandSource, DriverError};
 use super::driver::{ApplyResult, Driver};
 use super::store::{Applied, OutboxRow};
 use crate::EngineError;
@@ -94,6 +95,9 @@ pub trait RunEngine: Send + Sync {
     async fn stop_attempt(&self, chat: &str) -> bool;
     async fn interrupt_run(&self, chat: &str) -> bool;
     fn owns_run(&self, chat: &str) -> bool;
+    fn agent_attempt(&self, _chat: &str) -> Option<AgentRuntime> {
+        None
+    }
     fn last_done(&self, chat: &str) -> Option<(u64, DoneStatus, Option<FailureClass>)>;
     fn journal_seq(&self, chat: &str) -> u64;
     fn effective_access(&self, _chat: &str) -> Option<u8> {
@@ -118,10 +122,16 @@ pub trait RunEngine: Send + Sync {
         Ok(false)
     }
     fn notify_question(&self, _chat: &str, _request: &str) {}
+    fn native_snapshot(&self, _doc: &str) -> Result<Vec<u8>, EngineError> {
+        Err(EngineError::Other("native snapshot reader unavailable".into()))
+    }
     fn save_native_snapshot(&self, _doc: &str, _snapshot: &[u8]) -> Result<(), EngineError> {
         Err(EngineError::Other(
             "native snapshot writer unavailable".into(),
         ))
+    }
+    fn native_changed_task(&self, chat: &str, _key: u64, tool: &str, status: &str) -> Result<(),EngineError> {
+        self.native_changed(chat, tool, status)
     }
     fn native_changed(&self, _chat: &str, _tool: &str, _status: &str) -> Result<(), EngineError> {
         Ok(())
@@ -146,7 +156,7 @@ pub enum SendKind {
 }
 
 enum Decision {
-    Refused(&'static str),
+    Refused(CommandRefusal, &'static str),
     Bypass,
     Effects(Vec<String>),
 }
@@ -215,7 +225,7 @@ fn auto_step(s: &OrchState, th: &Thread, chat: &str) -> Option<(String, Event)> 
     if let Some(ev) = super::questions::next(s, t) {
         return Some((format!("question-start:{chat}:{}", th.rord() + 1), ev));
     }
-    if let Some(Msg::Wake { .. }) = th.queue.front() {
+    if matches!(th.queue.front(),Some(Msg::Wake{..})) || (th.held==Hold::Fail && th.queue.iter().any(|m|matches!(m,Msg::Wake{..}))) {
         let pass = matches!(th.held, Hold::None | Hold::Fail);
         let key = format!("wakestart:{chat}:{}", th.rord() + 1);
         return pass.then_some((key, Event::Del(DelEvent::StartFromQueueWake { t })));
@@ -236,6 +246,9 @@ type PendingCall = (AttemptId, String, Option<serde_json::Value>);
 pub struct OrchWire {
     me: std::sync::Weak<OrchWire>,
     driver: Driver,
+    engine_instance_id: String,
+    runtime_source_seq: Mutex<u64>,
+    runtime_connections: Mutex<HashMap<String, (bool, u64, u64)>>,
     opts: OrchOptions,
     gate: Mutex<()>,
     engine: Mutex<Option<Arc<dyn RunEngine>>>,
@@ -248,6 +261,7 @@ pub struct OrchWire {
     boot_live: HashSet<AttemptId>,
     lose: Mutex<HashSet<String>>,
     dead: std::sync::atomic::AtomicBool,
+    recovering: std::sync::atomic::AtomicBool,
     wake: tokio::sync::Notify,
     task_events: tokio::sync::Notify,
     calls: Mutex<HashMap<(String, String), PendingCall>>,
@@ -264,6 +278,9 @@ impl OrchWire {
         let wire = Arc::new_cyclic(|me| Self {
             me: me.clone(),
             driver,
+            engine_instance_id: crate::new_id(),
+            runtime_source_seq: Mutex::new(0),
+            runtime_connections: Mutex::new(HashMap::new()),
             opts,
             gate: Mutex::new(()),
             engine: Mutex::new(None),
@@ -276,6 +293,7 @@ impl OrchWire {
             boot_live,
             lose: Mutex::new(HashSet::new()),
             dead: std::sync::atomic::AtomicBool::new(false),
+            recovering: std::sync::atomic::AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
             task_events: tokio::sync::Notify::new(),
             calls: Mutex::new(HashMap::new()),
@@ -288,8 +306,84 @@ impl OrchWire {
         &self.driver
     }
 
+    fn observe_runtime(&self, kind: &str, state: &str) -> Result<(), DriverError> {
+        if !self.driver.mechanism_capture_enabled() {
+            return Ok(());
+        }
+        self.observe_runtime_data(kind, serde_json::json!({"state":state}))
+    }
+
+    fn observe_runtime_data(&self, kind: &str, mut data: serde_json::Value) -> Result<(), DriverError> {
+        if !self.driver.mechanism_capture_enabled() {
+            return Ok(());
+        }
+        let mut source_seq = lock(&self.runtime_source_seq);
+        *source_seq += 1;
+        let id = format!("runtime:{}:{}", self.engine_instance_id, *source_seq);
+        data["device"] = serde_json::json!(self.driver.device());
+        data["engine_instance_id"] = serde_json::json!(self.engine_instance_id);
+        data["generation"] = serde_json::json!(self.engine_instance_id);
+        data["origin_id"] = serde_json::json!(id);
+        data["source_seq"] = serde_json::json!(*source_seq);
+        self.driver.observe_mechanism(&id, kind, data)
+    }
+
+    pub(crate) fn engine_started(&self) -> Result<(), DriverError> {
+        self.observe_runtime("engine_lifecycle", "started")
+    }
+
+    pub(crate) fn engine_stopping(&self) -> Result<(), DriverError> {
+        self.observe_runtime("engine_lifecycle", "stopping")
+    }
+
+    pub(crate) fn engine_stopped(&self) -> Result<(), DriverError> {
+        self.observe_runtime("engine_lifecycle", "stopped")
+    }
+
+    pub(crate) fn admission_open(&self) -> Result<(), DriverError> {
+        self.observe_runtime("admission_state", "open")
+    }
+
+    pub(crate) fn admission_quiesced(&self) -> Result<(), DriverError> {
+        self.observe_runtime("admission_state", "quiesced")
+    }
+
+    pub(crate) fn admission_held(&self) -> Result<(), DriverError> {
+        self.observe_runtime("admission_state", "held")
+    }
+
+    pub(crate) fn edge_disconnected(&self) -> Result<(), DriverError> {
+        self.observe_runtime_data("transport_connection", serde_json::json!({
+            "connection_id":format!("{}:edge", self.engine_instance_id),
+            "scope":"edge","source":"disconnect_edge","state":"disconnected"
+        }))
+    }
+
+    pub(crate) fn observe_room_transport(&self, chat: &str, stats: &zeron_sync::ChatStatsSnapshot) -> Result<(), DriverError> {
+        if !self.driver.mechanism_capture_enabled() {
+            return Ok(());
+        }
+        let value = (stats.connected, stats.rejoins, stats.disconnects);
+        let mut seen = lock(&self.runtime_connections);
+        if seen.get(chat) == Some(&value) {
+            return Ok(());
+        }
+        self.observe_runtime_data("transport_connection", serde_json::json!({
+            "connection_id":format!("{}:chat-room:{chat}", self.engine_instance_id),
+            "scope":"chat_room","chat":chat,"source":"room_stats",
+            "state":if stats.connected {"connected"} else {"disconnected"},
+            "connected":stats.connected,"rejoins":stats.rejoins,"disconnects":stats.disconnects
+        }))?;
+        seen.insert(chat.to_string(), value);
+        Ok(())
+    }
+
     pub fn trace_lines(&self) -> Result<Vec<String>, DriverError> {
         self.driver.trace_lines()
+    }
+
+    pub fn recovery_pending(&self) -> bool {
+        self.recovering.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn is_dead(&self) -> bool {
@@ -302,6 +396,11 @@ impl OrchWire {
         spawn_task("worker", async move { wire.worker().await });
     }
 
+    pub(crate) fn attach_recovering(self: &Arc<Self>, engine: Arc<dyn RunEngine>) {
+        self.recovering.store(true, std::sync::atomic::Ordering::Release);
+        self.attach(engine);
+    }
+
     pub fn detach(&self) {
         lock(&self.engine).take();
         self.wake.notify_one();
@@ -312,11 +411,17 @@ impl OrchWire {
     }
 
     async fn worker(self: Arc<Self>) {
+        let mut first = self.recovering.load(std::sync::atomic::Ordering::Acquire);
         loop {
-            let tick = tokio::select! {
+            if self.recovering.load(std::sync::atomic::Ordering::Acquire) {
+                if self.engine().is_none() || self.is_dead() { return; }
+                self.wake.notified().await;
+                continue;
+            }
+            let tick = if std::mem::take(&mut first) { false } else { tokio::select! {
                 () = self.wake.notified() => false,
                 () = tokio::time::sleep(self.opts.reconcile_every) => true,
-            };
+            }};
             let Some(engine) = self.engine() else { return };
             if self.is_dead() {
                 return;
@@ -387,7 +492,7 @@ impl OrchWire {
             return Ok(());
         }
         if self.unrequested_stop(th, at, outcome) {
-            self.engine_interrupt(at.run.thread, chat, at)?;
+            self.engine_interrupt(chat, at)?;
         }
         let ev = Event::Run(RunEvent::ProviderTerminal {
             t: at.run.thread,
@@ -453,6 +558,19 @@ impl OrchWire {
         let n = u32::try_from(n).map_err(|_| DriverError::Corrupt("thread id overflow".into()))?;
         if fresh {
             self.driver.put_meta(&format!("thread:{n}"), chat)?;
+        }
+        let engine = lock(&self.engine).clone();
+        if let Some(route) = engine.and_then(|engine| engine.orch_route(chat)) {
+            let key = format!("remote-host:{chat}");
+            if self.driver.meta(&key)?.is_some_and(|host| host != route.host) {
+                return Err(DriverError::Corrupt("registry host changed without handoff".into()));
+            }
+            self.driver.put_meta(&key, &route.host)?;
+            self.driver.observe_mechanism(
+                &format!("registry-host:{chat}"),
+                "registry_host",
+                serde_json::json!({"chat":chat,"host":route.host,"parent":route.parent,"validated":true}),
+            )?;
         }
         Ok(ThreadId(n))
     }
@@ -590,15 +708,24 @@ impl OrchWire {
         let _g = lock(&self.gate);
         let cmd = take_command();
         let out = self.decide_send(p, kind, steerable, cmd.as_deref());
-        self.note_command(cmd.as_deref())?;
+        let (disposition, effect_ids, refusal) = match &out {
+            Ok(Decision::Effects(ids)) => (CommandDisposition::Effects, ids.clone(), None),
+            Ok(Decision::Refused(reason, _)) => (CommandDisposition::Refused, Vec::new(), Some(*reason)),
+            Ok(Decision::Bypass) => (CommandDisposition::Bypass, Vec::new(), None),
+            Err(_) => (CommandDisposition::Error, Vec::new(), None),
+        };
+        self.note_command(cmd.as_deref(), CommandReceipt {
+            source:CommandSource::WireSend, disposition, message_id:Some(p.message_id.clone()),
+            effect_ids, refusal,
+        })?;
         out
     }
 
-    fn note_command(&self, cmd: Option<&str>) -> Result<(), DriverError> {
-        match cmd {
-            Some(id) => self.driver.put_meta(&command_key(id), "1"),
-            None => Ok(()),
+    fn note_command(&self, cmd: Option<&str>, receipt: CommandReceipt) -> Result<(), DriverError> {
+        if let Some(id) = cmd {
+            self.driver.record_command_decision(id, receipt)?;
         }
+        Ok(())
     }
 
     pub fn command_receipt(&self, id: &str) -> bool {
@@ -623,12 +750,16 @@ impl OrchWire {
         if let Via::Dispatch { request, .. } = &p.via {
             let access = tasks::access_level(request.access);
             let ev = Event::Del(DelEvent::NarrowAccess { t, access });
-            self.driver
-                .apply_if(&format!("access:{}:{}", p.chat, access), ev, &enabled(ev))?;
+            let key = format!("access:{}:{}", p.chat, access);
+            if let Some(result) = self.driver.apply_if(&key, ev, &enabled(ev))?
+                && matches!(result.applied, Applied::Accepted { .. })
+            {
+                self.record_local_ceiling(&p.chat, access, &key)?;
+            }
         }
         let n = self.msg(&p.message_id)?;
         if kind != SendKind::Redeliver && self.ran(&p.message_id)? {
-            return Ok(Decision::Refused("R17: this message id already ran"));
+            return Ok(Decision::Refused(CommandRefusal::AlreadyRan, "R17: this message id already ran"));
         }
         let s = self.driver.state()?;
         let th = s
@@ -639,7 +770,7 @@ impl OrchWire {
         }
         if in_flight(th, n) || lock(&self.claimed_msgs).contains(&p.message_id) {
             return Ok(Decision::Refused(
-                "R17: this message id is already in flight",
+                CommandRefusal::InFlight, "R17: this message id is already in flight",
             ));
         }
         self.stash(n, p)?;
@@ -649,7 +780,7 @@ impl OrchWire {
         let mut fx = accepted_ids(&r);
         if let Applied::Rejected { reason, .. } = r.applied {
             tracing::info!(chat = %p.chat, ?reason, "orchestrator refused the send");
-            return Ok(Decision::Refused("orchestrator refused the send"));
+            return Ok(Decision::Refused(CommandRefusal::ReducerRejected, "orchestrator refused the send"));
         }
         lock(&self.claimed_msgs).insert(p.message_id.clone());
         self.pump(t, &p.chat, &mut fx)?;
@@ -706,11 +837,13 @@ impl OrchWire {
         if p.message_id.is_empty() {
             p.message_id = crate::new_id();
         }
-        match self
+        let decision = self
             .decide(&p, kind, steerable)
-            .map_err(|e| self.to_engine(e))?
-        {
-            Decision::Refused(why) => {
+            .map_err(|e| self.to_engine(e))?;
+        self.record_root_ceiling(engine, &p.chat)
+            .map_err(|e| self.to_engine(e))?;
+        match decision {
+            Decision::Refused(_, why) => {
                 tracing::info!(chat = %p.chat, message = %p.message_id, why, "dispatch refused");
                 Ok(Ran::Nothing)
             }
@@ -758,20 +891,34 @@ impl OrchWire {
             None => format!("int:{chat}:{}", self.driver.bump(&format!("ints:{chat}"))?),
         };
         let ev = Event::Del(DelEvent::Stop { t });
-        let r = self.driver.apply_command(&key, cmd.as_deref(), ev)?;
-        self.note_command(cmd.as_deref())?;
+        let result = self.driver.apply_command(&key, cmd.as_deref(), ev);
+        let (disposition, effect_ids, refusal) = match &result {
+            Ok(r) if matches!(r.applied, Applied::Rejected { .. }) => (CommandDisposition::Refused, Vec::new(), Some(CommandRefusal::ReducerRejected)),
+            Ok(r) => (CommandDisposition::Effects, accepted_ids(r), None),
+            Err(_) => (CommandDisposition::Error, Vec::new(), None),
+        };
+        self.note_command(cmd.as_deref(), CommandReceipt {
+            source:CommandSource::WireInterrupt, disposition, message_id:None, effect_ids, refusal,
+        })?;
+        let r = result?;
         let mut fx = accepted_ids(&r);
         self.pump(t, chat, &mut fx)?;
         Ok(fx)
     }
 
     pub fn provider_done(&self, chat: &str, status: DoneStatus, failure: Option<FailureClass>) {
+        self.provider_done_context(chat, status, failure, None);
+    }
+
+    pub(crate) fn provider_done_at(&self, chat: &str, status: DoneStatus, failure: Option<FailureClass>, at: AttemptId) {
+        self.provider_done_context(chat, status, failure, Some(at));
+    }
+
+    fn provider_done_context(&self, chat: &str, status: DoneStatus, failure: Option<FailureClass>, source: Option<AttemptId>) {
         if self.is_dead() || lock(&self.lose).remove(chat) {
             return;
         }
-        let res = self
-            .note_reset(chat, status, failure)
-            .and_then(|()| self.done_locked(chat, outcome_of(status, failure)));
+        let res = self.done_locked(chat, status, failure, source);
         match res {
             Ok(changed) => {
                 self.wake.notify_one();
@@ -805,7 +952,8 @@ impl OrchWire {
         }
     }
 
-    fn done_locked(&self, chat: &str, outcome: Outcome) -> Result<bool, DriverError> {
+    fn done_locked(&self, chat: &str, status: DoneStatus, failure: Option<FailureClass>, source: Option<AttemptId>) -> Result<bool, DriverError> {
+        let outcome = outcome_of(status, failure);
         let _g = lock(&self.gate);
         let Some(t) = self.known_thread(chat)? else {
             return Ok(false);
@@ -822,10 +970,11 @@ impl OrchWire {
             return Ok(false);
         }
         let held = th.held;
-        let at = lock(&self.expect)
+        let at = source.unwrap_or_else(|| lock(&self.expect)
             .get(chat)
             .copied()
-            .unwrap_or(th.attempt_id());
+            .unwrap_or(th.attempt_id()));
+        if at == th.attempt_id() { self.note_reset(chat, status, failure)?; }
         let ev = Event::Run(RunEvent::ProviderTerminal {
             t,
             run: at.run.ord,
@@ -835,7 +984,7 @@ impl OrchWire {
         let key = format!("done:{chat}:{}:{}", at.run.ord, at.n);
         let applied = self.driver.apply_if(&key, ev, &enabled(ev))?;
         if applied.is_none() && self.unrequested_stop(th, at, outcome) {
-            self.engine_interrupt(t, chat, at)?;
+            self.engine_interrupt(chat, at)?;
             self.driver.apply_if(&key, ev, &enabled(ev))?;
         }
         let mut fx = Vec::new();
@@ -853,15 +1002,64 @@ impl OrchWire {
             && !th.attempt.emitted
     }
 
-    fn engine_interrupt(&self, t: ThreadId, chat: &str, at: AttemptId) -> Result<(), DriverError> {
+    fn engine_interrupt(&self, chat: &str, at: AttemptId) -> Result<(), DriverError> {
         let key = format!("int:{chat}:{}:{}:engine", at.run.ord, at.n);
-        let r = self
-            .driver
-            .apply(&key, Event::Del(DelEvent::InterruptChat { t }))?;
-        for id in accepted_ids(&r) {
-            self.driver.complete(&id)?;
+        self.driver.record_engine_interrupt(&key, at)
+    }
+
+    pub(crate) fn recover_start(&self, engine: &dyn RunEngine, mut pending: Pending) -> Result<String, EngineError> {
+        let _g = lock(&self.gate);
+        let saved = self.driver.meta(&format!("jseq:{}", pending.chat)).map_err(|e| self.to_engine(e))?
+            .and_then(|value| parse_jseq(&value));
+        let Some((run, attempt, _)) = saved else { return Ok(String::new()) };
+        let input = self.driver.meta(&format!("start-input:{}", pending.chat)).map_err(|e| self.to_engine(e))?
+            .and_then(|value| serde_json::from_str::<(u32, u32, String)>(&value).ok());
+        if input != Some((run, attempt, pending.message_id.clone())) { return Ok(String::new()) }
+        let at = {
+            let Some(t) = self.known_thread(&pending.chat).map_err(|e| self.to_engine(e))? else { return Ok(String::new()) };
+            let at = AttemptId { run: RunId { thread: t, ord: run }, n: attempt };
+            let state = self.driver.state().map_err(|e| self.to_engine(e))?;
+            let Ok(thread) = state.thread(t) else { return Ok(String::new()) };
+            if !thread.is_live() || thread.int_req || thread.attempt.emitted || thread.attempt_id() != at || !self.boot_live.contains(&at)
+                || engine.owns_run(&pending.chat)
+            { return Ok(String::new()) }
+            tasks::clamp_access(&mut pending, thread.access);
+            at
+        };
+        let retry_input = serde_json::to_string(&pending).map_err(|error| EngineError::Other(error.to_string()))?;
+        self.driver.put_meta(&format!("retry-input:{}:{}:{}", pending.chat, run, attempt.saturating_add(1)), &retry_input)
+            .map_err(|error| self.to_engine(error))?;
+        self.terminal_unstarted_locked(&pending.chat, at, Outcome::Crash).map_err(|error| self.to_engine(error))?;
+        self.wake.notify_one();
+        Ok(String::new())
+    }
+
+    pub(crate) fn with_runtime_admission<T>(&self, at: AttemptId, access: u8, f: impl FnOnce() -> Result<T, EngineError>) -> Result<T, EngineError> {
+        let _g = lock(&self.gate);
+        let state = self.driver.state().map_err(|e| self.to_engine(e))?;
+        let admitted = state.thread(at.run.thread).is_ok_and(|thread|
+            thread.is_live() && !thread.int_req && !thread.attempt.emitted
+                && thread.attempt_id() == at && access <= thread.access);
+        if !admitted { return Err(EngineError::Other("orchestrator attempt no longer admits a turn".into())) }
+        f()
+    }
+
+    pub(crate) fn runtime_attempt_current(&self, at: AttemptId) -> bool {
+        self.driver.state().is_ok_and(|state| state.thread(at.run.thread).is_ok_and(|thread|
+            thread.is_live() && !thread.int_req && thread.attempt_id() == at))
+    }
+
+    fn claim_pending(&self, effect_id: &str) -> Result<bool, DriverError> {
+        if !lock(&self.claimed).insert(effect_id.to_owned()) {
+            return Ok(false);
         }
-        Ok(())
+        match self.driver.effect_pending(effect_id) {
+            Ok(true) => Ok(true),
+            result => {
+                lock(&self.claimed).remove(effect_id);
+                result.map(|_| false)
+            }
+        }
     }
 
     pub async fn run_effects(
@@ -869,6 +1067,9 @@ impl OrchWire {
         engine: &dyn RunEngine,
         only: Option<&[String]>,
     ) -> Vec<Result<Ran, EngineError>> {
+        if self.recovering.load(std::sync::atomic::Ordering::Acquire) {
+            return vec![Err(EngineError::Other("orchestrator recovery is pending or blocked; check the engine log".into()))];
+        }
         if let Err(err) = self.retry_native_terminals(engine) {
             tracing::warn!(error = %err, "native terminal save remains pending");
         }
@@ -879,15 +1080,21 @@ impl OrchWire {
         let mut out = Vec::new();
         let mut busy = HashSet::new();
         for row in rows {
+            let t = order_key(&row.effect);
             if only.is_some_and(|ids| !ids.contains(&row.effect_id)) {
+                busy.extend(t);
                 continue;
             }
-            let t = order_key(&row.effect);
             if t.is_some_and(|t| busy.contains(&t)) {
                 continue;
             }
-            if self.is_dead() || !lock(&self.claimed).insert(row.effect_id.clone()) {
-                busy.extend(t);
+            let claimed = match self.claim_pending(&row.effect_id) {
+                Ok(claimed) => claimed,
+                Err(err) => { out.push(Err(self.to_engine(err))); return out; }
+            };
+            if self.is_dead() || !claimed {
+                if claimed { lock(&self.claimed).remove(&row.effect_id); }
+                if lock(&self.claimed).contains(&row.effect_id) { busy.extend(t); }
                 continue;
             }
             let res = self.execute(engine, &row, false).await;
@@ -903,10 +1110,12 @@ impl OrchWire {
                 continue;
             }
             if let Err(err) = self.driver.complete(&row.effect_id) {
+                lock(&self.claimed).remove(&row.effect_id);
                 out.push(Err(self.to_engine(err)));
                 return out;
             }
             lock(&self.claimed).remove(&row.effect_id);
+            self.wake.notify_one();
             out.push(res);
         }
         out
@@ -919,7 +1128,10 @@ impl OrchWire {
         replay: bool,
     ) -> Result<Ran, EngineError> {
         let wrap = |e: DriverError| EngineError::Other(format!("orchestrator: {e}"));
-        if self.remote_effect(engine, &row.effect).map_err(wrap)? {
+        if self
+            .remote_effect(engine, &row.effect, &row.effect_id)
+            .map_err(wrap)?
+        {
             return Ok(Ran::Nothing);
         }
         match &row.effect {
@@ -956,9 +1168,9 @@ impl OrchWire {
                 self.start(engine, &row.effect_id, *attempt, p, replay)
                     .await
             }
-            Effect::SteerRun { msg, .. } => {
+            Effect::SteerRun { msg, attempt } => {
                 let p = self.pending_of(*msg).map_err(wrap)?;
-                self.steer(engine, p).await
+                STARTING_ATTEMPT.scope(*attempt, self.steer(engine, p)).await
             }
             Effect::InterruptAttempt { attempt } => {
                 let chat = self.chat_of(attempt.run.thread).map_err(wrap)?;
@@ -968,6 +1180,7 @@ impl OrchWire {
             Effect::InterruptRun { run } => {
                 let chat = self.chat_of(run.thread).map_err(wrap)?;
                 engine.interrupt_run(&chat).await;
+                if !engine.owns_run(&chat) { self.reconcile_absent_natives(engine,&chat)?; }
                 Ok(Ran::Nothing)
             }
             Effect::ArmTimer { run } => {
@@ -1023,7 +1236,7 @@ impl OrchWire {
                         zeron_orch::native::NativeStatus::Completed => "done",
                         _ => "failed",
                     };
-                    engine.native_changed(&chat, &tool, status)?;
+                    engine.native_changed_task(&chat, *key, &tool, status)?;
                 }
                 self.task_events.notify_waiters();
                 Ok(Ran::Nothing)
@@ -1106,6 +1319,10 @@ impl OrchWire {
         if let Some(n) = msg {
             return self.pending_of(n);
         }
+        let chat = self.chat_of(at.run.thread)?;
+        if let Some(input) = self.driver.meta(&format!("retry-input:{chat}:{}:{}", at.run.ord, at.n))? {
+            return Ok(serde_json::from_str(&input)?);
+        }
         let s = self.driver.state()?;
         let th = s
             .thread(at.run.thread)
@@ -1138,6 +1355,17 @@ impl OrchWire {
         _replay: bool,
     ) -> Result<Ran, EngineError> {
         let marker = format!("fx:{effect_id}");
+        if let Some(route) = engine.orch_route(&p.chat) {
+            let key = format!("remote-host:{}", p.chat);
+            if self.driver.meta(&key).map_err(|error| self.to_engine(error))?.is_some_and(|host| host != route.host) {
+                return Err(EngineError::Other("registry host changed without handoff".into()));
+            }
+            self.driver.put_meta(&key, &route.host).map_err(|error| self.to_engine(error))?;
+            self.driver.observe_mechanism(
+                &format!("registry-host:{}", p.chat), "registry_host",
+                serde_json::json!({"chat":p.chat,"host":route.host,"parent":route.parent,"validated":true}),
+            ).map_err(|error| self.to_engine(error))?;
+        }
         let access_ceiling = self.driver.state().ok().and_then(|state| {
             state.thread(at.run.thread).ok().map(|thread| thread.access)
         });
@@ -1207,13 +1435,16 @@ impl OrchWire {
         lock(&self.expect).insert(p.chat.clone(), at);
         let before = engine.journal_seq(&p.chat);
         let jseq = format!("{}:{}:{}", at.run.ord, at.n, before);
+        let input = serde_json::to_string(&(at.run.ord, at.n, &p.message_id))
+            .map_err(|error| EngineError::Other(error.to_string()))?;
         if let Err(error) = self.driver.put_meta(&format!("jseq:{}", p.chat), &jseq)
+            .and_then(|()| self.driver.put_meta(&format!("start-input:{}", p.chat), &input))
             .and_then(|()| self.driver.put_meta(&intent, &jseq))
         {
             self.start_failed(&p.chat, at);
             return Err(self.to_engine(error));
         }
-        let result = self.quietly(&p.chat, engine.start(&p)).await;
+        let result = STARTING_ATTEMPT.scope(at, self.quietly(&p.chat, engine.start(&p))).await;
         let after = engine.journal_seq(&p.chat);
         match result {
             Ok(id) => {
@@ -1269,6 +1500,10 @@ impl OrchWire {
         outcome: Outcome,
     ) -> Result<(), DriverError> {
         let _g = lock(&self.gate);
+        self.terminal_unstarted_locked(chat, at, outcome)
+    }
+
+    fn terminal_unstarted_locked(&self, chat: &str, at: AttemptId, outcome: Outcome) -> Result<(), DriverError> {
         let ev = Event::Run(RunEvent::ProviderTerminal {
             t: at.run.thread,
             run: at.run.ord,
@@ -1391,8 +1626,8 @@ impl OrchWire {
             if t.is_some_and(|t| busy.contains(&t)) {
                 continue;
             }
-            if !lock(&self.claimed).insert(row.effect_id.clone()) {
-                busy.extend(t);
+            if !self.claim_pending(&row.effect_id).map_err(|e| self.to_engine(e))? {
+                if lock(&self.claimed).contains(&row.effect_id) { busy.extend(t); }
                 continue;
             }
             if let Err(err) = self.execute(engine, &row, true).await {
@@ -1406,14 +1641,14 @@ impl OrchWire {
                     continue;
                 }
             }
-            self.driver
-                .complete(&row.effect_id)
-                .map_err(|e| self.to_engine(e))?;
+            let completed = self.driver.complete(&row.effect_id);
             lock(&self.claimed).remove(&row.effect_id);
+            completed.map_err(|e| self.to_engine(e))?;
         }
         self.reconcile(engine).map_err(|e| self.to_engine(e))?;
         self.pump_all().map_err(|e| self.to_engine(e))?;
         self.rearm().map_err(|e| self.to_engine(e))?;
+        self.recovering.store(false, std::sync::atomic::Ordering::Release);
         self.wake.notify_one();
         Ok(())
     }
@@ -1552,3 +1787,15 @@ where
 #[cfg(test)]
 #[path = "wire/provider_mechanism_tests.rs"]
 mod provider_mechanism_tests;
+
+#[cfg(test)]
+#[path = "wire/stop_tests.rs"]
+mod stop_tests;
+
+tokio::task_local! {
+    static STARTING_ATTEMPT: AttemptId;
+}
+
+pub(crate) fn starting_attempt() -> Option<AttemptId> {
+    STARTING_ATTEMPT.try_with(|at| *at).ok()
+}
