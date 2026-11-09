@@ -515,10 +515,6 @@ impl OrchWire {
         if self.is_dead() {
             return;
         }
-        if status == DoneStatus::Interrupted && lock(&self.quiet).get(chat).is_some_and(|n| *n > 0)
-        {
-            return;
-        }
         match self.done_locked(chat, status, failure) {
             Ok(changed) => {
                 self.wake.notify_one();
@@ -547,6 +543,10 @@ impl OrchWire {
             return Ok(false);
         };
         if !th.is_live() {
+            return Ok(false);
+        }
+        let quiet = lock(&self.quiet).get(chat).is_some_and(|n| *n > 0);
+        if status == DoneStatus::Interrupted && quiet && !th.int_req {
             return Ok(false);
         }
         let held = th.held;
@@ -721,7 +721,7 @@ impl OrchWire {
             return Ok(Ran::Nothing);
         }
         lock(&self.expect).insert(p.chat.clone(), at);
-        match engine.start(&p).await {
+        match self.quietly(&p.chat, engine.start(&p)).await {
             Ok(id) => {
                 if let Err(err) = self.driver.put_meta(&marker, "1") {
                     tracing::warn!(error = %err, "orchestrator start marker failed");

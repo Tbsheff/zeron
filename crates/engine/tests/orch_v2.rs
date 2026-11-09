@@ -32,9 +32,16 @@ struct Agent {
     steers: Arc<Mutex<Vec<String>>>,
     tries: Mutex<HashMap<String, u32>>,
     interrupt_delay: Duration,
+    parks: bool,
 }
 
 impl Agent {
+    fn parking() -> Arc<Self> {
+        let mut a = Arc::into_inner(Self::new(Some(SteeringMode::TurnBoundary))).expect("fresh");
+        a.parks = true;
+        Arc::new(a)
+    }
+
     fn new(steering: Option<SteeringMode>) -> Arc<Self> {
         let (finish, _) = tokio::sync::broadcast::channel(16);
         Arc::new(Self {
@@ -44,6 +51,7 @@ impl Agent {
             steers: Arc::default(),
             tries: Mutex::default(),
             interrupt_delay: Duration::from_millis(300),
+            parks: false,
         })
     }
 
@@ -89,10 +97,10 @@ fn done(status: DoneStatus, failure: Option<FailureClass>) -> AgentEvent {
 
 async fn hold(
     then: AgentEvent,
-    mut controls: RunControls,
-    mut finish: tokio::sync::broadcast::Receiver<()>,
-    steers: Arc<Mutex<Vec<String>>>,
-    tx: futures::channel::mpsc::UnboundedSender<Result<AgentEvent, HarnessError>>,
+    controls: &mut RunControls,
+    finish: &mut tokio::sync::broadcast::Receiver<()>,
+    steers: &Arc<Mutex<Vec<String>>>,
+    tx: &futures::channel::mpsc::UnboundedSender<Result<AgentEvent, HarnessError>>,
     delay: Duration,
 ) -> AgentEvent {
     loop {
@@ -152,22 +160,44 @@ impl Harness for Agent {
         let finish = self.finish.subscribe();
         let steers = self.steers.clone();
         let delay = self.interrupt_delay;
+        let parks = self.parks;
         tokio::spawn(async move {
-            let last = match plan {
-                Plan::Done(status, failure) => done(status, failure),
-                Plan::Hold(status, failure) => {
-                    hold(
-                        done(status, failure),
-                        controls,
-                        finish,
-                        steers,
-                        tx.clone(),
-                        delay,
-                    )
-                    .await
+            let (mut controls, mut finish, mut plan) = (controls, finish, plan);
+            loop {
+                let last = match plan {
+                    Plan::Done(status, failure) => done(status, failure),
+                    Plan::Hold(status, failure) => {
+                        let then = done(status, failure);
+                        hold(then, &mut controls, &mut finish, &steers, &tx, delay).await
+                    }
+                };
+                let stopped = matches!(
+                    last,
+                    AgentEvent::Done {
+                        status: DoneStatus::Interrupted,
+                        ..
+                    }
+                );
+                let _ = tx.unbounded_send(Ok(last));
+                if !parks || stopped {
+                    return;
                 }
-            };
-            let _ = tx.unbounded_send(Ok(last));
+                let next = tokio::select! {
+                    m = controls.steering.recv() => m,
+                    () = controls.interrupt.cancelled() => None,
+                };
+                let Some(m) = next else { return };
+                plan = if m.prompt.starts_with("hold") {
+                    Plan::Hold(DoneStatus::Completed, None)
+                } else {
+                    Plan::Done(DoneStatus::Completed, None)
+                };
+                steers.lock().unwrap().push(m.prompt);
+                let _ = tx.unbounded_send(Ok(AgentEvent::Steered {
+                    assistant_message_id: None,
+                    next_assistant_message_id: Some(uuid::Uuid::new_v4().to_string()),
+                }));
+            }
         });
         Ok(rx.boxed())
     }
@@ -591,6 +621,33 @@ async fn a_usage_limit_resumes_at_reset_and_then_sends_the_held_person_message()
     for act in ["ResetPasses", "UsageLimitRecovery"] {
         assert!(acts.iter().any(|a| a == act), "{act} missing");
     }
+    r.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parked_runtime_takes_each_next_run_through_its_mailbox() {
+    let r = rig(Agent::parking(), Some(OrchOptions::default())).await;
+    r.send("first", "m1");
+    r.wait_statuses(&[RunStatus::Completed], "run 1 ends").await;
+    r.send("second", "m2");
+    r.wait_statuses(&[RunStatus::Completed, RunStatus::Completed], "run 2 ends")
+        .await;
+    r.core
+        .doc_host
+        .queue_message(CHAT, "third", Vec::new())
+        .expect("queue");
+    r.wait_statuses(&[RunStatus::Completed; 3], "run 3 ends")
+        .await;
+    assert_eq!(
+        r.agent.steers.lock().unwrap().as_slice(),
+        ["second"],
+        "run 2 went through the parked runtime's mailbox"
+    );
+    assert_eq!(
+        r.agent.runs(),
+        ["first", "third"],
+        "the queue drain's chat-row request replaces the runtime, as with the flag off"
+    );
     r.finish().await;
 }
 
