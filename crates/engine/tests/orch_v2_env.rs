@@ -78,8 +78,11 @@ impl RunEngine for Idle {
     fn owns_run(&self, _: &str) -> bool {
         false
     }
-    fn last_done(&self, _: &str) -> Option<(DoneStatus, Option<zeron_proto::FailureClass>)> {
+    fn last_done(&self, _: &str) -> Option<(u64, DoneStatus, Option<zeron_proto::FailureClass>)> {
         None
+    }
+    fn journal_seq(&self, _: &str) -> u64 {
+        0
     }
     fn kick_drain(&self, _: &str) {}
 }

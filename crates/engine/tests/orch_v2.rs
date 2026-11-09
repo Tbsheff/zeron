@@ -645,6 +645,57 @@ async fn a_transient_failure_retries_within_the_budget() {
     r.finish().await;
 }
 
+fn ticking(every: Duration) -> OrchOptions {
+    OrchOptions {
+        reconcile_every: every,
+        ..OrchOptions::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_done_is_reconciled_on_the_timer_and_the_queue_moves_on() {
+    let r = rig(Agent::new(None), Some(ticking(Duration::from_millis(100)))).await;
+    r.wire().lose_next_done(CHAT);
+    r.send("hello", "m1");
+    wait_for(|| r.agent.runs() == ["hello"], "the run starts").await;
+    r.wait_statuses(
+        &[RunStatus::Completed],
+        "the tick ends the run from the journal",
+    )
+    .await;
+    r.core
+        .doc_host
+        .queue_message(CHAT, "next", Vec::new())
+        .expect("queue");
+    r.wait_statuses(
+        &[RunStatus::Completed, RunStatus::Completed],
+        "the queue drains",
+    )
+    .await;
+    assert_eq!(r.agent.runs(), ["hello", "next"], "no prompt ran twice");
+    r.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_done_is_reconciled_when_the_engine_starts() {
+    let agent = Agent::new(None);
+    let slow = ticking(Duration::from_secs(3600));
+    let r = rig(agent.clone(), Some(slow.clone())).await;
+    r.wire().lose_next_done(CHAT);
+    r.send("hello", "m1");
+    wait_for(|| r.agent.runs() == ["hello"], "the run starts").await;
+    settle().await;
+    assert_eq!(r.statuses(), [RunStatus::Live], "the Done was lost");
+    let dir = r.dir.clone();
+    r.core.shutdown().await;
+    drop(r);
+    let r = boot(dir, agent, Some(slow)).await;
+    r.wait_statuses(&[RunStatus::Completed], "startup reconcile ends the run")
+        .await;
+    assert_eq!(r.agent.runs(), ["hello"]);
+    r.finish().await;
+}
+
 fn fast_retries() -> OrchOptions {
     OrchOptions {
         retry_delays: vec![Duration::from_millis(20)],

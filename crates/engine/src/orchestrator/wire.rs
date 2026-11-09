@@ -84,7 +84,8 @@ pub trait RunEngine: Send + Sync {
     async fn stop_attempt(&self, chat: &str) -> bool;
     async fn interrupt_run(&self, chat: &str) -> bool;
     fn owns_run(&self, chat: &str) -> bool;
-    fn last_done(&self, chat: &str) -> Option<(DoneStatus, Option<FailureClass>)>;
+    fn last_done(&self, chat: &str) -> Option<(u64, DoneStatus, Option<FailureClass>)>;
+    fn journal_seq(&self, chat: &str) -> u64;
     fn kick_drain(&self, chat: &str);
 }
 
@@ -184,6 +185,8 @@ pub struct OrchWire {
     claimed_msgs: Mutex<HashSet<String>>,
     redeliver: Mutex<HashSet<(String, String)>>,
     quiet: Mutex<HashMap<String, u32>>,
+    suspect: Mutex<HashMap<String, AttemptId>>,
+    lose: Mutex<HashSet<String>>,
     dead: std::sync::atomic::AtomicBool,
     wake: tokio::sync::Notify,
 }
@@ -206,6 +209,8 @@ impl OrchWire {
             claimed_msgs: Mutex::new(HashSet::new()),
             redeliver: Mutex::new(HashSet::new()),
             quiet: Mutex::new(HashMap::new()),
+            suspect: Mutex::new(HashMap::new()),
+            lose: Mutex::new(HashSet::new()),
             dead: std::sync::atomic::AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
         }))
@@ -240,12 +245,111 @@ impl OrchWire {
 
     async fn worker(self: Arc<Self>) {
         loop {
-            self.wake.notified().await;
+            let tick = tokio::select! {
+                () = self.wake.notified() => false,
+                () = tokio::time::sleep(self.opts.reconcile_every) => true,
+            };
             let Some(engine) = self.engine() else { return };
             if self.is_dead() {
                 return;
             }
+            if tick && let Err(err) = self.check_stuck(engine.as_ref()) {
+                self.fail(err);
+            }
             self.run_effects(engine.as_ref(), None).await;
+        }
+    }
+
+    pub fn lose_next_done(&self, chat: &str) {
+        lock(&self.lose).insert(chat.to_owned());
+    }
+
+    fn check_stuck(&self, engine: &dyn RunEngine) -> Result<(), DriverError> {
+        let s = self.driver.state()?;
+        let pending = self.driver.pending()?;
+        let mut seen = HashMap::new();
+        for th in s.threads.values().filter(|th| th.is_live()) {
+            let chat = self.chat_of(th.id)?;
+            if !self.may_be_stuck(engine, th, &chat, &pending) {
+                continue;
+            }
+            let at = th.attempt_id();
+            if lock(&self.suspect).get(&chat) == Some(&at) {
+                self.end_stuck(engine, &chat, at)?;
+            } else {
+                seen.insert(chat, at);
+            }
+        }
+        *lock(&self.suspect) = seen;
+        Ok(())
+    }
+
+    fn may_be_stuck(
+        &self,
+        engine: &dyn RunEngine,
+        th: &Thread,
+        chat: &str,
+        pending: &[OutboxRow],
+    ) -> bool {
+        let starting = pending.iter().any(|r| starts(&r.effect, th.id));
+        let quiet = lock(&self.quiet).get(chat).is_some_and(|n| *n > 0);
+        !th.attempt.emitted && !starting && !quiet && !engine.owns_run(chat)
+    }
+
+    fn end_stuck(
+        &self,
+        engine: &dyn RunEngine,
+        chat: &str,
+        at: AttemptId,
+    ) -> Result<(), DriverError> {
+        let outcome = self.stuck_outcome(engine, chat, at);
+        tracing::warn!(
+            chat,
+            run = at.run.ord,
+            attempt = at.n,
+            ?outcome,
+            "orchestrator run is live but the engine has none; ending it"
+        );
+        let _g = lock(&self.gate);
+        let s = self.driver.state()?;
+        let th = s
+            .thread(at.run.thread)
+            .map_err(|r| DriverError::Corrupt(format!("{r:?}")))?;
+        if th.attempt_id() != at || !th.is_live() {
+            return Ok(());
+        }
+        if self.unrequested_stop(th, at, outcome) {
+            self.engine_interrupt(at.run.thread, chat, at)?;
+        }
+        let ev = Event::Run(RunEvent::ProviderTerminal {
+            t: at.run.thread,
+            run: at.run.ord,
+            attempt: at.n,
+            outcome,
+        });
+        let key = format!("done:{chat}:{}:{}", at.run.ord, at.n);
+        self.driver.apply_if(&key, ev, &enabled(ev))?;
+        self.pump(at.run.thread, chat, &mut Vec::new())?;
+        if let Some(e) = self.engine() {
+            e.kick_drain(chat);
+        }
+        Ok(())
+    }
+
+    fn stuck_outcome(&self, engine: &dyn RunEngine, chat: &str, at: AttemptId) -> Outcome {
+        let since = self
+            .driver
+            .meta(&format!("jseq:{chat}"))
+            .ok()
+            .flatten()
+            .and_then(|v| parse_jseq(&v))
+            .filter(|(ord, n, _)| *ord == at.run.ord && *n == at.n)
+            .map(|(_, _, seq)| seq);
+        match (since, engine.last_done(chat)) {
+            (Some(start), Some((seq, status, failure))) if seq > start => {
+                outcome_of(status, failure)
+            }
+            _ => Outcome::Crash,
         }
     }
 
@@ -578,10 +682,10 @@ impl OrchWire {
     }
 
     pub fn provider_done(&self, chat: &str, status: DoneStatus, failure: Option<FailureClass>) {
-        if self.is_dead() {
+        if self.is_dead() || lock(&self.lose).remove(chat) {
             return;
         }
-        match self.done_locked(chat, status, failure) {
+        match self.done_locked(chat, outcome_of(status, failure)) {
             Ok(changed) => {
                 self.wake.notify_one();
                 if changed && let Some(e) = self.engine() {
@@ -594,12 +698,7 @@ impl OrchWire {
         }
     }
 
-    fn done_locked(
-        &self,
-        chat: &str,
-        status: DoneStatus,
-        failure: Option<FailureClass>,
-    ) -> Result<bool, DriverError> {
+    fn done_locked(&self, chat: &str, outcome: Outcome) -> Result<bool, DriverError> {
         let _g = lock(&self.gate);
         let Some(t) = self.known_thread(chat)? else {
             return Ok(false);
@@ -612,7 +711,7 @@ impl OrchWire {
             return Ok(false);
         }
         let quiet = lock(&self.quiet).get(chat).is_some_and(|n| *n > 0);
-        if status == DoneStatus::Interrupted && quiet && !th.int_req {
+        if outcome == Outcome::Interrupted && quiet && !th.int_req {
             return Ok(false);
         }
         let held = th.held;
@@ -620,7 +719,6 @@ impl OrchWire {
             .get(chat)
             .copied()
             .unwrap_or(th.attempt_id());
-        let outcome = outcome_of(status, failure);
         let ev = Event::Run(RunEvent::ProviderTerminal {
             t,
             run: at.run.ord,
@@ -804,6 +902,10 @@ impl OrchWire {
             return Ok(Ran::Nothing);
         }
         lock(&self.expect).insert(p.chat.clone(), at);
+        let jseq = format!("{}:{}:{}", at.run.ord, at.n, engine.journal_seq(&p.chat));
+        if let Err(err) = self.driver.put_meta(&format!("jseq:{}", p.chat), &jseq) {
+            tracing::warn!(error = %err, "orchestrator journal mark failed");
+        }
         match self.quietly(&p.chat, engine.start(&p)).await {
             Ok(id) => {
                 if let Err(err) = self.driver.put_meta(&marker, "1") {
@@ -954,13 +1056,11 @@ impl OrchWire {
 
     fn reconcile(&self, engine: &dyn RunEngine) -> Result<(), DriverError> {
         let s = self.driver.state()?;
+        let pending = self.driver.pending()?;
         for th in s.threads.values().filter(|th| th.is_live()) {
             let chat = self.chat_of(th.id)?;
-            if engine.owns_run(&chat) {
-                continue;
-            }
-            if let Some((status, failure)) = engine.last_done(&chat) {
-                self.done_locked(&chat, status, failure)?;
+            if self.may_be_stuck(engine, th, &chat, &pending) {
+                self.end_stuck(engine, &chat, th.attempt_id())?;
             }
         }
         Ok(())
@@ -975,6 +1075,22 @@ impl OrchWire {
         }
         Ok(())
     }
+}
+
+fn starts(effect: &Effect, t: ThreadId) -> bool {
+    match effect {
+        Effect::StartRun { run, .. } => run.thread == t,
+        Effect::StartAttempt { attempt, .. } => attempt.run.thread == t,
+        _ => false,
+    }
+}
+
+fn parse_jseq(v: &str) -> Option<(u32, u32, u64)> {
+    let mut it = v.split(':');
+    let ord = it.next()?.parse().ok()?;
+    let n = it.next()?.parse().ok()?;
+    let seq = it.next()?.parse().ok()?;
+    Some((ord, n, seq))
 }
 
 fn now_ms() -> i64 {

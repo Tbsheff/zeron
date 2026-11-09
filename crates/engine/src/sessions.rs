@@ -467,16 +467,25 @@ impl SessionsEngine {
     pub(crate) fn journal_last_done(
         &self,
         chat_id: &str,
-    ) -> Option<(DoneStatus, Option<zeron_proto::FailureClass>)> {
+    ) -> Option<(u64, DoneStatus, Option<zeron_proto::FailureClass>)> {
         match self.inner.journal.last_event(chat_id).ok()?? {
             (
-                _,
+                seq,
                 AgentEvent::Done {
                     status, failure, ..
                 },
-            ) => Some((status, failure)),
+            ) => Some((seq, status, failure)),
             _ => None,
         }
+    }
+
+    pub(crate) fn journal_seq(&self, chat_id: &str) -> u64 {
+        self.inner
+            .journal
+            .last_event(chat_id)
+            .ok()
+            .flatten()
+            .map_or(0, |(seq, _)| seq)
     }
 
     fn orch_send<'a>(

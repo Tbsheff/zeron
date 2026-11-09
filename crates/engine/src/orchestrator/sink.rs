@@ -138,8 +138,12 @@ impl RunEngine for SessionsEngine {
         self.has_run(chat) || self.reviving_any(chat)
     }
 
-    fn last_done(&self, chat: &str) -> Option<(DoneStatus, Option<FailureClass>)> {
+    fn last_done(&self, chat: &str) -> Option<(u64, DoneStatus, Option<FailureClass>)> {
         self.journal_last_done(chat)
+    }
+
+    fn journal_seq(&self, chat: &str) -> u64 {
+        self.journal_seq(chat)
     }
 
     fn kick_drain(&self, _chat: &str) {
