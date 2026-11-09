@@ -442,6 +442,20 @@ impl SessionsEngine {
         self.orch_for(chat_id).is_some()
     }
 
+    pub(crate) fn orch_command_done(&self, command_id: &str) -> bool {
+        self.inner
+            .orch
+            .get()
+            .is_some_and(|wire| wire.command_receipt(command_id))
+    }
+
+    pub(crate) fn orch_finish_command(&self, command_id: &str) -> bool {
+        self.inner
+            .orch
+            .get()
+            .is_none_or(|wire| wire.finish_command(command_id).is_ok())
+    }
+
     pub(crate) fn host(&self) -> Option<DocHost> {
         self.inner.doc_host()
     }

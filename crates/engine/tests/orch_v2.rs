@@ -721,6 +721,40 @@ async fn fp3_a_rolled_back_send_leaves_nothing_to_replay() {
     r.finish().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fp4_a_receipted_command_without_a_ledger_mark_is_applied_not_run_again() {
+    let r = crash_then_restart(FaultPoint::Fp4ReceiptNotMarked, 0, "hello").await;
+    let statuses = || {
+        r.core
+            .doc_host
+            .open(CHAT)
+            .expect("open")
+            .doc()
+            .read_commands()
+            .expect("commands")
+            .iter()
+            .map(|c| c.status)
+            .collect::<Vec<_>>()
+    };
+    wait_for(
+        || statuses() == [zeron_doc::SessionCommandStatus::Applied],
+        "recovery marks the receipted command applied",
+    )
+    .await;
+    wait_for(
+        || r.statuses() == [RunStatus::Completed],
+        "the run ends once",
+    )
+    .await;
+    settle().await;
+    assert_eq!(r.agent.runs(), ["hello"], "exactly one provider run");
+    assert!(
+        r.acts().iter().filter(|a| *a == "PersonSend").count() == 1,
+        "the command applied once"
+    );
+    r.finish().await;
+}
+
 async fn duplicate_attempts(orch: Option<OrchOptions>) -> Vec<String> {
     let r = rig(Agent::new(None), orch).await;
     r.send("once", "m1");

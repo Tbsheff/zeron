@@ -38,6 +38,7 @@ use zeron_proto::{ConversationSourceContext, HarnessId, UserInputAnswer, UserInp
 use zeron_sync::DocsStore;
 
 use crate::http_error::describe_http_error;
+use crate::orchestrator::wire::with_command;
 use crate::project_actions::{
     ProjectActionSetupHandoff, ProjectActionsStore, launch_project_setup_action,
 };
@@ -472,6 +473,15 @@ const ATTACHMENT_PROMPT_HEADER: &str = "Attached images (local files — open th
 /// Older clients stored the already-expanded prompt in `text`; recognize the
 /// exact trailer implied by `attachments` so those rows are not expanded a
 /// second time after an upgrade.
+fn receipt_first(sessions: &SessionsEngine, chat_id: &str, entry: &SessionCommandEntry) -> bool {
+    matches!(
+        entry.payload,
+        SessionCommandPayload::Run { .. }
+            | SessionCommandPayload::Steer { .. }
+            | SessionCommandPayload::Interrupt {}
+    ) && sessions.orchestrates(chat_id)
+}
+
 fn queued_message_prompt(text: &str, attachments: &[String]) -> String {
     if attachments.is_empty() {
         return text.to_string();
@@ -1216,7 +1226,7 @@ impl DocHost {
     /// A hosted chat has a command no drain has executed yet.
     fn has_waiting_commands(&self) -> bool {
         let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
-        let is_processed = |id: &str| self.inner.store.is_processed(id).unwrap_or(false);
+        let is_processed = |id: &str| self.command_processed(id);
         handles.iter().any(|handle| {
             self.is_host(&handle.chat_id)
                 && handle.doc.read_commands().is_ok_and(|commands| {
@@ -2364,8 +2374,7 @@ impl DocHost {
                 return false;
             };
             if commands.iter().any(|c| {
-                c.status == SessionCommandStatus::Pending
-                    && !self.inner.store.is_processed(&c.id).unwrap_or(false)
+                c.status == SessionCommandStatus::Pending && !self.command_processed(&c.id)
             }) {
                 return false;
             }
@@ -3244,7 +3253,7 @@ impl DocHost {
             return true;
         }
         if self.is_host(&handle.chat_id) {
-            let is_processed = |id: &str| self.inner.store.is_processed(id).unwrap_or(false);
+            let is_processed = |id: &str| self.command_processed(id);
             match handle.doc.read_commands() {
                 Ok(commands) => commands
                     .iter()
@@ -3274,7 +3283,7 @@ impl DocHost {
             return true;
         }
         if self.is_host(&handle.chat_id) {
-            let is_processed = |id: &str| self.inner.store.is_processed(id).unwrap_or(false);
+            let is_processed = |id: &str| self.command_processed(id);
             match handle.doc.read_commands() {
                 Ok(commands) => commands
                     .iter()
@@ -4806,10 +4815,7 @@ impl DocHost {
         let commands = handle.doc.read_commands()?;
         let pending: Vec<SessionCommandEntry> = commands
             .iter()
-            .filter(|c| {
-                c.status == SessionCommandStatus::Pending
-                    && !self.inner.store.is_processed(&c.id).unwrap_or(false)
-            })
+            .filter(|c| c.status == SessionCommandStatus::Pending && !self.command_processed(&c.id))
             .cloned()
             .collect();
         for entry in pending {
@@ -4844,8 +4850,7 @@ impl DocHost {
                 // an explicit user retry is exactly the consent to re-send.
                 SessionCommandStatus::Rejected | SessionCommandStatus::Expired => true,
                 SessionCommandStatus::Pending => {
-                    self.inner.store.is_processed(&c.id).unwrap_or(false)
-                        && !lock(&self.inner.executing).contains(&c.id)
+                    self.command_processed(&c.id) && !lock(&self.inner.executing).contains(&c.id)
                 }
                 _ => false,
             };
@@ -4857,7 +4862,7 @@ impl DocHost {
             let live_attempt = commands.iter().any(|o| {
                 o.id != c.id
                     && o.status == SessionCommandStatus::Pending
-                    && !self.inner.store.is_processed(&o.id).unwrap_or(false)
+                    && !self.command_processed(&o.id)
                     && match (&o.payload, &c.payload) {
                         (
                             SessionCommandPayload::Run { message_id: a, .. },
@@ -4956,7 +4961,7 @@ impl DocHost {
         let messages = handle.doc.read_entries().unwrap_or_default();
         let current_turn_id = messages.last().map(|m| m.id.clone());
         let turn_is_past = |turn_id: &str| messages.iter().any(|m| m.id == turn_id);
-        let is_processed = |id: &str| self.inner.store.is_processed(id).unwrap_or(false);
+        let is_processed = |id: &str| self.command_processed(id);
         let disposition = evaluate_command(
             &entry,
             &EvaluationContext {
@@ -5275,7 +5280,7 @@ impl DocHost {
                     return;
                 }
             };
-            let is_processed = |id: &str| self.inner.store.is_processed(id).unwrap_or(false);
+            let is_processed = |id: &str| self.command_processed(id);
             // Dead-command sweep: Pending in the doc, consumed by the ledger,
             // and NOT mid-execution in this process — the crash window
             // between mark-processed and the outcome write. Left alone it is
@@ -5298,14 +5303,7 @@ impl DocHost {
                     && !lock(&self.inner.executing).contains(&c.id)
                     && still_pending(&c.id)
                 {
-                    tracing::warn!(chat = %handle.chat_id, command = %c.id,
-                        "command consumed but never resolved (crash mid-execute?); rejecting");
-                    self.resolve_command(
-                        handle,
-                        &c.id,
-                        SessionCommandStatus::Rejected,
-                        Some("interrupted before completion — retry to send again"),
-                    );
+                    self.settle_dead_command(&sessions, handle, &c.id);
                     skipped.insert(c.id.clone());
                 }
             }
@@ -5387,12 +5385,22 @@ impl DocHost {
                 skipped.insert(entry.id.clone());
                 continue;
             }
+            let receipted = matches!(disposition, CommandDisposition::Execute)
+                && receipt_first(&sessions, &handle.chat_id, &entry);
             // Mark BEFORE executing: a crash mid-execution must never double-run a
             // command whose side effect may already have happened.
-            if let Err(err) = self.inner.store.mark_processed(&entry.id) {
+            if !receipted && let Err(err) = self.inner.store.mark_processed(&entry.id) {
                 tracing::error!(chat = %handle.chat_id, error = %err, "processed-ledger write failed; halting drain");
                 lock(&self.inner.executing).remove(&entry.id);
                 return;
+            }
+            if receipted {
+                let done = self.execute_receipted(&sessions, handle, &entry).await;
+                lock(&self.inner.executing).remove(&entry.id);
+                if !done {
+                    return;
+                }
+                continue;
             }
             match disposition {
                 CommandDisposition::Skip => {
@@ -5482,7 +5490,7 @@ impl DocHost {
         let commands = handle.doc.read_commands().unwrap_or_default();
         let command_waiting = commands.iter().any(|c| {
             c.status == SessionCommandStatus::Pending
-                && !self.inner.store.is_processed(&c.id).unwrap_or(false)
+                && !self.command_processed(&c.id)
                 && !self.missing_attachments(c).is_empty()
         });
         command_waiting
@@ -5572,6 +5580,56 @@ impl DocHost {
                 "command outcome write failed"
             );
         }
+    }
+
+    fn command_processed(&self, id: &str) -> bool {
+        self.inner.store.is_processed(id).unwrap_or(false)
+            || self.sessions().is_some_and(|s| s.orch_command_done(id))
+    }
+
+    fn settle_dead_command(&self, sessions: &SessionsEngine, handle: &ChatDocHandle, id: &str) {
+        if sessions.orch_command_done(id) {
+            tracing::info!(chat = %handle.chat_id, command = %id,
+                "command has an orchestrator receipt but no ledger mark; marking it applied");
+            if sessions.orch_finish_command(id) {
+                self.resolve_command(handle, id, SessionCommandStatus::Applied, None);
+            }
+            return;
+        }
+        tracing::warn!(chat = %handle.chat_id, command = %id,
+            "command consumed but never resolved (crash mid-execute?); rejecting");
+        self.resolve_command(
+            handle,
+            id,
+            SessionCommandStatus::Rejected,
+            Some("interrupted before completion — retry to send again"),
+        );
+    }
+
+    async fn execute_receipted(
+        &self,
+        sessions: &SessionsEngine,
+        handle: &Arc<ChatDocHandle>,
+        entry: &SessionCommandEntry,
+    ) -> bool {
+        if matches!(
+            entry.payload,
+            SessionCommandPayload::Run { .. } | SessionCommandPayload::Steer { .. }
+        ) {
+            self.await_earlier_controls(handle, &entry.id).await;
+        }
+        let run = self.execute(sessions, handle, entry);
+        let (status, resolution) = match with_command(&entry.id, run).await {
+            Ok(outcome) => outcome,
+            Err(err) => (SessionCommandStatus::Rejected, Some(err.to_string())),
+        };
+        if !sessions.orch_finish_command(&entry.id) {
+            tracing::error!(chat = %handle.chat_id, command = %entry.id,
+                "ledger mark after the orchestrator receipt failed; halting drain");
+            return false;
+        }
+        self.resolve_command(handle, &entry.id, status, resolution.as_deref());
+        true
     }
 
     /// `entry` is a prompt sent before the Stop that has already acted on

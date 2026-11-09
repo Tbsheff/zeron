@@ -247,10 +247,28 @@ impl Driver {
                 continue;
             }
             out.push(self.apply_cmd(key, Some(key), *event)?);
-            self.faults.hit(FaultPoint::Fp4ReceiptNotMarked)?;
-            self.store.mark_processed(key)?;
+            self.mark_command(key)?;
         }
         Ok(out)
+    }
+
+    pub fn apply_command(
+        &self,
+        key: &str,
+        cmd: Option<&str>,
+        event: Event,
+    ) -> Result<ApplyResult, DriverError> {
+        self.apply_cmd(key, cmd, event)
+    }
+
+    pub fn has_receipt(&self, key: &str) -> Result<bool, DriverError> {
+        Ok(self.store.transact(|tx| store::receipt(tx, key))?.is_some())
+    }
+
+    pub fn mark_command(&self, cmd: &str) -> Result<(), DriverError> {
+        self.faults.hit(FaultPoint::Fp4ReceiptNotMarked)?;
+        self.store.mark_processed(cmd)?;
+        Ok(())
     }
 
     pub fn pending(&self) -> Result<Vec<OutboxRow>, DriverError> {

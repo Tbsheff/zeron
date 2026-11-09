@@ -375,6 +375,37 @@ impl OrchWire {
     ) -> Result<Decision, DriverError> {
         self.alive()?;
         let _g = lock(&self.gate);
+        let cmd = take_command();
+        let out = self.decide_send(p, kind, steerable, cmd.as_deref());
+        self.note_command(cmd.as_deref())?;
+        out
+    }
+
+    fn note_command(&self, cmd: Option<&str>) -> Result<(), DriverError> {
+        match cmd {
+            Some(id) => self.driver.put_meta(&command_key(id), "1"),
+            None => Ok(()),
+        }
+    }
+
+    pub fn command_receipt(&self, id: &str) -> bool {
+        let key = command_key(id);
+        self.driver.meta(&key).ok().flatten().is_some()
+            || self.driver.has_receipt(&key).unwrap_or(false)
+    }
+
+    pub fn finish_command(&self, id: &str) -> Result<(), DriverError> {
+        self.alive()?;
+        self.driver.mark_command(id).map_err(|e| self.fail(e))
+    }
+
+    fn decide_send(
+        &self,
+        p: &Pending,
+        kind: SendKind,
+        steerable: bool,
+        cmd: Option<&str>,
+    ) -> Result<Decision, DriverError> {
         let t = self.thread(&p.chat)?;
         let n = self.msg(&p.message_id)?;
         if kind != SendKind::Redeliver && self.ran(&p.message_id)? {
@@ -394,7 +425,8 @@ impl OrchWire {
         }
         self.stash(n, p)?;
         let (key, ev) = self.send_event(th, p, n, kind, steerable)?;
-        let r = self.driver.apply(&key, ev)?;
+        let key = cmd.map_or(key, command_key);
+        let r = self.driver.apply_command(&key, cmd, ev)?;
         let mut fx = accepted_ids(&r);
         if let Applied::Rejected { reason, .. } = r.applied {
             tracing::info!(chat = %p.chat, ?reason, "orchestrator refused the send");
@@ -501,11 +533,14 @@ impl OrchWire {
         self.alive()?;
         let _g = lock(&self.gate);
         let t = self.thread(chat)?;
-        let k = self.driver.bump(&format!("ints:{chat}"))?;
-        let r = self.driver.apply(
-            &format!("int:{chat}:{k}"),
-            Event::Run(RunEvent::RequestInterrupt { t }),
-        )?;
+        let cmd = take_command();
+        let key = match cmd.as_deref() {
+            Some(id) => command_key(id),
+            None => format!("int:{chat}:{}", self.driver.bump(&format!("ints:{chat}"))?),
+        };
+        let ev = Event::Run(RunEvent::RequestInterrupt { t });
+        let r = self.driver.apply_command(&key, cmd.as_deref(), ev)?;
+        self.note_command(cmd.as_deref())?;
         let mut fx = accepted_ids(&r);
         self.pump(t, chat, &mut fx)?;
         Ok(fx)
@@ -896,6 +931,24 @@ impl OrchWire {
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+tokio::task_local! {
+    static COMMAND: std::cell::RefCell<Option<String>>;
+}
+
+pub async fn with_command<F: std::future::Future>(id: &str, fut: F) -> F::Output {
+    COMMAND
+        .scope(std::cell::RefCell::new(Some(id.to_owned())), fut)
+        .await
+}
+
+fn take_command() -> Option<String> {
+    COMMAND.try_with(|c| c.borrow_mut().take()).ok().flatten()
+}
+
+fn command_key(id: &str) -> String {
+    format!("cmd:{id}")
 }
 
 pub fn spawn_task<F>(what: &'static str, fut: F) -> bool
