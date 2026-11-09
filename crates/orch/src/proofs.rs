@@ -1,11 +1,11 @@
 use crate::event::{DelEvent, DelegateMode, Event, How, Mode, OutboxEvent, RunEvent};
 use crate::ids::ThreadId;
-use crate::invariants::{Violation, all_violations, check_invariants, well_formed};
+use crate::invariants::{check_invariants, s1, s3, s5a, s6, well_formed};
 use crate::state::{
     CohortSt, Config, Delivery, Disp, Hold, Message, Msg, Node, OrchState, Outcome, ProviderEvent,
     Run, RunStatus, Start, Task, TaskSt, Thread, WakeRule,
 };
-use crate::step::step;
+use crate::step::apply_event;
 
 const R: ThreadId = ThreadId(0);
 const A: ThreadId = ThreadId(1);
@@ -98,10 +98,28 @@ fn assume_good(s: &OrchState) {
     kani::assume(check_invariants(s).is_ok());
 }
 
-fn preserved(s: &OrchState, e: Event, broken: fn(&Violation) -> bool) {
-    if let Ok((next, _)) = step(s, e) {
-        assert!(!all_violations(&next).iter().any(broken));
+fn preserved(mut s: OrchState, e: Event, holds: fn(&OrchState) -> bool) {
+    if apply_event(&mut s, e).is_ok() {
+        assert!(holds(&s));
     }
+}
+
+fn s1_holds(s: &OrchState) -> bool {
+    s.threads.values().all(|th| s1(th).is_ok())
+}
+
+fn s3_holds(s: &OrchState) -> bool {
+    s.threads
+        .values()
+        .all(|th| th.task.is_none_or(|k| s3(th.id, k).is_ok()))
+}
+
+fn s5a_holds(s: &OrchState) -> bool {
+    s.threads.values().all(|th| s5a(s, th).is_ok())
+}
+
+fn s6_holds(s: &OrchState) -> bool {
+    s.threads.values().all(|th| s6(s, th).is_ok())
 }
 
 fn lineage() -> OrchState {
@@ -110,6 +128,7 @@ fn lineage() -> OrchState {
         max_fanout: 1,
         max_queue: 2,
         max_retry: 1,
+        run_window: 8,
     });
     let mut root = Thread::new(R, None, 0, level(), kani::any());
     one_run(&mut root, Start::Queued(Msg::Person(1)));
@@ -125,37 +144,32 @@ fn lineage() -> OrchState {
     s
 }
 
-fn lineage_event() -> Event {
-    let mode = pick([DelegateMode::Async, DelegateMode::Wait]);
-    let child = pick([A, B, ThreadId(3)]);
-    Event::Del(pick([
-        DelEvent::NarrowAccess {
-            t: tid(),
-            access: level(),
-        },
-        DelEvent::Delegate {
-            t: tid(),
-            child,
-            mode,
-            access: level(),
-            reconfigure: kani::any(),
-        },
-    ]))
+fn delegate_event() -> Event {
+    Event::Del(DelEvent::Delegate {
+        t: tid(),
+        child: pick([A, B, ThreadId(3)]),
+        mode: pick([DelegateMode::Async, DelegateMode::Wait]),
+        access: level(),
+        reconfigure: kani::any(),
+    })
 }
 
-#[kani::proof]
-#[kani::unwind(5)]
-fn s6_access_narrow_under_narrow_and_delegate() {
-    let s = lineage();
-    assume_good(&s);
-    preserved(&s, lineage_event(), |v| {
-        matches!(v, Violation::S6AccessNarrow(_))
-    });
+fn narrow_event() -> Event {
+    Event::Del(DelEvent::NarrowAccess {
+        t: tid(),
+        access: level(),
+    })
 }
 
-#[kani::proof]
-#[kani::unwind(5)]
-fn s5a_depth_and_fanout_under_delegate_and_settle() {
+fn notice_event() -> Event {
+    Event::Outbox(OutboxEvent::DoNotice {
+        child: pick([A, B]),
+        run: 1,
+        how: how(),
+    })
+}
+
+fn with_notice() -> OrchState {
     let mut s = lineage();
     if kani::any() {
         s.outbox.insert(Message::Notice {
@@ -163,20 +177,58 @@ fn s5a_depth_and_fanout_under_delegate_and_settle() {
             run: 1,
         });
     }
-    assume_good(&s);
-    let e = if kani::any() {
-        lineage_event()
-    } else {
-        Event::Outbox(OutboxEvent::DoNotice {
-            child: pick([A, B]),
-            run: 1,
-            how: how(),
-        })
-    };
-    preserved(&s, e, |v| {
-        matches!(v, Violation::S5aDepth(_) | Violation::S5aFanout(_))
-    });
+    s
 }
+
+macro_rules! harness {
+    ($name:ident, $unwind:literal, $state:expr, $event:expr, $holds:expr) => {
+        #[kani::proof]
+        #[kani::unwind($unwind)]
+        fn $name() {
+            let s = $state;
+            assume_good(&s);
+            let pick_event = $event;
+            let e = pick_event(&s);
+            preserved(s, e, $holds);
+        }
+    };
+}
+
+harness!(
+    s6_narrow,
+    5,
+    lineage(),
+    |_: &OrchState| narrow_event(),
+    s6_holds
+);
+harness!(
+    s6_delegate,
+    5,
+    lineage(),
+    |_: &OrchState| delegate_event(),
+    s6_holds
+);
+harness!(
+    s5a_delegate,
+    5,
+    with_notice(),
+    |_: &OrchState| delegate_event(),
+    s5a_holds
+);
+harness!(
+    s5a_narrow,
+    5,
+    with_notice(),
+    |_: &OrchState| narrow_event(),
+    s5a_holds
+);
+harness!(
+    s5a_notice,
+    5,
+    with_notice(),
+    |_: &OrchState| notice_event(),
+    s5a_holds
+);
 
 fn lone_thread() -> OrchState {
     let mut s = OrchState::new(Config {
@@ -184,6 +236,7 @@ fn lone_thread() -> OrchState {
         max_fanout: 1,
         max_queue: 2,
         max_retry: 1,
+        run_window: 8,
     });
     let mut th = Thread::new(R, None, 0, 1, true);
     for _ in 0..small(2) {
@@ -226,52 +279,105 @@ fn lone_thread() -> OrchState {
     s
 }
 
-fn lone_event(s: &OrchState) -> Event {
-    let t = R;
-    let ev = s
-        .threads
+fn inbox_event(s: &OrchState) -> ProviderEvent {
+    s.threads
         .get(&R)
-        .and_then(|th| th.inbox.iter().next().copied());
-    let ev = ev.unwrap_or(ProviderEvent {
-        node: Node::Root,
-        run: 1,
-        attempt: 1,
-        outcome: Outcome::Completed,
-    });
-    match small(2) {
-        0 => Event::Run(pick([
-            RunEvent::StartFromQueue { t },
-            RunEvent::UsageLimitRecovery { t },
-            RunEvent::IngestEnd { t, ev },
-            RunEvent::RetryAttempt { t, ev },
-        ])),
-        1 => Event::Run(pick([
-            RunEvent::RestartActive {
-                t,
-                mode: Mode::Restart,
-                msg: 1,
-            },
-            RunEvent::ProviderTerminal {
-                t,
-                run: small(2),
-                attempt: small(2),
-                outcome: outcome(),
-            },
-            RunEvent::RequestInterrupt { t },
-            RunEvent::ResetPasses { t, run: small(2) },
-        ])),
-        _ => Event::Del(DelEvent::StartFromQueueWake { t }),
-    }
+        .and_then(|th| th.inbox.first().copied())
+        .unwrap_or(ProviderEvent {
+            node: Node::Root,
+            run: 1,
+            attempt: 1,
+            outcome: Outcome::Completed,
+        })
 }
 
-#[kani::proof]
-#[kani::unwind(5)]
-fn s1_at_most_one_active_run() {
-    let s = lone_thread();
-    assume_good(&s);
-    let e = lone_event(&s);
-    preserved(&s, e, |v| matches!(v, Violation::S1AtMostOneActiveRun(_)));
+fn lone_run(e: RunEvent) -> impl Fn(&OrchState) -> Event {
+    move |_| Event::Run(e)
 }
+
+const T: ThreadId = R;
+
+harness!(
+    s1_start_from_queue,
+    4,
+    lone_thread(),
+    lone_run(RunEvent::StartFromQueue { t: T }),
+    s1_holds
+);
+harness!(
+    s1_usage_limit_recovery,
+    4,
+    lone_thread(),
+    lone_run(RunEvent::UsageLimitRecovery { t: T }),
+    s1_holds
+);
+harness!(
+    s1_request_interrupt,
+    4,
+    lone_thread(),
+    lone_run(RunEvent::RequestInterrupt { t: T }),
+    s1_holds
+);
+harness!(
+    s1_restart_active,
+    4,
+    lone_thread(),
+    lone_run(RunEvent::RestartActive {
+        t: T,
+        mode: Mode::Restart,
+        msg: 1
+    }),
+    s1_holds
+);
+harness!(
+    s1_ingest_end,
+    4,
+    lone_thread(),
+    |s: &OrchState| Event::Run(RunEvent::IngestEnd {
+        t: T,
+        ev: inbox_event(s)
+    }),
+    s1_holds
+);
+harness!(
+    s1_retry_attempt,
+    4,
+    lone_thread(),
+    |s: &OrchState| Event::Run(RunEvent::RetryAttempt {
+        t: T,
+        ev: inbox_event(s)
+    }),
+    s1_holds
+);
+harness!(
+    s1_provider_terminal,
+    4,
+    lone_thread(),
+    |_: &OrchState| Event::Run(RunEvent::ProviderTerminal {
+        t: T,
+        run: small(2),
+        attempt: small(2),
+        outcome: outcome(),
+    }),
+    s1_holds
+);
+harness!(
+    s1_reset_passes,
+    4,
+    lone_thread(),
+    |_: &OrchState| Event::Run(RunEvent::ResetPasses {
+        t: T,
+        run: small(2)
+    }),
+    s1_holds
+);
+harness!(
+    s1_start_from_queue_wake,
+    4,
+    lone_thread(),
+    |_: &OrchState| Event::Del(DelEvent::StartFromQueueWake { t: T }),
+    s1_holds
+);
 
 fn delivery_state() -> OrchState {
     let mut s = OrchState::new(Config {
@@ -279,6 +385,7 @@ fn delivery_state() -> OrchState {
         max_fanout: 2,
         max_queue: 2,
         max_retry: 1,
+        run_window: 8,
     });
     let mut root = Thread::new(R, None, 0, 1, true);
     one_run(&mut root, Start::Queued(Msg::Person(1)));
@@ -315,59 +422,113 @@ fn delivery_state() -> OrchState {
     s
 }
 
-fn delivery_event(ev: ProviderEvent) -> Event {
-    match small(2) {
-        0 => Event::Del(pick([
-            DelEvent::ReadResult {
-                p: R,
-                c: A,
-                run: small(1),
-            },
-            DelEvent::WaitReturn { t: R },
-            DelEvent::WaitTimeout { t: R },
-            DelEvent::LateWaitAck { t: R },
-            DelEvent::StartFromQueueWake { t: R },
-            DelEvent::Stop { t: R },
-        ])),
-        1 => Event::Outbox(pick([
-            OutboxEvent::DoNotice {
-                child: A,
-                run: 1,
-                how: how(),
-            },
-            OutboxEvent::DoOffer {
-                parent: R,
-                run: 1,
-                generation: small(1),
-                how: how(),
-            },
-            OutboxEvent::DoStop {
-                child: A,
-                stop: 1,
-                how: how(),
-            },
-        ])),
-        _ => Event::Run(RunEvent::IngestEnd { t: R, ev }),
-    }
-}
-
-#[kani::proof]
-#[kani::unwind(5)]
-fn s3_exactly_once() {
+fn delivery_with_end() -> OrchState {
     let mut s = delivery_state();
-    let ev = ProviderEvent {
-        node: Node::Root,
-        run: 1,
-        attempt: 1,
-        outcome: pick([Outcome::Completed, Outcome::Interrupted]),
-    };
     if kani::any() {
         if let Some(root) = s.threads.get_mut(&R) {
-            root.inbox.insert(ev);
+            root.inbox.insert(ProviderEvent {
+                node: Node::Root,
+                run: 1,
+                attempt: 1,
+                outcome: pick([Outcome::Completed, Outcome::Interrupted]),
+            });
             root.attempt.emitted = true;
         }
     }
-    assume_good(&s);
-    let e = delivery_event(ev);
-    preserved(&s, e, |v| matches!(v, Violation::S3ExactlyOnce(_)));
+    s
 }
+
+fn del(e: DelEvent) -> impl Fn(&OrchState) -> Event {
+    move |_| Event::Del(e)
+}
+
+harness!(
+    s3_wait_return,
+    5,
+    delivery_with_end(),
+    del(DelEvent::WaitReturn { t: R }),
+    s3_holds
+);
+harness!(
+    s3_wait_timeout,
+    5,
+    delivery_with_end(),
+    del(DelEvent::WaitTimeout { t: R }),
+    s3_holds
+);
+harness!(
+    s3_late_wait_ack,
+    5,
+    delivery_with_end(),
+    del(DelEvent::LateWaitAck { t: R }),
+    s3_holds
+);
+harness!(
+    s3_stop,
+    5,
+    delivery_with_end(),
+    del(DelEvent::Stop { t: R }),
+    s3_holds
+);
+harness!(
+    s3_start_from_queue_wake,
+    5,
+    delivery_with_end(),
+    del(DelEvent::StartFromQueueWake { t: R }),
+    s3_holds
+);
+harness!(
+    s3_read_result,
+    5,
+    delivery_with_end(),
+    |_: &OrchState| Event::Del(DelEvent::ReadResult {
+        p: R,
+        c: A,
+        run: small(1)
+    }),
+    s3_holds
+);
+harness!(
+    s3_do_notice,
+    5,
+    delivery_with_end(),
+    |_: &OrchState| Event::Outbox(OutboxEvent::DoNotice {
+        child: A,
+        run: 1,
+        how: how()
+    }),
+    s3_holds
+);
+harness!(
+    s3_do_offer,
+    5,
+    delivery_with_end(),
+    |_: &OrchState| Event::Outbox(OutboxEvent::DoOffer {
+        parent: R,
+        run: 1,
+        generation: small(1),
+        how: how(),
+    }),
+    s3_holds
+);
+harness!(
+    s3_do_stop,
+    5,
+    delivery_with_end(),
+    |_: &OrchState| Event::Outbox(OutboxEvent::DoStop {
+        child: A,
+        stop: 1,
+        how: how()
+    }),
+    s3_holds
+);
+harness!(
+    s3_ingest_end,
+    5,
+    delivery_with_end(),
+    |s: &OrchState| Event::Run(RunEvent::IngestEnd {
+        t: R,
+        ev: inbox_event(s)
+    }),
+    s3_holds
+);
